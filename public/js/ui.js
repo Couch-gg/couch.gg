@@ -6,8 +6,9 @@
 // Screens are driven by net events ('joined', 'lobby', 'start', 'error',
 // 'close') and a DOM CustomEvent 'ui:gameover' dispatched by the game scene.
 
-import { MIN_PLAYERS, MAX_PLAYERS, TEAM_NAMES } from '/shared/constants.js';
+import { MIN_PLAYERS, MAX_PLAYERS, TEAM_NAMES, NAME_MAX_LEN } from '/shared/constants.js';
 import { SFX } from '/js/sfx.js';
+import { startLocalGame } from '/js/local.js';
 
 const NAME_STORE_KEY = 'trebuchet.name';
 
@@ -36,6 +37,7 @@ export function initUI(net) {
   // ---- Element handles -----------------------------------------------------
   const screens = {
     menu: $('screen-menu'),
+    local: $('screen-local'),
     lobby: $('screen-lobby'),
     gameover: $('screen-gameover'),
   };
@@ -44,6 +46,14 @@ export function initUI(net) {
   const codeInput = $('menu-code');
   const btnCreate = $('btn-create');
   const btnJoin = $('btn-join');
+  const btnLocal = $('btn-local');
+
+  // Local hotseat setup controls.
+  const localPlayers = $('local-players');
+  const btnLocalAdd = $('btn-local-add');
+  const btnLocalRemove = $('btn-local-remove');
+  const btnLocalStart = $('btn-local-start');
+  const btnLocalBack = $('btn-local-back');
 
   const lobbyCode = $('lobby-code');
   const lobbyLink = $('lobby-link');
@@ -64,6 +74,7 @@ export function initUI(net) {
   let inGame = false;          // true once a 'start' has hidden the overlay
   let gameOver = false;        // true while the game-over panel is showing
   let lastLobby = null;        // most recent lobby payload (for re-render)
+  let localMode = false;       // true while a local hotseat game is active
 
   // ---- Screen switching ----------------------------------------------------
   function show(which) {
@@ -160,6 +171,99 @@ export function initUI(net) {
     codeInput.addEventListener('focus', () => btnJoin.classList.remove('btn-highlight'), { once: true });
     btnJoin.addEventListener('click', () => btnJoin.classList.remove('btn-highlight'), { once: true });
   }
+
+  // ---- LOCAL HOTSEAT SETUP -------------------------------------------------
+  // Render player-name rows (2-4). Preserves any already-typed values across
+  // add/remove so re-rendering doesn't wipe input.
+  function renderLocalRows(count, keep) {
+    const n = Math.max(MIN_PLAYERS, Math.min(MAX_PLAYERS, count | 0));
+    const prev = keep || [];
+    localPlayers.innerHTML = '';
+    for (let i = 0; i < n; i++) {
+      const li = document.createElement('li');
+      li.className = 'local-row';
+
+      const swatch = document.createElement('span');
+      swatch.className = `swatch swatch-${i}`;
+      swatch.title = TEAM_NAMES[i] || '';
+
+      const input = document.createElement('input');
+      input.className = 'text-input local-name';
+      input.type = 'text';
+      input.maxLength = NAME_MAX_LEN;
+      input.autocomplete = 'off';
+      input.spellcheck = false;
+      input.setAttribute('autocapitalize', 'characters');
+      input.placeholder = 'PLAYER ' + (i + 1);
+      input.value = (prev[i] != null) ? prev[i] : '';
+      // Force uppercase as the player types (matches the menu name field).
+      input.addEventListener('input', () => {
+        const pos = input.selectionStart;
+        input.value = input.value.toUpperCase();
+        try { input.setSelectionRange(pos, pos); } catch (e) { /* ignore */ }
+      });
+
+      li.appendChild(swatch);
+      li.appendChild(input);
+      localPlayers.appendChild(li);
+    }
+    updateLocalButtons();
+  }
+
+  function localRowValues() {
+    return Array.from(localPlayers.querySelectorAll('.local-name')).map((el) => el.value);
+  }
+
+  function updateLocalButtons() {
+    const n = localPlayers.querySelectorAll('.local-row').length;
+    btnLocalAdd.disabled = n >= MAX_PLAYERS;
+    btnLocalRemove.disabled = n <= MIN_PLAYERS;
+  }
+
+  function showLocalSetup() {
+    clickSound();
+    // Start with 2 rows, defaulting names to the empty placeholders.
+    renderLocalRows(MIN_PLAYERS, []);
+    show('local');
+  }
+
+  function doLocalAdd() {
+    clickSound();
+    const vals = localRowValues();
+    if (vals.length >= MAX_PLAYERS) return;
+    renderLocalRows(vals.length + 1, vals);
+  }
+
+  function doLocalRemove() {
+    clickSound();
+    const vals = localRowValues();
+    if (vals.length <= MIN_PLAYERS) return;
+    renderLocalRows(vals.length - 1, vals.slice(0, vals.length - 1));
+  }
+
+  function doLocalStart() {
+    clickSound();
+    // The driver sanitizes (trim/cap/uppercase) and applies PLAYER N defaults.
+    const names = localRowValues();
+    localMode = true;
+    inGame = true;
+    gameOver = false;
+    hideAll();
+    // Fresh start of the local driver; it emits a server-shaped 'start' which
+    // main.js routes into the Game scene.
+    startLocalGame(net, names);
+  }
+
+  function doLocalBack() {
+    clickSound();
+    show('menu');
+  }
+
+  if (btnLocal) btnLocal.addEventListener('click', showLocalSetup);
+  if (btnLocalAdd) btnLocalAdd.addEventListener('click', doLocalAdd);
+  if (btnLocalRemove) btnLocalRemove.addEventListener('click', doLocalRemove);
+  if (btnLocalStart) btnLocalStart.addEventListener('click', doLocalStart);
+  if (btnLocalBack) btnLocalBack.addEventListener('click', doLocalBack);
 
   // ---- LOBBY ---------------------------------------------------------------
   function renderLobby(msg) {
@@ -296,7 +400,9 @@ export function initUI(net) {
     gameoverBanner.textContent = label;
     gameoverBanner.className = 'gameover-banner' + (cls ? ' ' + cls : '');
 
-    btnRematch.hidden = !d.isHost;
+    // Local hotseat: REMATCH is always available (no host concept). Online:
+    // only the host sees REMATCH (detail.isHost from the game scene).
+    btnRematch.hidden = localMode ? false : !d.isHost;
 
     inGame = false;
     gameOver = true;
@@ -338,6 +444,8 @@ export function initUI(net) {
   // On (re)connect, if we were never in a room yet, show the menu.
   net.on('open', () => {
     connBanner.hidden = true;
+    // Don't yank the menu over a local hotseat game/setup on a (re)connect.
+    if (localMode || !screens.local.hidden) return;
     if (!inGame && screens.lobby.hidden && screens.gameover.hidden && screens.menu.hidden) {
       show('menu');
     }
@@ -348,7 +456,7 @@ export function initUI(net) {
     // we're neither in a live game nor on the game-over panel — otherwise just
     // cache the payload (host may have changed) without yanking the screen.
     lastLobby = msg;
-    if (!inGame && !gameOver) {
+    if (!inGame && !gameOver && !localMode && screens.local.hidden) {
       renderLobby(msg);
       show('lobby');
     }
@@ -366,6 +474,9 @@ export function initUI(net) {
   });
 
   net.on('close', () => {
+    // A WebSocket drop must NOT interrupt a local hotseat game (it doesn't use
+    // the socket). Suppress the banner while local mode is active.
+    if (localMode) return;
     showConnLost();
   });
 

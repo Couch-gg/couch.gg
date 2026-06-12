@@ -429,6 +429,70 @@ body {
 }
 
 /* ============================================================
+   LOCAL HOTSEAT SETUP
+   ============================================================ */
+.local-panel {
+  width: min(440px, 88vw);
+  align-items: stretch;
+}
+
+.local-hint {
+  text-align: center;
+  margin-bottom: 2px;
+}
+
+.local-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+.local-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.local-row .swatch {
+  flex: 0 0 16px;
+}
+
+.local-row .text-input {
+  flex: 1;
+  min-width: 0;
+  font-size: clamp(9px, 1.5vw, 13px);
+  padding: 9px 10px;
+}
+
+.local-count-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+}
+
+.local-actions {
+  margin-top: 6px;
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+}
+
+.local-actions .btn {
+  flex: 1;
+}
+
+/* Local hotseat turn banner reuses the team swatch palette. */
+.local-list::-webkit-scrollbar { width: 8px; }
+.local-list::-webkit-scrollbar-track { background: #07070f; }
+.local-list::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border: 1px solid #000;
+}
+
+/* ============================================================
    GAME OVER
    ============================================================ */
 .gameover-panel {

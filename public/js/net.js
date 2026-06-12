@@ -24,6 +24,12 @@ class Net {
     this.you = null;
     this.code = null;
 
+    // Local hotseat hook. When set to a handler object (see js/local.js),
+    // outgoing 'fire'/'rematch' messages are routed to it instead of the
+    // socket, and the local driver emits server-shaped messages via emit().
+    // Null in normal online play — leaves all online behavior untouched.
+    this.local = null;
+
     // Guard so connect() is idempotent if called more than once.
     this._connecting = false;
     this._closedEmitted = false;
@@ -101,6 +107,19 @@ class Net {
    * @param {object} obj
    */
   send(obj) {
+    // Local hotseat: route gameplay intents to the in-page driver instead of
+    // the socket. Only 'fire'/'rematch' are intercepted; everything else (and
+    // all online play, when net.local is null) is unaffected.
+    if (this.local && obj && (obj.t === 'fire' || obj.t === 'rematch')) {
+      try {
+        this.local.handle(obj);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('[net] local handler error', err);
+      }
+      return;
+    }
+
     let raw;
     try {
       raw = JSON.stringify(obj);
@@ -150,6 +169,17 @@ class Net {
       set.delete(fn);
       if (set.size === 0) this._listeners.delete(type);
     }
+  }
+
+  /**
+   * Public emit — dispatch a message to listeners as if it arrived from the
+   * server. Used by the local hotseat driver to deliver server-shaped frames
+   * ('start', 'shot', 'turn', ...) through the same event path online uses.
+   * @param {string} type  message .t
+   * @param {object} payload
+   */
+  emit(type, payload) {
+    this._emit(type, payload);
   }
 
   _emit(type, payload) {

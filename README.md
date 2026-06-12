@@ -24,6 +24,20 @@ Then open **http://localhost:3000** in Chrome or Safari.
    tunnel the port, e.g. with `ngrok http 3000`.)
 3. When 2–4 players are in the lobby, the host clicks **START GAME**.
 
+## Local hotseat (one keyboard, no network)
+
+Want to play with friends on the same machine? From the menu click **LOCAL
+GAME**, set 2–4 player names (use **+ PLAYER / − PLAYER** to size the roster),
+and hit **START**. Players share one keyboard and take turns — the turn banner
+names whoever is up (tinted in their team color), and input unlocks for the
+active player automatically.
+
+It runs **entirely in your browser** (no server round-trip; a dropped connection
+won't interrupt a local game) and uses the **exact same physics, terrain, wind,
+and damage model** as online play — it just simulates each shot client-side
+instead of on the server. After a game, **REMATCH** rolls a fresh battlefield with
+the same players.
+
 ## How to play
 
 Turn-based artillery duel. Last trebuchet standing wins.
@@ -56,7 +70,8 @@ Turn-based artillery duel. Last trebuchet standing wins.
 ```
 server/   Express + WebSocket server, rooms, turn engine
 shared/   deterministic sim + game constants (used by server AND browser)
-public/   client: Phaser scenes, pixel-art baker, WebAudio sfx, menu/lobby UI
+public/   client: Phaser scenes, pixel-art baker, WebAudio sfx, menu/lobby UI,
+          local hotseat driver (public/js/local.js)
 scripts/  dev utilities: headless protocol bot, TCP proxy for local testing
 ```
 

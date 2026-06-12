@@ -71,9 +71,35 @@
           <button id="btn-join" class="btn" type="button">
             JOIN GAME
           </button>
+
+          <div class="menu-divider"><span>OR</span></div>
+
+          <button id="btn-local" class="btn" type="button">
+            LOCAL GAME
+          </button>
         </div>
 
         <p class="hint blink-slow">INVITE 1-3 FRIENDS ON YOUR NETWORK</p>
+      </section>
+
+      <!-- LOCAL SETUP (hotseat) -->
+      <section id="screen-local" class="screen" hidden>
+        <div class="panel local-panel">
+          <p class="lobby-eyebrow">LOCAL HOTSEAT</p>
+          <p class="hint local-hint">2-4 PLAYERS &mdash; ONE KEYBOARD &mdash; TAKE TURNS</p>
+
+          <ul id="local-players" class="local-list"></ul>
+
+          <div class="local-count-actions">
+            <button id="btn-local-remove" class="btn btn-small" type="button">&minus; PLAYER</button>
+            <button id="btn-local-add" class="btn btn-small" type="button">+ PLAYER</button>
+          </div>
+
+          <div class="local-actions">
+            <button id="btn-local-start" class="btn btn-primary" type="button">START</button>
+            <button id="btn-local-back" class="btn" type="button">BACK</button>
+          </div>
+        </div>
       </section>
 
       <!-- LOBBY -->

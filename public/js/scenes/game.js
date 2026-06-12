@@ -30,6 +30,11 @@ export class Game extends Phaser.Scene {
   // -- lifecycle ----------------------------------------------------------
   init(data) {
     this.payload = data || {};
+    // Local hotseat: everyone shares one screen and one keyboard. The driver
+    // sets net.you to the active player each turn, so _myTurn tracks "the
+    // player whose turn it is". We tweak the turn banner + game-over detail
+    // accordingly. Online payloads never set `local`, so this is a no-op there.
+    this._local = data && data.local === true;
     // Reset all per-game scratch so a restarted scene (rematch) starts clean.
     this._bound = null;
     this._animating = false;
@@ -424,6 +429,13 @@ export class Game extends Phaser.Scene {
     const cur = this._trebs.get(this.turn);
     if (this._gameOver) {
       this.turnBanner.setText('');
+    } else if (this._myTurn && this._local) {
+      // Local hotseat: everyone sees the same screen, so name the active
+      // player ("<NAME>'S TURN") and tint it with their team color. It still
+      // flashes (driven by _myTurn in update()) like YOUR TURN does.
+      const name = (cur && (cur.p.name || TEAM_NAMES[cur.colorIdx])) || 'PLAYER';
+      this.turnBanner.setText(name + "'S TURN");
+      this.turnBanner.setColor(this._hexColor(cur ? cur.colorIdx : 0));
     } else if (this._myTurn) {
       this.turnBanner.setText('YOUR TURN');
       this.turnBanner.setColor('#ffe066');
@@ -848,12 +860,15 @@ export class Game extends Phaser.Scene {
       const t = this._trebs.get(winnerId);
       winnerName = (t && t.p.name) ||
         (this.players.find((p) => p.id === winnerId) || {}).name || 'WINNER';
-      youWin = (winnerId === net.you);
+      // Local hotseat: there's no single "you", so always show the named
+      // winner ("<NAME> WINS!") rather than "YOU WIN!".
+      youWin = !this._local && (winnerId === net.you);
     }
 
     try { SFX.play(youWin ? 'win' : 'lose'); } catch (e) { /* ignore */ }
 
-    const isHost = (this._hostId === net.you);
+    // Local hotseat: REMATCH is always offered (no host concept).
+    const isHost = this._local ? true : (this._hostId === net.you);
 
     // Brief in-canvas banner, then hand off to the HTML game-over panel.
     this._note(draw ? 'DRAW!' : (youWin ? 'YOU WIN!' : winnerName + ' WINS!'));
@@ -865,6 +880,12 @@ export class Game extends Phaser.Scene {
   }
 
   // -- util ---------------------------------------------------------------
+  // Convert a team colorIdx to a '#rrggbb' CSS string for Phaser text color.
+  _hexColor(colorIdx) {
+    const c = TEAM_COLORS[colorIdx] != null ? TEAM_COLORS[colorIdx] : 0xffffff;
+    return '#' + (c & 0xffffff).toString(16).padStart(6, '0');
+  }
+
   _rng(seed) {
     let a = (seed >>> 0) || 1;
     return function () {

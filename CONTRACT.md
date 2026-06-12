@@ -37,6 +37,7 @@ public/index.html            [Agent SHELL]
 public/css/style.css         [Agent SHELL]
 public/js/net.js             [Agent SHELL]
 public/js/ui.js              [Agent SHELL]
+public/js/local.js           [Agent SHELL — local hotseat driver]
 public/js/main.js            [Agent GAME]
 public/js/scenes/boot.js     [Agent GAME]
 public/js/scenes/game.js     [Agent GAME]
@@ -333,6 +334,53 @@ export const SFX = {
 
 ---
 
+## 6. Local hotseat mode — `public/js/local.js`
+
+Lets 2–4 players share one keyboard and take turns on a single screen, with **no
+server round-trip**. The online path is unchanged; local mode is purely additive.
+
+### Driver — `public/js/local.js`
+`startLocalGame(net, names)` builds a `LocalGame` that **impersonates the server
+entirely client-side**. It mirrors `server/game.js` exactly (random seed,
+`generateTerrain` + `placePlayers`, `PLAYER_HP`, random first turn, wind
+`uniform[-WIND_MAX,WIND_MAX]` rounded to 1 decimal, `fire` clamping →
+`simulateShot` → `applyCrater` → damage/alive → `settlePlayers`, deaths/winner/
+draw, next-alive rotation, `TURN_MS` timeout that skips the turn) and **emits the
+exact same message shapes** the server sends (`start`, `shot`, `turn`, and the
+terminal `left` on a final timeout) with identical fields (`turnEndsAt` epoch ms,
+`winner`/`draw`, `result.{impact,crater,hits[].hp,deaths,settled}`). Player ids
+are `local_0`..`local_3`, `colorIdx` = index. `names` are sanitized (trim, strip
+control chars, cap `NAME_MAX_LEN`, uppercase) with defaults `PLAYER 1`..`PLAYER 4`.
+The `start` payload also carries `local: true` (online never sets it). Also
+exports `isLocalActive()` and `getLocalGame()`.
+
+### `net.send` interception hook — `public/js/net.js`
+`net.local` defaults to `null` (online untouched). `startLocalGame` sets
+`net.local = { handle(obj) }`. `net.send(obj)` routes **only** `{t:'fire'}` /
+`{t:'rematch'}` to `net.local.handle()` instead of the WebSocket when `net.local`
+is set; every other message and all online play go to the socket as before. The
+driver delivers server-shaped frames back through `net.emit(type, payload)` (a
+thin public wrapper over the internal `_emit`), so they flow through the same
+listener path the socket uses — the Game scene and UI need no special casing.
+
+### `net.you` convention (the key trick)
+Before emitting any message that establishes whose turn it is (`start`, `shot`
+with `next`, `turn`), the driver sets `net.you = <current turn player id>`. The
+existing Game scene already treats `net.you` as "you" and unlocks input for it, so
+the active hotseat player can aim/fire. Online behavior is unaffected (the server
+still owns `net.you` via the `joined` handshake there).
+
+### Scene + UI awareness (minimal)
+- `scenes/game.js`: when `payload.local === true`, the turn banner reads
+  `"<NAME>'S TURN"` (flashing, tinted with the player's team color) instead of
+  `YOUR TURN`, and the `ui:gameover` detail uses `youWin:false` + `isHost:true`
+  so the panel shows `"<NAME> WINS!"` / `DRAW` with REMATCH. Everything else
+  (aiming, firing, animations, craters, hp, settle, deaths) runs unchanged.
+- `ui.js`: a third menu option **LOCAL GAME** opens a setup panel (2–4 name rows
+  via ADD/REMOVE, START, BACK). While local mode is active the connection-lost
+  banner is suppressed (a ws drop must not interrupt a local game) and the
+  game-over panel always offers REMATCH + LEAVE (LEAVE reloads, as online).
+
 ## Game flow summary
 
 1. Page load → Boot bakes textures → HTML MENU over a black/ambient canvas.
@@ -343,3 +391,7 @@ export const SFX = {
 4. Turns: aim with arrows, SPACE to fire ⇒ server simulates ⇒ `shot` broadcast ⇒ all clients
    animate identical outcome. Wind changes every turn. Terrain is destroyed; trebuchets fall.
 5. Last alive wins ⇒ game-over panel ⇒ host REMATCH (new terrain) or LEAVE.
+
+Alternatively: **LOCAL GAME** ⇒ name 2–4 players ⇒ `local.js` drives an entirely
+client-side hotseat match (same physics, same screens) where each player aims and
+fires on their turn; REMATCH gives a fresh battlefield. See §6.
