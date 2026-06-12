@@ -395,3 +395,103 @@ still owns `net.you` via the `joined` handshake there).
 Alternatively: **LOCAL GAME** ⇒ name 2–4 players ⇒ `local.js` drives an entirely
 client-side hotseat match (same physics, same screens) where each player aims and
 fires on their turn; REMATCH gives a fresh battlefield. See §6.
+
+---
+
+## 7. V2 — SIEGE UPDATE (binding spec; supersedes earlier sections where it conflicts)
+
+Five gameplay changes. Message field names below are exact. All new tuning constants
+live in `shared/constants.js` (owner: Agent SIM).
+
+### 7.1 Trebuchet-realistic arcs (no flat shots)
+- New constants: `ELEV_MIN = 50`, `ELEV_MAX = 85` (degrees of ELEVATION above horizon).
+- Valid launch angles (existing 0=right/90=up/180=left convention):
+  `[ELEV_MIN..ELEV_MAX]` shooting right, `[180-ELEV_MAX .. 180-ELEV_MIN]` shooting left.
+  `ANGLE_MIN/ANGLE_MAX` are dead; sim + server + local driver clamp INVALID angles to the
+  nearest valid bound (NaN -> ELEV_MIN rightward).
+- Client aiming: LEFT/RIGHT arrows sweep the aim through `50..85` (right side) and
+  `95..130` (left side) in 1° steps (Shift = 5°), SNAPPING across the 86..94 gap (85 -> 95
+  and back). HUD shows direction + elevation, e.g. `ARC ► 62`.
+- `SPEED_MAX = 280` (slight raise so max-power 50° lobs can still cross the map).
+  Sim test: full-power 50° shot from flat ground travels > 380 px horizontally.
+
+### 7.2 Plunging-fire damage (arc height matters) + damage numbers
+- `simulateShot` tracks vertical velocity at impact (`vyImpact`, positive = falling).
+- Damage multiplier `plunge = clamp(0.55 + 0.95 * (vyImpact / PLUNGE_VY_REF), 0.55, 1.5)`
+  with `PLUNGE_VY_REF = 270`. Player damage becomes
+  `round(DMG_MAX * (1 - dist/DMG_RADIUS) * plunge)`, min 1 when within radius.
+  Sim tests: multiplier monotonic in vyImpact; an 85° full-power lob deals measurably more
+  damage than a 50° full-power shot landing at the same distance from the target.
+- `simulateShot` result gains `plunge` (the multiplier, 2 decimals) so clients can show it.
+- CLIENT: floating damage popups at impact — for every entry in `hits` (red `-N`) and
+  `castleHits` (pale stone-white `-N`), a small pixel-font number rises ~14 px and fades
+  over ~900 ms at the victim's position (stagger by 120 ms if same position). Big hits
+  (plunge >= 1.25) render 1 px larger with a brief white flash.
+
+### 7.3 Hold-to-charge firing
+- Power is no longer set with UP/DOWN. Hold SPACE *or* hold pointer-down on the FIRE
+  button: power charges `POWER_MIN -> POWER_MAX` linearly over `CHARGE_TIME_MS = 1800`,
+  shown as a charge bar (inside/beside the FIRE button AND a thin vertical meter next to
+  the readout). Release fires with the charged power; reaching full charge AUTO-FIRES.
+- Charging only starts when it's your turn, nothing animating, game not over. If the turn
+  ends while charging (timeout), cancel silently. Keyboard repeat of Space must not
+  retrigger after release-fire (guard until next keyup).
+- The `fire` message is UNCHANGED (`{t:'fire', angle, power}`) — charging is client UX.
+  The headless bot is unaffected protocol-wise but must aim within the new elevation
+  bounds (Agent SRV updates `scripts/headless-player.js`: elevation search 50..85, both
+  directions, correction logic preserved).
+
+### 7.4 Trebuchet throw animation + improved sprite
+- Agent ART redraws the trebuchet (26x26, 4 team variants) with a clearer silhouette:
+  heavy A-frame, long arm, hanging counterweight box, visible sling, team banner.
+- New frame keys (replace `_loaded`/`_fire`): `treb_<i>_idle` (arm cocked back, sling
+  loaded), `treb_<i>_swing` (arm vertical, counterweight dropping), `treb_<i>_release`
+  (arm forward-high, sling open, counterweight down). Old keys `treb_<i>_loaded` /
+  `treb_<i>_fire` are REMOVED — Agent CLIENT must reference only the new keys.
+- CLIENT fire sequence on every `shot`: shooter plays idle -> swing (90 ms) -> release
+  (held ~360 ms) -> idle; the projectile + whoosh start AT the swing->release boundary
+  (delay the trajectory animation by 90 ms). SFX 'fire' plays at release, not at message
+  arrival. A small dust puff at the trebuchet on release is welcome but optional.
+
+### 7.5 Castles (destructible forts; masonry hits score damage)
+- New sim export: `buildCastles(heights, positions) -> castles`, deterministic, called by
+  server, online client, and local driver right after `placePlayers` (same order). For
+  player i at `(x, y)`: two flanking towers on the pad edges, each `3 px wide` columns of
+  stone from the pad surface up `CASTLE_TOWER_H = 16` px, topped with 1-px crenellations,
+  at offsets `x - 11..x - 9` and `x + 9..x + 11`. Castle representation:
+  `castles[i] = { id: <playerId set by caller> , blocks: [{ x, y, w:1, h:1 }...] }` as a
+  flat ordered list of 1x1 logical stone cells (order MUST be deterministic; block index
+  identifies a cell forever).
+- `simulateShot` gains a `castles` argument. Collision: a projectile within
+  `PROJ_RADIUS + 0.5` of an intact block terminates there (castle impact). Block checks
+  run before player-circle checks (walls protect), after the same 0.15 s arming delay.
+- Destruction on ANY impact (terrain, player, or castle): every intact block whose center
+  lies within `CRATER_R` of the impact is destroyed. Additionally, after `applyCrater`,
+  any block left floating (its column's terrain surface dropped below the block's bottom
+  edge by > 2 px AND no intact block directly beneath) collapses and counts as destroyed.
+- Scoring: for each castle owner losing `n` blocks this shot, the owner takes
+  `castleDmg = min(CASTLE_DMG_CAP, ceil(n * CASTLE_DMG_PER_BLOCK))` hp with
+  `CASTLE_DMG_PER_BLOCK = 0.75`, `CASTLE_DMG_CAP = 12` (self-hits included — don't smash
+  your own walls). This is how "hitting the castle scores points": it bleeds the owner.
+- Result/message additions (server `shot` AND local driver, identical):
+  `result.castleHits = [{ id, dmg, hp, blocks: [blockIndex...] }]` — `hp` is the owner's
+  hp AFTER all of this shot's damage; when a player takes both blast and castle damage,
+  `hits[].hp` and `castleHits[].hp` are both that same final value. `result.hits` stays
+  blast-only. Deaths may result from castle damage alone — `deaths` covers both sources.
+- State/authority: server (and local driver) keep authoritative castle state; clients
+  mirror destroyed indices from `result.castleHits[].blocks` (like craters). On `start`
+  (and rematch) everyone rebuilds castles fresh from the seed-derived positions.
+- CLIENT rendering: stone pixel blocks (2-3 gray shades, slight per-block variation seeded
+  by index) drawn UNDER trebuchets/HP bars; destroyed blocks vanish with a tiny gray
+  debris puff. No castle texture work for Agent ART beyond (optional) a 1x1-scaled stone
+  tile helper — the scene may draw blocks with Graphics directly.
+- Sim tests: determinism (same inputs -> same castles), side shot into a tower terminates
+  on the wall and shields the player behind it, castle damage applied and capped, floating
+  blocks collapse after a crater bite under a tower.
+
+### V2 file ownership
+- Agent SIM: shared/constants.js, shared/sim.js, shared/sim.test.js
+- Agent ART: public/js/sprites.js
+- Agent CLIENT: public/js/scenes/game.js (charge input, popups, castle render, swing sync,
+  HUD `ARC`), plus a one-line controls hint if ui.js has one (do not restructure ui.js)
+- Agent SRV: server/game.js, public/js/local.js (exact parity), scripts/headless-player.js

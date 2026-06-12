@@ -90,117 +90,125 @@ function registerCanvas(scene, key, canvas) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// TREBUCHET (26x26) — three frames (idle / loaded / fire) per team color.
+// TREBUCHET (26x26) — three pose frames (idle / swing / release) per team color.
 //
 // Authored facing RIGHT (the game flips with flipX). Origin is set by the game to bottom-center.
-// Layout reads instantly at small size:
-//   - Wide wooden base beam on the ground.
-//   - A-frame: two angled legs meeting at a pivot apex near the top-middle.
-//   - Long throwing arm pivoting at the apex: short heavy end (counterweight box, team color trim)
-//     to the LEFT/back, long thin end with the sling + payload to the RIGHT/front.
-//   - A team-color flag flies from the apex.
+// A clear, iconic siege-engine silhouette that reads instantly at 1x:
+//   - Wide wooden base beam + diagonal foot braces planted on the ground.
+//   - HEAVY A-frame: two thick angled legs meeting at an iron pivot apex near the top-middle.
+//   - LONG throwing arm pivoting at the apex. Short heavy end (back/left) carries a HANGING
+//     counterweight box; long thin end (front/right) carries the sling + payload.
+//   - A team-color BANNER flies from a pole at the apex.
+//   - The counterweight box visibly HANGS from the short arm end (rope link, swings down as the
+//     arm rotates), and SLING LINES connect the long arm tip to the stone payload.
+//
+// Three poses (counterweight + arm + sling tell the whole story):
+//   idle    — arm cocked back-down: long end pulled DOWN to the rear, sling loaded low behind;
+//             counterweight raised high on the short end. Primed and ready.
+//   swing   — arm rotated toward vertical, counterweight mid-drop, sling whipping up & forward.
+//   release — arm forward-high over the front, sling open/empty, counterweight at the bottom.
 //
 // Palette chars (shared by all frames):
 //   D dark wood   W wood (mid)   L light wood (highlight)
-//   K iron/pivot (dark)          M metal highlight
-//   C counterweight box (team)   c counterweight shade (darker team)
-//   F flag (team)                f flag shade
-//   R rope/sling (tan)           S stone payload
-//   p flag pole (light wood)
+//   K iron/pivot & arm spine (dark)   M metal pivot highlight
+//   C counterweight box (team, lit)   c counterweight box (team, shade)   i iron cw band (dark)
+//   F banner (team)   f banner shade   p banner pole (metal)
+//   R rope / sling line (tan)   S stone payload (gray)
 // ---------------------------------------------------------------------------------------------
 
-// IDLE / LOADED: arm cocked down-back (counterweight raised on the short end is the loaded look;
-// here the long arm rests pointing up-back, sling holding the stone low at the front — ready).
-// We use ONE grid for idle and loaded (contract allows loaded == idle art) but give "loaded"
-// a slightly raised stone so it reads as primed; to keep silhouettes crisp we share the frame.
+// IDLE — arm cocked back-down. Counterweight box raised high on the short (right/front) end,
+// long arm pulled DOWN to the rear (left), sling + stone resting low behind the frame.
 const TREB_IDLE = [
-  '...FFFF...................',
-  '...FffF...cCc.............',
-  '...FFFf...cCc.............',
-  '...p......cCc.............',
-  '...p......ccc.............',
-  '...p.......K..............',
-  '...p.......K.WL...........',
-  '...p.......K..WL..........',
-  '...p......KMK..WL.........',
-  '...p.......K....WL........',
-  '...p.......K.....WW.......',
-  '...p.......K......WL......',
-  '...p.......K.......WL.....',
-  '...p......DKD.......WW....',
-  '...p.....DWKWD.......WL...',
-  '........DW.K.WD......RR...',
-  '.......DW..K..WD....R..R..',
-  '......DW...K...WD...R.SR..',
-  '.....DW....K....WD..RSR...',
-  '....DW.....K.....WD..R....',
-  '..DDW......K......WDD.....',
-  '..LWW......K......WWL.....',
-  '.DWWWWWWWWWWWWWWWWWWWD....',
-  '.DLLLLLLLLLLLLLLLLLLLD....',
-  '.D..DD..........DD..D.....',
-  '.DD.WW..........WW.DD.....',
+  '.....................CCC..',
+  '.Ff..................CiC..',
+  '.FF..................ccc..',
+  '.Ff...................R...',
+  '.FF...................R...',
+  '.p...................WL...',
+  '.p..................WL....',
+  '.p.................WL.....',
+  '.p................WL......',
+  '.p...............WL.......',
+  '.p....RR........KMK.......',
+  '.p...R..R......DKD........',
+  '.p...R.SR.....DWKWD.......',
+  '.p....RR.....DW.K.WD......',
+  '.p..........DW..K..WD.....',
+  '.p.........DW...K...WD....',
+  '..........DW....K....WD...',
+  '.........DW.....K.....WD..',
+  '.....DDDDW......K......WDD',
+  '....DLWWWWWWWWWWWWWWWWWWWWL',
+  '....DWWWWWWWWWWWWWWWWWWWWWD',
+  '....DLLLLLLLLLLLLLLLLLLLLD',
+  '....D..DD..........DD...D.',
+  '...DD..WW..........WW...DD',
+  '..DW...WW..........WW...WD',
+  '..D....DD..........DD....D',
 ];
 
-// LOADED: nearly identical, payload nudged so it reads as a fresh stone seated in the sling.
-const TREB_LOADED = [
-  '...FFFF...................',
-  '...FffF...cCc.............',
-  '...FFFf...cCc.............',
-  '...p......cCc.............',
-  '...p......ccc.............',
-  '...p.......K..............',
-  '...p.......K.WL...........',
-  '...p.......K..WL..........',
-  '...p......KMK..WL.........',
-  '...p.......K....WL........',
-  '...p.......K.....WW.......',
-  '...p.......K......WL......',
-  '...p.......K.......WL.....',
-  '...p......DKD.......WW....',
-  '...p.....DWKWD......RWL...',
-  '........DW.K.WD....R.RR...',
-  '.......DW..K..WD..R..SR...',
-  '......DW...K...WD.R.SSSR..',
-  '.....DW....K....WD.RSSSR..',
-  '....DW.....K.....WD.RSR...',
-  '..DDW......K......WDDR....',
-  '..LWW......K......WWL.....',
-  '.DWWWWWWWWWWWWWWWWWWWD....',
-  '.DLLLLLLLLLLLLLLLLLLLD....',
-  '.D..DD..........DD..D.....',
-  '.DD.WW..........WW.DD.....',
+// SWING — arm rotated toward vertical. Counterweight box mid-drop (swung down toward the rear),
+// long arm pointing UP, sling whipping up and forward over the apex.
+const TREB_SWING = [
+  '..............R...........',
+  '.Ff..........R.RR.........',
+  '.FF.........R..SR.........',
+  '.Ff........R...R..........',
+  '.FF.......WL..............',
+  '.p.......WL...............',
+  '.p......WW................',
+  '.p.....WL.................',
+  '.p.....WL.................',
+  '.p....WL..................',
+  '.p....WL.........KMK......',
+  '.p...iWi........DKD.......',
+  '.p...CCC.......DWKWD......',
+  '.p...CiC......DW.K.WD.....',
+  '.p...ccc.....DW..K..WD....',
+  '.p..........DW...K...WD...',
+  '...........DW....K....WD..',
+  '..........DW.....K.....WD.',
+  '.....DDDDW......K......WDD',
+  '....DLWWWWWWWWWWWWWWWWWWWWL',
+  '....DWWWWWWWWWWWWWWWWWWWWWD',
+  '....DLLLLLLLLLLLLLLLLLLLLD',
+  '....D..DD..........DD...D.',
+  '...DD..WW..........WW...DD',
+  '..DW...WW..........WW...WD',
+  '..D....DD..........DD....D',
 ];
 
-// FIRE: arm swung up/over — counterweight has dropped to the LEFT/down, long end has whipped
-// UP/OVER to the right, sling flung open, stone released high. Strong diagonal silhouette.
-const TREB_FIRE = [
-  '...FFFF.............RR....',
-  '...FffF...........R...SR..',
-  '...FFFf..........R..SSSR..',
-  '...p............R...SSR...',
-  '...p...........WL..RR.....',
-  '...p..........WL..........',
-  '...p.........WL...........',
-  '...p........WW............',
-  '...p.......WL.............',
-  '...p......WL..............',
-  '...p.....WW...............',
-  '...p....WL................',
-  '...p...WLK................',
-  '...p..DWKWD...............',
-  '...p.DW.K.WD..............',
-  '....DW..K..WD.....cCc.....',
-  '...DW...K...WD....cCc.....',
-  '..DW....K....WD...cCc.....',
-  '.DW.....K.....WD..ccc.....',
-  'DW......K......WD.........',
-  'LW......K......WWD........',
-  'WW......K......WWL........',
-  'DWWWWWWWWWWWWWWWWWWD......',
-  'DLLLLLLLLLLLLLLLLLLD......',
-  'D..DD.........DD...D......',
-  'D..WW.........WW...D......',
+// RELEASE — long arm whipped forward-HIGH over the front (right); sling thrown open and EMPTY
+// (payload already launched). Counterweight box swung down to the BOTTOM at the rear (left),
+// hanging from the short arm end. The A-frame + base are identical to IDLE; only the arm,
+// counterweight and sling move.
+const TREB_RELEASE = [
+  '..................RR......',
+  '.Ff.............RR..RR....',
+  '.FF............R......R...',
+  '.Ff...........R.......R...',
+  '.FF..........WL...........',
+  '.p..........WL............',
+  '.p.........WW.............',
+  '.p........WL..............',
+  '.p.......WL...............',
+  '.p......WL................',
+  '.p.....WL.......KMK.......',
+  '.p....WLK......DKD........',
+  '.p....KCccc...DWKWD.......',
+  '.p...CCCcccc.DW.K.WD......',
+  '.p...iCiccc.DW..K..WD.....',
+  '.p...CCCccWDW...K...WD....',
+  '......iiiDW.....K....WD...',
+  '.........DW.....K.....WD..',
+  '.....DDDDW......K......WDD',
+  '....DLWWWWWWWWWWWWWWWWWWWWL',
+  '....DWWWWWWWWWWWWWWWWWWWWWD',
+  '....DLLLLLLLLLLLLLLLLLLLLD',
+  '....D..DD..........DD...D.',
+  '...DD..WW..........WW...DD',
+  '..DW...WW..........WW...WD',
+  '..D....DD..........DD....D',
 ];
 
 // Pad every trebuchet grid row to exactly 26 chars so the canvas is 26x26.
@@ -211,26 +219,27 @@ function padRows(grid, w) {
 function bakeTrebuchet(scene, idx) {
   const team = TEAM_COLORS[idx];
 
-  // Wood ramp (warm browns) — shared across teams.
+  // Wood ramp (warm browns) — shared across teams. 2-3 shade wood for legible volume.
   const pal = {
-    D: 0x4a2f1a, // dark wood
-    W: 0x7a4e29, // mid wood
-    L: 0xb07b43, // light wood highlight
+    D: 0x4a2f1a, // dark wood (shadow side / outlines)
+    W: 0x7a4e29, // mid wood (body)
+    L: 0xb07b43, // light wood (highlight)
     K: 0x2b2b33, // iron pivot / arm spine (dark)
-    M: 0x9aa0ad, // metal highlight
-    R: 0xc9a86a, // rope (tan)
+    M: 0x9aa0ad, // metal pivot highlight
+    R: 0xc9a86a, // rope / sling line (tan)
   };
-  // Stone payload grays, flag pole, flag + counterweight from team color.
+  // Stone payload grays, banner pole, banner + counterweight from team color.
   pal.S = 0x9b9b9b; // stone payload (gray)
-  pal.p = 0x8a8f99; // flag pole (metal gray)
+  pal.p = 0x8a8f99; // banner pole (metal gray)
+  pal.i = 0x33333b; // iron band on the counterweight box (dark)
   pal.F = team;
-  pal.f = shade(team, -0.35); // flag shade
-  pal.C = shade(team, 0.1); // counterweight face (team, slightly lit)
+  pal.f = shade(team, -0.35); // banner shade
+  pal.C = shade(team, 0.12); // counterweight face (team, slightly lit)
   pal.c = shade(team, -0.4); // counterweight shade (darker team)
 
   bakeGrid(scene, `treb_${idx}_idle`, padRows(TREB_IDLE, 26), pal);
-  bakeGrid(scene, `treb_${idx}_loaded`, padRows(TREB_LOADED, 26), pal);
-  bakeGrid(scene, `treb_${idx}_fire`, padRows(TREB_FIRE, 26), pal);
+  bakeGrid(scene, `treb_${idx}_swing`, padRows(TREB_SWING, 26), pal);
+  bakeGrid(scene, `treb_${idx}_release`, padRows(TREB_RELEASE, 26), pal);
 }
 
 // ---------------------------------------------------------------------------------------------

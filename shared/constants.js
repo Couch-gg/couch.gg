@@ -15,10 +15,28 @@ export const TRAJ_SAMPLE_EVERY = 2;    // record every Nth sim step -> 60 sample
 export const MAX_FLIGHT_T = 20;        // hard cap on projectile flight time (s)
 
 export const ANGLE_MIN = 10;           // degrees; 0 = right, 90 = straight up, 180 = left
-export const ANGLE_MAX = 170;
+export const ANGLE_MAX = 170;          // DEAD (V2): superseded by ELEV_MIN/ELEV_MAX elevation bands
 export const POWER_MIN = 10;
 export const POWER_MAX = 100;
-export const SPEED_MAX = 260;          // launch speed px/s at power 100 (speed = power/100*SPEED_MAX)
+export const SPEED_MAX = 280;          // launch speed px/s at power 100 (speed = power/100*SPEED_MAX)
+
+// V2 SIEGE — trebuchet-realistic arcs (no flat shots). ELEVATION above horizon.
+// Valid launch angles (0=right/90=up/180=left convention):
+//   shooting right: [ELEV_MIN .. ELEV_MAX]
+//   shooting left:  [180-ELEV_MAX .. 180-ELEV_MIN]
+// ANGLE_MIN/ANGLE_MAX are dead; the sim clamps invalid angles to the nearest
+// valid bound (NaN -> ELEV_MIN, rightward).
+export const ELEV_MIN = 50;            // degrees of elevation above the horizon (min)
+export const ELEV_MAX = 85;            // degrees of elevation above the horizon (max)
+
+// V2 SIEGE — plunging-fire damage. Vertical velocity at impact scales damage.
+export const PLUNGE_VY_REF = 270;      // reference falling speed for the plunge multiplier
+export const CHARGE_TIME_MS = 1800;    // hold-to-charge: POWER_MIN -> POWER_MAX over this span
+
+// V2 SIEGE — castles (destructible forts).
+export const CASTLE_TOWER_H = 16;      // tower height in stone columns (px)
+export const CASTLE_DMG_PER_BLOCK = 0.75; // hp bled to owner per destroyed block
+export const CASTLE_DMG_CAP = 12;      // max castle damage to an owner in a single shot
 
 export const PROJ_RADIUS = 2;          // projectile collision radius
 export const CRATER_R = 16;            // terrain crater radius

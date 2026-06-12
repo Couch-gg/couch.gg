@@ -9,11 +9,12 @@
 import {
   WORLD_W, WORLD_H,
   TERRAIN_FLOOR_Y,
-  ANGLE_MIN, ANGLE_MAX, POWER_MIN, POWER_MAX,
+  ELEV_MIN, ELEV_MAX, POWER_MIN, POWER_MAX,
+  CHARGE_TIME_MS,
   MUZZLE_DY,
   TEAM_COLORS, TEAM_NAMES
 } from '/shared/constants.js';
-import { generateTerrain, placePlayers, applyCrater } from '/shared/sim.js';
+import { generateTerrain, placePlayers, applyCrater, buildCastles } from '/shared/sim.js';
 import { net } from '../net.js';
 import { SFX } from '../sfx.js';
 
@@ -21,6 +22,21 @@ const DIRT_COLOR = 0x6b4a2b;
 const DIRT_DARK = 0x4a321d;
 const GRASS_COLOR = 0x5dc961;
 const GRASS_DARK = 0x3f9444;
+
+// V2 castle stone palette — 3 gray shades, picked per-block by a seeded index
+// hash so each wall has subtle variation. Index 0 = face, 1 = light edge,
+// 2 = dark shade.
+const STONE_SHADES = [0x8b8b94, 0xa8a8b2, 0x6e6e78];
+const STONE_MORTAR = 0x4a4a52;
+
+// V2 aim bounds in the 0=right / 90=up / 180=left convention:
+//   right shots  : ELEV_MIN..ELEV_MAX            (elevation == angle)
+//   left  shots  : 180-ELEV_MAX..180-ELEV_MIN    (elevation == 180-angle)
+// The dead gap (ELEV_MAX+1 .. 180-ELEV_MAX-1) is snapped across.
+const RIGHT_LO = ELEV_MIN;            // 50
+const RIGHT_HI = ELEV_MAX;            // 85
+const LEFT_LO = 180 - ELEV_MAX;       // 95
+const LEFT_HI = 180 - ELEV_MIN;       // 130
 
 export class Game extends Phaser.Scene {
   constructor() {
@@ -42,11 +58,26 @@ export class Game extends Phaser.Scene {
     this._gameOver = false;
     this._turnEndsAt = 0;
     this._lastTickSecond = -1;
-    this._aimAngle = 45;
-    this._aimPower = 70;
+    // Aim angle in the 0=right/90=up/180=left convention. Default: 60° elevation
+    // shooting right (a sensible trebuchet lob). Snapped into a valid band by
+    // _clampAim().
+    this._aimAngle = 60;
     this._heldAngle = null; // remembered between turns
-    this._heldPower = null;
+    // --- Hold-to-charge firing (7.3) ---------------------------------------
+    // Power is no longer arrow-controlled; it charges while SPACE or the FIRE
+    // button is held, from POWER_MIN to POWER_MAX over CHARGE_TIME_MS.
+    this._charging = false;
+    this._chargePower = POWER_MIN; // current charged power while holding
+    this._chargeStart = 0;         // this.time.now when the hold began
+    // Guard so a single Space *hold* (key-repeat) can't retrigger a new charge
+    // after a release-fire — stays true until the next keyup.
+    this._spaceLatched = false;
+    this._chargeSource = null;     // 'key' | 'pointer' | null
     this._trebs = new Map();   // id -> { container, sprite, label, hpBg, hpFill, p }
+    // --- Castles (7.5) -----------------------------------------------------
+    // castleByOwner: ownerId -> { gfx, blocks:[{x,y,w,h}], alive:[bool] }.
+    // Destroyed block indices are mirrored from result.castleHits[].blocks.
+    this._castles = new Map();
     this._notes = [];
     // Monotonic counter bumped every time a turn/left/shot-next is applied. The
     // pending _afterShot from a shot captures this at fire time and skips its
@@ -64,7 +95,16 @@ export class Game extends Phaser.Scene {
     // generateTerrain + placePlayers reproduce the flattened pads exactly as on
     // the server; authoritative x/y/hp still come from the payload.
     this.heights = generateTerrain(this.seed);
-    placePlayers(this.heights, this.players.length, this.seed);
+    const positions = placePlayers(this.heights, this.players.length, this.seed);
+    // Castles are built right after placePlayers (same order as server/local
+    // driver) so block indices line up with result.castleHits[].blocks. The
+    // sim sets each castle's id to the matching player id.
+    const idPositions = positions.map((pos, i) => ({
+      x: pos.x,
+      y: pos.y,
+      id: this.players[i] ? this.players[i].id : ('p' + i),
+    }));
+    this._rawCastles = buildCastles(this.heights, idPositions);
 
     // --- Background layers -------------------------------------------------
     this._paintSky();
@@ -75,6 +115,9 @@ export class Game extends Phaser.Scene {
     this.terrainGfx = this.add.graphics();
     this.terrainGfx.setDepth(10);
     this._redrawTerrain();
+
+    // --- Castles (drawn UNDER trebuchets/HP bars) -------------------------
+    this._buildCastleState();
 
     // --- Trebuchets --------------------------------------------------------
     for (const p of this.players) {
@@ -104,10 +147,20 @@ export class Game extends Phaser.Scene {
     this.cursors = this.input.keyboard.createCursorKeys();
     this.shiftKey = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.SHIFT);
     this.spaceKey = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.SPACE);
-    // Discrete-press handling for arrows + space (held repeat handled in update).
-    this.input.keyboard.on('keydown-SPACE', this._tryFire, this);
-    // Click anywhere / on the FIRE button to fire too.
+    // Hold-to-charge: SPACE down begins charging, SPACE up fires (7.3). The
+    // keydown fires repeatedly while held (OS key-repeat) — _spaceLatched +
+    // _charging guard against retrigger.
+    this._onSpaceDown = () => this._beginCharge('key');
+    this._onSpaceUp = () => this._releaseCharge('key');
+    this.input.keyboard.on('keydown-SPACE', this._onSpaceDown, this);
+    this.input.keyboard.on('keyup-SPACE', this._onSpaceUp, this);
+    // Pointer-down on the FIRE button begins charging; pointer-up (anywhere)
+    // releases. Pointer-down elsewhere is ignored for firing.
     this.input.on('pointerdown', this._onPointerDown, this);
+    this.input.on('pointerup', this._onPointerUp, this);
+    // If the pointer leaves the canvas while held, treat it as a release so the
+    // shot still fires (and the bar never sticks).
+    this.input.on('gameout', this._onPointerUp, this);
 
     // --- Net listeners (ALL removed in shutdown) ---------------------------
     // Seed hostId from the registry (set by main.js from the lobby that preceded
@@ -134,10 +187,13 @@ export class Game extends Phaser.Scene {
     net.off('left', this._onLeft);
     net.off('lobby', this._onLobby);
     if (this.input && this.input.keyboard) {
-      this.input.keyboard.off('keydown-SPACE', this._tryFire, this);
+      this.input.keyboard.off('keydown-SPACE', this._onSpaceDown, this);
+      this.input.keyboard.off('keyup-SPACE', this._onSpaceUp, this);
     }
     if (this.input) {
       this.input.off('pointerdown', this._onPointerDown, this);
+      this.input.off('pointerup', this._onPointerUp, this);
+      this.input.off('gameout', this._onPointerUp, this);
     }
     // Detach any in-flight projectile ticker so it can't fire after teardown.
     if (this._projUpdate) {
@@ -239,6 +295,103 @@ export class Game extends Phaser.Scene {
         g.fillRect(x, y + 2, 1, 1);
       }
     }
+  }
+
+  // -- castles (7.5) ------------------------------------------------------
+  // Turn the raw deterministic castle list from buildCastles into renderable
+  // state (one Graphics per owner, an `alive` flag per block) and draw them.
+  _buildCastleState() {
+    this._castles.clear();
+    const list = this._rawCastles || [];
+    for (let i = 0; i < list.length; i++) {
+      const castle = list[i];
+      if (!castle) continue;
+      const blocks = Array.isArray(castle.blocks) ? castle.blocks : [];
+      // Owner id: prefer the id the sim stamped on the castle; otherwise fall
+      // back to the player at the same index (build order matches player order).
+      let ownerId = castle.id;
+      if (ownerId == null && this.players[i]) ownerId = this.players[i].id;
+      if (ownerId == null) continue;
+      const gfx = this.add.graphics();
+      // Under trebuchets (depth 30) and HP bars, above terrain (depth 10).
+      gfx.setDepth(20);
+      const state = {
+        id: ownerId,
+        blocks,
+        alive: blocks.map(() => true),
+        gfx,
+      };
+      this._castles.set(ownerId, state);
+      this._redrawCastle(state);
+    }
+  }
+
+  _redrawCastle(state) {
+    const g = state.gfx;
+    g.clear();
+    const blocks = state.blocks;
+    for (let i = 0; i < blocks.length; i++) {
+      if (!state.alive[i]) continue;
+      const b = blocks[i];
+      const w = b.w || 1;
+      const h = b.h || 1;
+      // Per-block shade variation seeded by the block index so each wall has a
+      // stable, slightly varied masonry look (2-3 gray shades).
+      const shade = STONE_SHADES[this._stoneHash(i) % STONE_SHADES.length];
+      g.fillStyle(shade, 1);
+      g.fillRect(b.x, b.y, w, h);
+      // For taller cells, a 1px mortar line at the bottom reads as stacked
+      // stone. 1x1 cells (the common case) are left as a solid shade.
+      if (h >= 3) {
+        g.fillStyle(STONE_MORTAR, 0.6);
+        g.fillRect(b.x, b.y + h - 1, w, 1);
+      }
+    }
+  }
+
+  // Tiny stable hash so a block's shade never changes between redraws.
+  _stoneHash(i) {
+    let v = (i * 2654435761) >>> 0;
+    v ^= v >>> 13;
+    return v >>> 0;
+  }
+
+  // Apply destroyed block indices from result.castleHits[].blocks (mirroring
+  // authoritative state, like craters) and puff each removed cell.
+  _applyCastleHit(ownerId, blockIndices) {
+    const state = this._castles.get(ownerId);
+    if (!state || !Array.isArray(blockIndices)) return;
+    for (const idx of blockIndices) {
+      if (idx == null || idx < 0 || idx >= state.alive.length) continue;
+      if (!state.alive[idx]) continue;
+      state.alive[idx] = false;
+      const b = state.blocks[idx];
+      if (b) {
+        this._debrisPuff(b.x + (b.w || 1) / 2, b.y + (b.h || 1) / 2);
+      }
+    }
+    this._redrawCastle(state);
+  }
+
+  // A tiny gray dust puff where a stone block was destroyed.
+  _debrisPuff(x, y) {
+    const g = this.add.graphics();
+    g.setDepth(58);
+    g.fillStyle(0xb0b0b8, 0.9);
+    g.fillRect(-1, -1, 2, 2);
+    g.fillStyle(0x86868f, 0.9);
+    g.fillRect(0, 0, 1, 1);
+    g.setPosition(x, y);
+    this.tweens.add({
+      targets: g,
+      y: y - 4,
+      alpha: 0,
+      scaleX: 1.8,
+      scaleY: 1.8,
+      duration: 320,
+      ease: 'Quad.easeOut',
+      onComplete: () => g.destroy(),
+    });
   }
 
   // -- trebuchets ---------------------------------------------------------
@@ -375,11 +528,30 @@ export class Game extends Phaser.Scene {
     this.countText.setOrigin(1, 0);
     this.countText.setDepth(80);
 
-    // Aim readout (bottom-left).
+    // Aim readout (bottom-left). Leaves room to the right for the charge meter.
     this.aimText = this.add.text(4, WORLD_H - 12, '', fontSmall);
     this.aimText.setDepth(80);
 
-    // FIRE button (bottom-right) — chunky pixel box.
+    // Controls hint (bottom-left, above the readout) — in-canvas since ui.js
+    // has no in-game hint string to edit.
+    this.hintText = this.add.text(4, WORLD_H - 21, '◄► AIM   HOLD = POWER', {
+      fontFamily: '"Press Start 2P", monospace',
+      fontSize: '6px',
+      color: '#9a9aa8'
+    });
+    this.hintText.setDepth(80);
+
+    // Thin vertical charge meter next to the readout (7.3). Drawn each frame
+    // while charging; otherwise just shows an empty frame on your turn.
+    this.chargeMeterX = 92;
+    this.chargeMeterY = WORLD_H - 14;
+    this.chargeMeterW = 6;
+    this.chargeMeterH = 11;
+    this.chargeMeter = this.add.graphics();
+    this.chargeMeter.setDepth(80);
+
+    // FIRE button (bottom-right) — chunky pixel box that doubles as a charge
+    // bar (fills POWER_MIN..POWER_MAX while held).
     this.fireBtnRect = new Phaser.Geom.Rectangle(WORLD_W - 56, WORLD_H - 20, 52, 16);
     this.fireBtnBg = this.add.graphics();
     this.fireBtnBg.setDepth(80);
@@ -391,6 +563,7 @@ export class Game extends Phaser.Scene {
     this.fireBtnText.setOrigin(0.5, 0.5);
     this.fireBtnText.setDepth(81);
     this._drawFireBtn();
+    this._drawChargeMeter();
   }
 
   _drawFireBtn() {
@@ -400,13 +573,61 @@ export class Game extends Phaser.Scene {
     g.clear();
     g.fillStyle(0x000000, 0.9);
     g.fillRect(r.x - 2, r.y - 2, r.width + 4, r.height + 4);
-    g.fillStyle(enabled ? 0xe8c44d : 0x554a2a, 1);
+    // Base (un-charged) face. Dim when disabled.
+    g.fillStyle(enabled ? 0x6b5a22 : 0x554a2a, 1);
     g.fillRect(r.x, r.y, r.width, r.height);
+    // Charge fill (left -> right) doubles as a charge bar inside the button.
+    if (this._charging) {
+      const frac = this._chargeFrac();
+      const fillW = Math.max(1, Math.round(r.width * frac));
+      // Shift toward hot orange near full charge for feedback.
+      const fillColor = frac >= 0.999 ? 0xffe26a : 0xe8c44d;
+      g.fillStyle(fillColor, 1);
+      g.fillRect(r.x, r.y, fillW, r.height);
+    } else if (enabled) {
+      // Bright, ready-to-charge fill.
+      g.fillStyle(0xe8c44d, 1);
+      g.fillRect(r.x, r.y, r.width, r.height);
+    }
     g.lineStyle(2, enabled ? 0xfff0b0 : 0x332a18, 1);
     g.strokeRect(r.x, r.y, r.width, r.height);
+    this.fireBtnText.setText(this._charging ? String(this._chargePower) : 'FIRE');
     this.fireBtnText.setColor(enabled ? '#1a0a0a' : '#7a6a40');
     this.fireBtnBg.setVisible(true);
     this.fireBtnText.setVisible(true);
+  }
+
+  // Thin vertical charge meter beside the aim readout. Fills bottom -> top.
+  _drawChargeMeter() {
+    const g = this.chargeMeter;
+    g.clear();
+    const show = this._myTurn && !this._animating && !this._gameOver;
+    if (!show) {
+      g.setVisible(false);
+      return;
+    }
+    g.setVisible(true);
+    const x = this.chargeMeterX;
+    const y = this.chargeMeterY;
+    const w = this.chargeMeterW;
+    const h = this.chargeMeterH;
+    // Frame + dark track.
+    g.fillStyle(0x000000, 0.85);
+    g.fillRect(x - 1, y - 1, w + 2, h + 2);
+    g.fillStyle(0x2a2a2a, 1);
+    g.fillRect(x, y, w, h);
+    // Fill from the bottom up by the current charge fraction.
+    const frac = this._charging ? this._chargeFrac() : 0;
+    const fillH = Math.round(h * frac);
+    if (fillH > 0) {
+      g.fillStyle(frac >= 0.999 ? 0xffe26a : 0xe8c44d, 1);
+      g.fillRect(x, y + (h - fillH), w, fillH);
+    }
+  }
+
+  // 0..1 fraction of the charge window currently held.
+  _chargeFrac() {
+    return (this._chargePower - POWER_MIN) / Math.max(1, (POWER_MAX - POWER_MIN));
   }
 
   _refreshHud() {
@@ -447,15 +668,18 @@ export class Game extends Phaser.Scene {
       this.turnBanner.setText('');
     }
 
-    // Aim readout.
-    if (this._myTurn && !this._gameOver) {
-      this.aimText.setText('ANGLE ' + this._aimAngle + '  POWER ' + this._aimPower);
+    // Aim readout — ARC + direction + elevation (7.1), e.g. 'ARC ► 62'.
+    const showAim = this._myTurn && !this._gameOver;
+    if (showAim) {
+      this.aimText.setText(this._arcLabel());
       this.aimText.setVisible(true);
     } else {
       this.aimText.setVisible(false);
     }
+    if (this.hintText) this.hintText.setVisible(showAim);
 
     this._drawFireBtn();
+    this._drawChargeMeter();
     this._drawAimLine();
   }
 
@@ -467,7 +691,10 @@ export class Game extends Phaser.Scene {
     const baseX = me.container.x;
     const baseY = me.container.y - MUZZLE_DY;
     const rad = (this._aimAngle * Math.PI) / 180;
-    const len = 14 + (this._aimPower / 100) * 26;
+    // While charging the line grows with power so the player sees how hard the
+    // shot will be; otherwise it shows a fixed medium length (pure direction).
+    const powerFrac = this._charging ? this._chargeFrac() : 0.45;
+    const len = 14 + powerFrac * 26;
     const ex = baseX + Math.cos(rad) * len;
     const ey = baseY - Math.sin(rad) * len;
     // Dotted-ish aim line.
@@ -485,11 +712,12 @@ export class Game extends Phaser.Scene {
   _applyTurn(turnId, announce) {
     this.turn = turnId;
     const wasMine = this._myTurn;
+    // Any in-flight charge belongs to the previous turn — drop it silently.
+    this._cancelCharge();
     this._myTurn = (turnId === net.you);
     if (this._myTurn) {
       // Restore remembered aim if any.
       if (this._heldAngle != null) this._aimAngle = this._heldAngle;
-      if (this._heldPower != null) this._aimPower = this._heldPower;
       this._clampAim();
       if (announce && !wasMine) {
         try { SFX.play('yourturn'); } catch (e) { /* ignore */ }
@@ -499,33 +727,102 @@ export class Game extends Phaser.Scene {
     this._refreshHud();
   }
 
+  // Snap the aim angle into a valid launch band (7.1): right [50..85] or left
+  // [95..130]. Values in the dead gap are pushed to the nearest valid bound;
+  // anything else is clamped to the overall [50..130] sweep range.
   _clampAim() {
-    this._aimAngle = Math.max(ANGLE_MIN, Math.min(ANGLE_MAX, Math.round(this._aimAngle)));
-    this._aimPower = Math.max(POWER_MIN, Math.min(POWER_MAX, Math.round(this._aimPower)));
+    let a = Math.round(this._aimAngle);
+    if (!Number.isFinite(a)) a = RIGHT_LO; // NaN -> ELEV_MIN rightward
+    if (a < RIGHT_LO) a = RIGHT_LO;
+    else if (a > LEFT_HI) a = LEFT_HI;
+    else if (a > RIGHT_HI && a < LEFT_LO) {
+      // Inside the dead gap [86..94]: snap to whichever bound is nearer (ties
+      // resolve to the right side, matching the 85<->95 boundary).
+      a = (a - RIGHT_HI) <= (LEFT_LO - a) ? RIGHT_HI : LEFT_LO;
+    }
+    this._aimAngle = a;
+  }
+
+  // HUD label 'ARC ► 62' (right) / 'ARC ◄ 70' (left) — direction + elevation.
+  _arcLabel() {
+    const right = this._aimAngle <= RIGHT_HI;
+    const elev = right ? this._aimAngle : (180 - this._aimAngle);
+    return 'ARC ' + (right ? '►' : '◄') + ' ' + elev;
   }
 
   _onPointerDown(pointer) {
-    if (!this._myTurn || this._animating || this._gameOver) return;
+    if (!this._canCharge()) return;
     // Convert screen pointer to world coords (FIT scale handled by Phaser).
     const x = pointer.worldX;
     const y = pointer.worldY;
     if (Phaser.Geom.Rectangle.Contains(this.fireBtnRect, x, y)) {
-      this._tryFire();
+      this._beginCharge('pointer');
     }
   }
 
-  _tryFire() {
-    if (!this._myTurn || this._animating || this._gameOver) return;
+  _onPointerUp() {
+    this._releaseCharge('pointer');
+  }
+
+  // Whether starting a charge is currently allowed (your turn, idle, alive).
+  _canCharge() {
+    if (!this._myTurn || this._animating || this._gameOver) return false;
     const me = this._trebs.get(net.you);
-    if (!me || me.dead) return;
+    return !!(me && !me.dead);
+  }
+
+  // Begin (or ignore a duplicate begin of) a charge. `source` is 'key' or
+  // 'pointer'; only the source that began it can release it.
+  _beginCharge(source) {
+    if (source === 'key') {
+      // Guard against OS key-repeat retriggering after a release-fire: the
+      // latch stays set until keyup clears it.
+      if (this._spaceLatched) return;
+      this._spaceLatched = true;
+    }
+    if (this._charging) return;
+    if (!this._canCharge()) return;
+    this._charging = true;
+    this._chargeSource = source;
+    this._chargeStart = this.time.now;
+    this._chargePower = POWER_MIN;
+    this._refreshHud();
+  }
+
+  // Release the charge and fire with the charged power. Only the source that
+  // started the charge releases it (a stray pointerup won't fire a key charge).
+  _releaseCharge(source) {
+    if (source === 'key') this._spaceLatched = false;
+    if (!this._charging) return;
+    if (this._chargeSource !== source) return;
+    const power = this._chargePower;
+    this._charging = false;
+    this._chargeSource = null;
+    this._fire(power);
+  }
+
+  // Silently abort any in-flight charge (turn end / timeout). The Space latch
+  // is left as-is: a still-held key must not start a brand new charge on the
+  // next turn until it is physically released (keyup clears the latch).
+  _cancelCharge() {
+    if (!this._charging) return;
+    this._charging = false;
+    this._chargeSource = null;
+    this._refreshHud();
+  }
+
+  // Commit the shot. Power is the charged value; angle is the current aim.
+  _fire(power) {
+    const me = this._trebs.get(net.you);
+    if (!me || me.dead) { this._refreshHud(); return; }
     this._clampAim();
     this._heldAngle = this._aimAngle;
-    this._heldPower = this._aimPower;
+    const p = Math.max(POWER_MIN, Math.min(POWER_MAX, Math.round(power)));
     // Lock input until the shot resolves.
     this._animating = true;
     this._myTurn = false;
     this._refreshHud();
-    net.send({ t: 'fire', angle: this._aimAngle, power: this._aimPower });
+    net.send({ t: 'fire', angle: this._aimAngle, power: p });
   }
 
   update(time, delta) {
@@ -564,7 +861,30 @@ export class Game extends Phaser.Scene {
       this.countText.setText('');
     }
 
-    // Keyboard aiming (held-repeat with discrete-press for crispness).
+    // Hold-to-charge progress (7.3). Power ramps POWER_MIN..POWER_MAX over
+    // CHARGE_TIME_MS; reaching full charge auto-fires.
+    if (this._charging) {
+      if (!this._canCharge()) {
+        // Turn ended / shot started under us — abort silently.
+        this._cancelCharge();
+      } else {
+        const frac = Math.min(1, (this.time.now - this._chargeStart) / CHARGE_TIME_MS);
+        this._chargePower = Math.round(POWER_MIN + (POWER_MAX - POWER_MIN) * frac);
+        this._drawFireBtn();
+        this._drawChargeMeter();
+        this._drawAimLine();
+        if (frac >= 1) {
+          // Auto-fire at full charge. Keep the same source-release semantics so
+          // the Space latch is cleared only on the real keyup.
+          const power = POWER_MAX;
+          this._charging = false;
+          this._chargeSource = null;
+          this._fire(power);
+        }
+      }
+    }
+
+    // Keyboard aiming — LEFT/RIGHT sweep the arc (UP/DOWN are dead in V2).
     if (this._myTurn && !this._animating && !this._gameOver) {
       this._handleAimKeys(time);
     }
@@ -586,18 +906,36 @@ export class Game extends Phaser.Scene {
       return false;
     };
 
-    if (repeatOk(this.cursors.left)) { this._aimAngle += step; changed = true; }
-    if (repeatOk(this.cursors.right)) { this._aimAngle -= step; changed = true; }
-    if (repeatOk(this.cursors.up)) { this._aimPower += step; changed = true; }
-    if (repeatOk(this.cursors.down)) { this._aimPower -= step; changed = true; }
+    // LEFT raises the angle toward 180 (aims more leftward); RIGHT lowers it
+    // toward 0 (more rightward). Direction is tracked so the sweep jumps the
+    // dead gap deterministically: 85 -> 95 going left, 95 -> 85 going right.
+    let dir = 0;
+    if (repeatOk(this.cursors.left)) { this._aimAngle += step; dir = +1; changed = true; }
+    if (repeatOk(this.cursors.right)) { this._aimAngle -= step; dir = -1; changed = true; }
 
     if (changed) {
-      this._clampAim();
+      this._snapAim(dir);
       this._heldAngle = this._aimAngle;
-      this._heldPower = this._aimPower;
-      this.aimText.setText('ANGLE ' + this._aimAngle + '  POWER ' + this._aimPower);
+      this.aimText.setText(this._arcLabel());
       this._drawAimLine();
     }
+  }
+
+  // Sweep snap (7.1): keep the angle in a valid band, jumping the dead gap in
+  // the direction of travel so the sweep crosses 85<->95 cleanly. `dir` is +1
+  // for a leftward sweep (increasing angle) and -1 for rightward.
+  _snapAim(dir) {
+    let a = Math.round(this._aimAngle);
+    if (a < RIGHT_LO) a = RIGHT_LO;
+    else if (a > LEFT_HI) a = LEFT_HI;
+    else if (a > RIGHT_HI && a < LEFT_LO) {
+      // Landed in the gap: sweeping left jumps up to LEFT_LO, sweeping right
+      // jumps down to RIGHT_HI. (dir 0 falls back to nearest bound.)
+      if (dir > 0) a = LEFT_LO;
+      else if (dir < 0) a = RIGHT_HI;
+      else a = (a - RIGHT_HI) <= (LEFT_LO - a) ? RIGHT_HI : LEFT_LO;
+    }
+    this._aimAngle = a;
   }
 
   // -- shot animation -----------------------------------------------------
@@ -607,25 +945,51 @@ export class Game extends Phaser.Scene {
     this._myTurn = false;
     this._refreshHud();
 
+    // A charge that was somehow still live (shouldn't happen — firing locks
+    // input) must not survive into the animation.
+    this._cancelCharge();
+
     // Capture the current turn epoch. If a later turn/left message advances it
     // while this shot is animating, _afterShot must NOT re-apply this shot's
     // (now stale) m.next.
     const shotEpoch = this._turnEpoch;
 
+    const traj = m.trajectory || [];
+
+    // Fire sequence (7.4): idle -> swing (90 ms) -> release (held ~360 ms) ->
+    // idle. The projectile + whoosh start AT the swing->release boundary, so we
+    // delay the trajectory animation by 90 ms.
     const shooter = this._trebs.get(m.shooterId);
-    // Fire animation on shooter.
+    const SWING_MS = 90;
+    const RELEASE_HOLD_MS = 360;
+
     if (shooter && !shooter.dead) {
-      shooter.sprite.setTexture('treb_' + shooter.colorIdx + '_fire');
-      this.time.delayedCall(420, () => {
+      const c = shooter.colorIdx;
+      // Frame 1: swing immediately.
+      shooter.sprite.setTexture('treb_' + c + '_swing');
+      // Frame 2: release at the swing->release boundary.
+      this.time.delayedCall(SWING_MS, () => {
         if (shooter.sprite && !shooter.dead) {
-          shooter.sprite.setTexture('treb_' + shooter.colorIdx + '_idle');
+          shooter.sprite.setTexture('treb_' + c + '_release');
+        }
+      });
+      // Back to idle after the release is held.
+      this.time.delayedCall(SWING_MS + RELEASE_HOLD_MS, () => {
+        if (shooter.sprite && !shooter.dead) {
+          shooter.sprite.setTexture('treb_' + c + '_idle');
         }
       });
     }
-    try { SFX.play('fire'); } catch (e) { /* ignore */ }
 
-    const traj = m.trajectory || [];
-    this._animateProjectile(traj, () => this._resolveImpact(m, shotEpoch));
+    // Launch the projectile + 'fire' SFX at the swing->release boundary.
+    this.time.delayedCall(SWING_MS, () => {
+      try { SFX.play('fire'); } catch (e) { /* ignore */ }
+      // Optional dust puff at the trebuchet on release.
+      if (shooter && !shooter.dead) {
+        this._debrisPuff(shooter.container.x, shooter.container.y - 2);
+      }
+      this._animateProjectile(traj, () => this._resolveImpact(m, shotEpoch));
+    });
   }
 
   _animateProjectile(traj, done) {
@@ -677,6 +1041,10 @@ export class Game extends Phaser.Scene {
     this.rock.setVisible(false);
     const res = m.result || {};
 
+    // Big-hit emphasis (7.2): plunge >= 1.25 renders popups 1px larger + flash.
+    const plunge = typeof res.plunge === 'number' ? res.plunge : 1;
+    const bigHit = plunge >= 1.25;
+
     // Explosion at impact (if any).
     const impact = res.impact;
     const hasDeaths = (res.deaths || []).length > 0;
@@ -692,13 +1060,42 @@ export class Game extends Phaser.Scene {
       }
     }
 
-    // Apply hits (hp authoritative from server).
+    // Castle destruction (7.5): mirror destroyed block indices and puff them.
+    for (const ch of (res.castleHits || [])) {
+      if (ch && ch.id != null) this._applyCastleHit(ch.id, ch.blocks);
+    }
+
+    // Per-position popup stagger: if two numbers land on the same victim, the
+    // second rises 120 ms later so they don't overlap.
+    const popupStagger = new Map(); // id -> count
+
+    // Apply blast hits (hp authoritative). hp may be superseded below by a
+    // matching castleHits entry (both carry the same final hp).
     for (const h of (res.hits || [])) {
       const t = this._trebs.get(h.id);
       if (!t) continue;
       t.p.hp = h.hp;
       this._drawHp(t);
       if (!t.dead) this._flashHit(t);
+      const idx = popupStagger.get(h.id) || 0;
+      popupStagger.set(h.id, idx + 1);
+      this._damagePopup(h.id, h.dmg, false, bigHit, idx * 120);
+    }
+
+    // Apply castle-damage hp + popups (stone-white). hp here is the owner's
+    // final hp after all of this shot's damage (same value as any hits[].hp).
+    for (const ch of (res.castleHits || [])) {
+      if (!ch || ch.id == null) continue;
+      const t = this._trebs.get(ch.id);
+      if (t) {
+        t.p.hp = ch.hp;
+        this._drawHp(t);
+      }
+      if (ch.dmg > 0) {
+        const idx = popupStagger.get(ch.id) || 0;
+        popupStagger.set(ch.id, idx + 1);
+        this._damagePopup(ch.id, ch.dmg, true, bigHit, idx * 120);
+      }
     }
 
     // Settle (drop) players whose ground was carved out.
@@ -773,6 +1170,56 @@ export class Game extends Phaser.Scene {
     this.time.delayedCall(90, () => { if (t.sprite) t.sprite.clearTint(); });
     this.time.delayedCall(180, () => { if (t.sprite && !t.dead) t.sprite.setTintFill(0xffffff); });
     this.time.delayedCall(270, () => { if (t.sprite) t.sprite.clearTint(); });
+  }
+
+  // Floating damage popup (7.2). `victimId` locates the position; `stone` =
+  // pale stone-white (castle damage) vs red (blast); `big` adds 1px + flash
+  // for plunge >= 1.25; `delayMs` staggers same-position numbers.
+  _damagePopup(victimId, dmg, stone, big, delayMs) {
+    const pos = this._victimPos(victimId);
+    if (!pos) return;
+    const start = () => {
+      if (!this.scene || !this.add) return;
+      const baseSize = big ? 9 : 8;
+      const color = stone ? '#e6e6ee' : '#ff5a4a';
+      const txt = this.add.text(pos.x, pos.y, '-' + Math.max(0, Math.round(dmg)), {
+        fontFamily: '"Press Start 2P", monospace',
+        fontSize: baseSize + 'px',
+        color,
+        stroke: '#000000',
+        strokeThickness: 3,
+      });
+      txt.setOrigin(0.5, 1);
+      txt.setDepth(92);
+      txt.setResolution(2);
+      if (big) {
+        // Brief white flash on a big hit.
+        txt.setTintFill(0xffffff);
+        this.time.delayedCall(110, () => { if (txt && txt.active) txt.clearTint(); });
+      }
+      this.tweens.add({
+        targets: txt,
+        y: pos.y - 14,
+        alpha: 0,
+        duration: 900,
+        ease: 'Quad.easeOut',
+        onComplete: () => txt.destroy(),
+      });
+    };
+    if (delayMs > 0) this.time.delayedCall(delayMs, start);
+    else start();
+  }
+
+  // Where to float a popup for a given player id — above their trebuchet, or
+  // the authoritative player record if the treb was already removed.
+  _victimPos(id) {
+    const t = this._trebs.get(id);
+    if (t && t.container) {
+      return { x: t.container.x, y: t.container.y - 16 };
+    }
+    const p = (this.players || []).find((q) => q.id === id);
+    if (p) return { x: p.x, y: p.y - 16 };
+    return null;
   }
 
   _smallPoof(x, y) {

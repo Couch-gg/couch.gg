@@ -18,19 +18,25 @@
 // ('start', 'shot' with `next`, 'turn'), we set net.you = <current turn id>.
 // The existing Game scene treats the active hotseat player as "you" and unlocks
 // input. Because everyone shares the screen, this is exactly what we want.
+//
+// V2 SIEGE UPDATE (CONTRACT §7) — this driver stays in EXACT parity with
+// server/game.js: elevation-band angle clamp (sim's clampElevation), castle
+// build/destruction/scoring (sim's buildCastles + resolveCastleDamage), and the
+// `plunge`/`castleHits` message fields are identical field-for-field.
 
 import {
   generateTerrain,
   placePlayers,
+  buildCastles,
   simulateShot,
   applyCrater,
   settlePlayers,
+  resolveCastleDamage,
+  clampElevation,
 } from '/shared/sim.js';
 
 import {
   WIND_MAX,
-  ANGLE_MIN,
-  ANGLE_MAX,
   POWER_MIN,
   POWER_MAX,
   PLAYER_HP,
@@ -78,6 +84,11 @@ class LocalGame {
     // Canonical mutable world state, rebuilt on every start/rematch.
     this.seed = 0;
     this.heights = null;
+
+    // Authoritative castle state aligned to `this.order` (mirrors server).
+    //   castles[i] = { id, blocks: [{ x, y, w:1, h:1 }, ...] }
+    // The sim marks destroyed cells with block.destroyed = true.
+    this.castles = [];
 
     // Per-player physical state keyed by id ('local_0'..'local_3').
     //   { id, x, y, hp, alive }
@@ -170,6 +181,30 @@ class LocalGame {
     return arr;
   }
 
+  // Build authoritative castle state from spawn positions, tagging each position
+  // with its owner id so the sim stamps castles[i].id (mirrors
+  // server/game.js#buildCastlesState).
+  buildCastlesState(positions) {
+    this.castles = [];
+    let built = [];
+    try {
+      const posList = positions.map((p, i) => ({
+        x: p.x,
+        y: p.y,
+        id: this.order[i],
+      }));
+      built = buildCastles(this.heights, posList) || [];
+    } catch (err) {
+      built = [];
+    }
+    for (let i = 0; i < this.order.length; i++) {
+      const id = this.order[i];
+      const c = built[i] || { blocks: [] };
+      const blocks = Array.isArray(c.blocks) ? c.blocks : [];
+      this.castles.push({ id, blocks });
+    }
+  }
+
   // --- lifecycle -----------------------------------------------------------
 
   // Build a fresh world from the roster and begin play (also used by rematch).
@@ -205,6 +240,9 @@ class LocalGame {
         alive: true,
       });
     }
+
+    // Castles: built immediately after placePlayers, same order as the server.
+    this.buildCastlesState(positions);
 
     // Random first turn among players (mirrors server).
     this.turn = this.order[(Math.random() * n) | 0] || this.order[0] || null;
@@ -258,7 +296,9 @@ class LocalGame {
     const shooter = this.units.get(shooterId);
     if (!shooter || !shooter.alive) return;
 
-    const angle = clamp(rawAngle, ANGLE_MIN, ANGLE_MAX);
+    // Angle clamps to the trebuchet elevation band (V2) via the sim's exact
+    // clamp; power to [MIN, MAX].
+    const angle = clampElevation(rawAngle);
     const power = clamp(rawPower, POWER_MIN, POWER_MAX);
 
     const firedWind = this.wind;
@@ -277,6 +317,7 @@ class LocalGame {
         wind: firedWind,
         heights: this.heights,
         players: this.simPlayers(),
+        castles: this.castles,
       });
     } catch (err) {
       result = { trajectory: [], impact: null, crater: null, hits: [] };
@@ -286,7 +327,9 @@ class LocalGame {
     const impact = result.impact || null;
     const crater = result.crater || null;
     const rawHits = Array.isArray(result.hits) ? result.hits : [];
+    const plunge = typeof result.plunge === 'number' ? result.plunge : undefined;
 
+    // Apply crater FIRST so castle collapse + settle see post-crater terrain.
     if (crater) {
       try {
         applyCrater(this.heights, crater);
@@ -295,18 +338,73 @@ class LocalGame {
       }
     }
 
-    const hits = [];
-    const deaths = [];
+    // Resolve castle block destruction (CONTRACT §7.5) — blast + collapse +
+    // per-owner scoring in the sim's helper. Must run AFTER applyCrater. Returns
+    // castleHits WITHOUT hp (we add hp once all damage is committed).
+    let rawCastleHits = [];
+    try {
+      const cres = resolveCastleDamage(this.castles, impact, this.heights);
+      if (cres && Array.isArray(cres.castleHits)) rawCastleHits = cres.castleHits;
+    } catch (err) {
+      rawCastleHits = [];
+    }
+
+    // Tally blast damage per id (apply atomically with castle damage below).
+    const blastDmg = new Map();
     for (const h of rawHits) {
       if (!h || h.id == null) continue;
       const u = this.units.get(h.id);
       if (!u || !u.alive) continue;
       const dmg = Math.max(0, Math.round(Number(h.dmg) || 0));
+      blastDmg.set(h.id, (blastDmg.get(h.id) || 0) + dmg);
+    }
+
+    // Tally castle damage per owner (the sim already applied the cap + ceil).
+    const castleDmg = new Map();
+    for (const ch of rawCastleHits) {
+      if (!ch || ch.id == null) continue;
+      const dmg = Math.max(0, Math.round(Number(ch.dmg) || 0));
+      castleDmg.set(ch.id, (castleDmg.get(ch.id) || 0) + dmg);
+    }
+
+    // Commit all damage to hp atomically, then derive final hp for messages.
+    const deaths = [];
+    const finalHp = new Map();
+    const affected = new Set([...blastDmg.keys(), ...castleDmg.keys()]);
+    for (const id of affected) {
+      const u = this.units.get(id);
+      if (!u || !u.alive) continue;
+      const total = (blastDmg.get(id) || 0) + (castleDmg.get(id) || 0);
       const wasAlive = u.alive;
-      u.hp = Math.max(0, u.hp - dmg);
+      u.hp = Math.max(0, u.hp - total);
       u.alive = u.hp > 0;
-      hits.push({ id: u.id, dmg, hp: u.hp });
-      if (wasAlive && !u.alive) deaths.push(u.id);
+      finalHp.set(id, u.hp);
+      if (wasAlive && !u.alive) deaths.push(id);
+    }
+
+    const hpFor = (id) => {
+      if (finalHp.has(id)) return finalHp.get(id);
+      const u = this.units.get(id);
+      return u ? u.hp : 0;
+    };
+
+    // Build the broadcast `hits` (blast-only) with post-ALL-damage hp.
+    const hits = [];
+    for (const h of rawHits) {
+      if (!h || h.id == null) continue;
+      if (!blastDmg.has(h.id)) continue;
+      const dmg = Math.max(0, Math.round(Number(h.dmg) || 0));
+      hits.push({ id: h.id, dmg, hp: hpFor(h.id) });
+    }
+
+    // Build `castleHits` (with post-ALL-damage hp). When a player takes both
+    // blast and castle damage, hits[].hp and castleHits[].hp are the same value.
+    const castleHits = [];
+    for (const ch of rawCastleHits) {
+      if (!ch || ch.id == null) continue;
+      const dmg = Math.max(0, Math.round(Number(ch.dmg) || 0));
+      const blocks = Array.isArray(ch.blocks) ? ch.blocks.slice() : [];
+      castleHits.push({ id: ch.id, dmg, hp: hpFor(ch.id), blocks });
     }
 
     let settled = [];
@@ -350,6 +448,9 @@ class LocalGame {
       this.net.you = this.turn;
     }
 
+    const resultOut = { impact, crater, hits, castleHits, deaths, settled };
+    if (plunge !== undefined) resultOut.plunge = plunge;
+
     this.net.emit('shot', {
       t: 'shot',
       shooterId,
@@ -357,7 +458,7 @@ class LocalGame {
       power,
       wind: firedWind,
       trajectory,
-      result: { impact, crater, hits, deaths, settled },
+      result: resultOut,
       next,
       winner,
       draw,
@@ -414,6 +515,7 @@ class LocalGame {
     this.units.clear();
     this.order = [];
     this.heights = null;
+    this.castles = [];
     this.turn = null;
     this.state = 'idle';
     if (this.net.local === this) this.net.local = null;

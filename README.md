@@ -40,18 +40,26 @@ the same players.
 
 ## How to play
 
-Turn-based artillery duel. Last trebuchet standing wins.
+Turn-based siege duel. Last trebuchet standing wins.
 
 | Input | Action |
 |---|---|
-| ← / → | Adjust launch angle (hold **Shift** for ±5) |
-| ↑ / ↓ | Adjust power (hold **Shift** for ±5) |
-| **Space** or **FIRE** button | Launch! |
+| ← / → | Sweep your launch arc (hold **Shift** for ±5°) |
+| **Hold** Space or the FIRE button | Charge the throw — longer hold = more power |
+| Release | Launch! (full charge fires automatically) |
 
-- Angles above 90° shoot **left** — you can engage targets on either side.
+- Trebuchets only **lob**: the arc stays between 50° and 85° above the horizon —
+  sweep past vertical to switch sides. No flat shots; this is a siege engine.
+- **Plunging fire hits harder**: the faster your stone is *falling* on impact,
+  the more damage it deals (up to ~1.5×). High mortar arcs crush; shallow lobs
+  glance. Damage numbers pop up at every impact.
+- Each trebuchet is guarded by a **stone castle**. Walls block incoming shots —
+  but smashed masonry wounds its owner (capped per shot), so chipping the fort
+  is progress. Lob *over* the walls for direct hits.
 - **Wind** changes every turn (top of the screen) and bends your shot — read it.
-- Impacts carve **craters** out of the terrain; trebuchets fall when the ground
-  beneath them is destroyed. Self-damage is possible. You have **60 s** per turn.
+- Impacts carve **craters**; undermined towers collapse, and trebuchets fall when
+  the ground beneath them is destroyed. Self-damage is very possible. **60 s** per
+  turn.
 - After a game the host can hit **REMATCH** for a fresh battlefield.
 
 ## Tech

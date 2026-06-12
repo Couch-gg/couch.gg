@@ -26,6 +26,12 @@ import {
   PLAYER_HIT_R,
   PLAYER_HIT_DY,
   MUZZLE_DY,
+  ELEV_MIN,
+  ELEV_MAX,
+  PLUNGE_VY_REF,
+  CASTLE_TOWER_H,
+  CASTLE_DMG_PER_BLOCK,
+  CASTLE_DMG_CAP,
   mulberry32,
 } from './constants.js';
 
@@ -34,6 +40,43 @@ const DEG2RAD = Math.PI / 180;
 // Clamp helper.
 function clamp(v, lo, hi) {
   return v < lo ? lo : v > hi ? hi : v;
+}
+
+/**
+ * clampElevation(angle) -> number
+ *
+ * V2 SIEGE — trebuchet-realistic arcs. Launch angles live in two elevation
+ * bands (0=right/90=up/180=left convention):
+ *   shooting right: [ELEV_MIN .. ELEV_MAX]            e.g. 50..85
+ *   shooting left:  [180-ELEV_MAX .. 180-ELEV_MIN]    e.g. 95..130
+ * Invalid angles are clamped to the NEAREST valid bound. The dead zone
+ * (85..95) snaps to whichever side is nearer; a tie favours the right band.
+ * NaN / non-finite -> ELEV_MIN (rightward), per spec.
+ */
+export function clampElevation(angle) {
+  const a = Number(angle);
+  if (!Number.isFinite(a)) return ELEV_MIN;
+
+  const rightLo = ELEV_MIN;
+  const rightHi = ELEV_MAX;
+  const leftLo = 180 - ELEV_MAX; // e.g. 95
+  const leftHi = 180 - ELEV_MIN; // e.g. 130
+
+  // Already inside one of the two valid bands.
+  if (a >= rightLo && a <= rightHi) return a;
+  if (a >= leftLo && a <= leftHi) return a;
+
+  // Below the right band entirely (too flat / shooting low-right) -> ELEV_MIN.
+  if (a < rightLo) return rightLo;
+  // Above the left band entirely (too flat / shooting low-left) -> leftHi.
+  if (a > leftHi) return leftHi;
+
+  // In the dead zone between the bands (rightHi < a < leftLo): snap to the
+  // nearest bound. Distance to the right band's top vs the left band's bottom.
+  const dRight = a - rightHi; // distance up to 85
+  const dLeft = leftLo - a;   // distance up to 95
+  // Tie (a exactly at the midpoint, e.g. 90) favours the right band.
+  return dRight <= dLeft ? rightHi : leftLo;
 }
 
 // Smooth interpolation curve (smoothstep) for value noise — gives gentle,
@@ -222,14 +265,117 @@ export function placePlayers(heights, n, seed) {
 }
 
 /**
- * simulateShot({ shooterId, x, y, angle, power, wind, heights, players })
- *   -> { trajectory, impact, crater, hits }
+ * buildCastles(heights, positions) -> castles
  *
- * Pure: does NOT mutate heights or players. Integrates a projectile with fixed
- * DT, samples the trajectory, and resolves the first terminating event.
+ * V2 SIEGE — deterministic castle construction. Called by server, online
+ * client, and local driver right after placePlayers (same order, same args) so
+ * castle state stays identical everywhere.
+ *
+ * For player i at positions[i] = { x, y } (and optionally { id }): two flanking
+ * towers on the pad edges. Each tower is 3 stone columns wide (1px cells),
+ * rising CASTLE_TOWER_H px from the terrain surface, topped with 1-px
+ * crenellations (merlons on the two outer columns of each tower). Left tower
+ * columns sit at x-11, x-10, x-9; right tower at x+9, x+10, x+11.
+ *
+ * ANCHORING (bug fix): each tower column is anchored to THAT column's own
+ * terrain surface — its bottom block's top edge is round(heights[col]) - 1.
+ * The tower columns (offsets ±9..11) lie OUTSIDE the ±6 pad placePlayers
+ * flattens, so on sloped terrain the column ground differs from the pad-center
+ * surface. Anchoring per-column keeps every bottom block resting on its own
+ * ground, so the floating-collapse phase never falsely undermines a freshly
+ * built castle. Falls back to the position's own y for out-of-range columns.
+ *
+ * Returns: castles[i] = { id, blocks: [{ x, y, w:1, h:1 }, ...] } where each
+ * block is a 1x1 logical stone cell. y is the cell's TOP edge (cell occupies
+ * the vertical span [y, y+1)). The block order is fully deterministic — a
+ * block's index identifies that physical cell forever (so clients can mirror
+ * destroyed indices from result.castleHits[].blocks). Order: left tower columns
+ * low-to-high x (each column bottom-up rows, then its merlon if outer), then the
+ * right tower the same way. `id` is taken from positions[i].id when present,
+ * else null (caller sets it).
+ *
+ * Pure: does NOT mutate heights or positions.
  */
-export function simulateShot({ shooterId, x, y, angle, power, wind, heights, players }) {
-  const rad = angle * DEG2RAD;
+export function buildCastles(heights, positions) {
+  const castles = [];
+  if (!Array.isArray(positions)) return castles;
+
+  // Column offsets for the two towers, outer -> inner per tower. Order matters:
+  // it fixes the block index layout forever.
+  const towerOffsets = [
+    [-11, -10, -9], // left tower (left col is the outer/merlon col)
+    [9, 10, 11],    // right tower (right col is the outer/merlon col)
+  ];
+
+  for (let i = 0; i < positions.length; i++) {
+    const pos = positions[i];
+    if (!pos) {
+      castles.push({ id: null, blocks: [] });
+      continue;
+    }
+    const baseX = Math.round(pos.x);
+    // Per-column surface resolver: the rounded terrain height at the given
+    // column, falling back to the position's own y when out of range. Each
+    // tower column rises from its OWN ground (not the pad center) so blocks are
+    // never born already-floating on sloped terrain.
+    const surfaceYAt = (col) => {
+      if (heights && col >= 0 && col < heights.length) return Math.round(heights[col]);
+      return Math.round(pos.y);
+    };
+
+    const blocks = [];
+    // For each tower, stack CASTLE_TOWER_H cells per column from THAT column's
+    // surface up, then add a crenellation merlon on the outer column (one extra
+    // cell on top of that column's wall).
+    for (let tIdx = 0; tIdx < towerOffsets.length; tIdx++) {
+      const cols = towerOffsets[tIdx];
+      for (let c = 0; c < cols.length; c++) {
+        const bx = baseX + cols[c];
+        // Skip columns that fall outside the world.
+        if (bx < 0 || bx >= WORLD_W) continue;
+        const colSurfaceY = surfaceYAt(bx);
+        // Wall cells: row 0 sits with its bottom on this column's surface (top
+        // edge at colSurfaceY - 1), rising upward.
+        for (let row = 0; row < CASTLE_TOWER_H; row++) {
+          const topY = colSurfaceY - 1 - row;
+          blocks.push({ x: bx, y: topY, w: 1, h: 1 });
+        }
+      }
+      // Crenellations: one extra merlon cell on the outer column of this tower,
+      // sitting directly atop that column's wall (row CASTLE_TOWER_H). The outer
+      // column is the first listed for the left tower and the last for the right.
+      const merlonCol = tIdx === 0 ? cols[0] : cols[cols.length - 1];
+      const mx = baseX + merlonCol;
+      if (mx >= 0 && mx < WORLD_W) {
+        const merlonTopY = surfaceYAt(mx) - 1 - CASTLE_TOWER_H;
+        blocks.push({ x: mx, y: merlonTopY, w: 1, h: 1 });
+      }
+    }
+
+    castles.push({
+      id: pos.id != null ? pos.id : null,
+      blocks,
+    });
+  }
+
+  return castles;
+}
+
+/**
+ * simulateShot({ shooterId, x, y, angle, power, wind, heights, players, castles })
+ *   -> { trajectory, impact, crater, hits, plunge, vyImpact }
+ *
+ * Pure: does NOT mutate heights, players, or castles. Integrates a projectile
+ * with fixed DT, samples the trajectory, and resolves the first terminating
+ * event. The optional `castles` argument (V2) makes intact castle blocks
+ * collidable; block checks run BEFORE player-circle checks (walls protect).
+ * When `castles` is omitted/empty, behavior matches v1 exactly.
+ */
+export function simulateShot({ shooterId, x, y, angle, power, wind, heights, players, castles }) {
+  // V2: clamp to the valid elevation bands. Invalid -> nearest bound,
+  // NaN -> ELEV_MIN rightward.
+  const elev = clampElevation(angle);
+  const rad = elev * DEG2RAD;
   const speed = (power / 100) * SPEED_MAX;
 
   // Spawn at the muzzle, above the trebuchet base.
@@ -254,7 +400,26 @@ export function simulateShot({ shooterId, x, y, angle, power, wind, heights, pla
   const hitReach = PLAYER_HIT_R + PROJ_RADIUS;
   const hitReachSq = hitReach * hitReach;
 
+  // V2: castle block collision. A projectile within (PROJ_RADIUS + 0.5) of an
+  // intact block center terminates there. Block checks run before player checks
+  // (walls protect) and after the same arming delay. We flatten the intact
+  // blocks once into a fast array of {cx, cy} centers.
+  const blockReach = PROJ_RADIUS + 0.5;
+  const blockReachSq = blockReach * blockReach;
+  const blockCenters = [];
+  if (Array.isArray(castles) && castles.length) {
+    for (const castle of castles) {
+      if (!castle || !Array.isArray(castle.blocks)) continue;
+      for (const b of castle.blocks) {
+        if (!b || b.destroyed) continue; // honor an inline destroyed flag if present
+        blockCenters.push({ cx: b.x + 0.5, cy: b.y + 0.5 });
+      }
+    }
+  }
+  const hasBlocks = blockCenters.length > 0;
+
   let impact = null;
+  let vyImpact = 0; // vertical velocity at the terminating event (positive = falling)
   let t = 0;
   let step = 0;
   const maxSteps = Math.ceil(MAX_FLIGHT_T / DT);
@@ -267,6 +432,20 @@ export function simulateShot({ shooterId, x, y, angle, power, wind, heights, pla
     py += vy * DT;
     t += DT;
 
+    // --- Castle block collision (before player checks; walls protect) ---
+    if (hasBlocks && t >= hitArmTime) {
+      for (let bi = 0; bi < blockCenters.length; bi++) {
+        const dx = px - blockCenters[bi].cx;
+        const dy = py - blockCenters[bi].cy;
+        if (dx * dx + dy * dy <= blockReachSq) {
+          impact = { x: px, y: py };
+          vyImpact = vy;
+          break;
+        }
+      }
+      if (impact) break;
+    }
+
     // --- Player collision (only after the arming delay) ---
     if (t >= hitArmTime) {
       for (const p of aliveList) {
@@ -276,6 +455,7 @@ export function simulateShot({ shooterId, x, y, angle, power, wind, heights, pla
         const dy = py - cy;
         if (dx * dx + dy * dy <= hitReachSq) {
           impact = { x: px, y: py };
+          vyImpact = vy;
           break;
         }
       }
@@ -289,6 +469,7 @@ export function simulateShot({ shooterId, x, y, angle, power, wind, heights, pla
       // WORLD_W).
       if (col >= 0 && col < WORLD_W && py >= heights[col]) {
         impact = { x: px, y: py };
+        vyImpact = vy;
         break;
       }
     }
@@ -312,20 +493,45 @@ export function simulateShot({ shooterId, x, y, angle, power, wind, heights, pla
   // Always record the final point so animation lands exactly where it stopped.
   pushSample();
 
+  // V2: plunging-fire multiplier from the vertical velocity at impact.
+  const plunge = plungeMultiplier(vyImpact);
+
   // Build crater + hits from the impact (if any).
   let crater = null;
   let hits = [];
   if (impact) {
     crater = { x: impact.x, y: impact.y, r: CRATER_R };
-    hits = computeHits(impact, aliveList);
+    hits = computeHits(impact, aliveList, plunge);
   }
 
-  return { trajectory, impact, crater, hits };
+  return {
+    trajectory,
+    impact,
+    crater,
+    hits,
+    plunge: round2(plunge),
+    vyImpact: round2(vyImpact),
+  };
+}
+
+/**
+ * plungeMultiplier(vyImpact) -> number
+ *
+ * V2 SIEGE — arc height matters. Steeper, faster-falling rounds plunge harder.
+ *   plunge = clamp(0.55 + 0.95 * (vyImpact / PLUNGE_VY_REF), 0.55, 1.5)
+ * vyImpact is positive when the projectile is falling at impact. Monotonic
+ * non-decreasing in vyImpact across the clamped range.
+ */
+export function plungeMultiplier(vyImpact) {
+  const vy = Number(vyImpact) || 0;
+  return clamp(0.55 + 0.95 * (vy / PLUNGE_VY_REF), 0.55, 1.5);
 }
 
 // Damage to every alive player within DMG_RADIUS of the impact. Linear falloff
-// to 0 at DMG_RADIUS; a player that is hit always takes at least 1.
-function computeHits(impact, aliveList) {
+// to 0 at DMG_RADIUS, scaled by the plunge multiplier; a player that is hit
+// always takes at least 1.
+function computeHits(impact, aliveList, plunge) {
+  const mult = Number.isFinite(plunge) ? plunge : 1;
   const hits = [];
   for (const p of aliveList) {
     const cx = p.x;
@@ -334,7 +540,7 @@ function computeHits(impact, aliveList) {
     const dy = impact.y - cy;
     const dist = Math.sqrt(dx * dx + dy * dy);
     if (dist <= DMG_RADIUS) {
-      let dmg = Math.round(DMG_MAX * (1 - dist / DMG_RADIUS));
+      let dmg = Math.round(DMG_MAX * (1 - dist / DMG_RADIUS) * mult);
       if (dmg < 1) dmg = 1;
       hits.push({ id: p.id, dmg });
     }
@@ -399,4 +605,160 @@ export function settlePlayers(heights, players) {
     }
   }
   return moved;
+}
+
+/**
+ * resolveCastleDamage(castles, impact, heights)
+ *   -> { castleHits, destroyed }   (MUTATES castle blocks: sets block.destroyed)
+ *
+ * V2 SIEGE — the single helper the server AND local driver call to keep castle
+ * state consistent. Run it for EVERY shot that produced an impact, AFTER
+ * applyCrater has already lowered `heights` (so floating-block collapse sees the
+ * post-crater terrain).
+ *
+ * Two destruction phases, both counting toward the same per-owner total:
+ *   1. Blast: every intact block whose CENTER lies within CRATER_R of `impact`
+ *      is destroyed.
+ *   2. Collapse: after the crater, any intact block left floating collapses — a
+ *      block is floating when its column's terrain surface has dropped below the
+ *      block's bottom edge (`block.y + 1`) by more than 2 px AND there is no
+ *      intact block directly beneath it (same column, immediately below). The
+ *      pass cascades bottom-up so a collapsing lower block can unsupport the
+ *      blocks above it within the same call.
+ *
+ * Scoring: for each castle owner losing `n` blocks this shot,
+ *   dmg = min(CASTLE_DMG_CAP, ceil(n * CASTLE_DMG_PER_BLOCK))
+ * Self-hits included (you can smash your own walls and bleed yourself).
+ *
+ * Arguments:
+ *   castles : the authoritative castle list from buildCastles. Block objects are
+ *             mutated in place — `block.destroyed = true` marks a dead cell.
+ *             Already-destroyed blocks are skipped (idempotent across shots).
+ *   impact  : { x, y } | null. Null/absent -> no blast phase (but collapse still
+ *             runs against the current terrain, which is correct after a crater).
+ *   heights : the post-crater authoritative heightmap (used by the collapse
+ *             phase only). If omitted, the collapse phase is skipped.
+ *
+ * Returns:
+ *   castleHits : [{ id, dmg, blocks: [blockIndex...] }] — one entry per castle
+ *                that lost ≥ 1 block this shot, in castle order. `blocks` are the
+ *                indices (into that castle's block list) destroyed THIS shot, in
+ *                ascending order. NOTE: no `hp` field — the caller subtracts
+ *                `dmg` from the owner's hp and adds the post-damage `hp` itself
+ *                (so blast + castle damage can share one final hp value).
+ *   destroyed  : total number of blocks destroyed across all castles this shot
+ *                (convenience; usually unused).
+ *
+ * Pure aside from the intended block mutation: does NOT touch `heights`,
+ * `impact`, players, or terrain.
+ */
+export function resolveCastleDamage(castles, impact, heights) {
+  const castleHits = [];
+  let destroyedTotal = 0;
+  if (!Array.isArray(castles) || castles.length === 0) {
+    return { castleHits, destroyed: destroyedTotal };
+  }
+
+  const craterR2 = CRATER_R * CRATER_R;
+  const hasImpact = impact && Number.isFinite(impact.x) && Number.isFinite(impact.y);
+  const hasHeights = heights && typeof heights.length === 'number';
+
+  for (let ci = 0; ci < castles.length; ci++) {
+    const castle = castles[ci];
+    if (!castle || !Array.isArray(castle.blocks)) continue;
+    const blocks = castle.blocks;
+    const destroyedThis = [];
+
+    // --- Phase 1: blast destruction within CRATER_R of the impact center. ---
+    if (hasImpact) {
+      for (let bi = 0; bi < blocks.length; bi++) {
+        const b = blocks[bi];
+        if (!b || b.destroyed) continue;
+        const cx = b.x + 0.5;
+        const cy = b.y + 0.5;
+        const dx = cx - impact.x;
+        const dy = cy - impact.y;
+        if (dx * dx + dy * dy <= craterR2) {
+          b.destroyed = true;
+          destroyedThis.push(bi);
+        }
+      }
+    }
+
+    // --- Phase 2: floating-block collapse after the crater bite. ---
+    // A block floats when its column terrain dropped below its bottom edge by
+    // > 2 px AND nothing intact directly supports it from below. We process each
+    // column bottom-up (largest y last in screen space = lowest block first) so
+    // a collapse cascades to the blocks resting on top of it in one pass.
+    if (hasHeights) {
+      // Group intact-or-just-checked blocks by column. We only need columns that
+      // actually have blocks; build a per-column list of {bi, b} sorted so the
+      // LOWEST cell (largest y) is processed first.
+      const byCol = new Map();
+      for (let bi = 0; bi < blocks.length; bi++) {
+        const b = blocks[bi];
+        if (!b) continue;
+        let list = byCol.get(b.x);
+        if (!list) {
+          list = [];
+          byCol.set(b.x, list);
+        }
+        list.push(bi);
+      }
+
+      for (const [col, idxs] of byCol) {
+        if (col < 0 || col >= heights.length) continue;
+        // Round the terrain surface the SAME way buildCastles anchors blocks
+        // (round(heights[col])). buildCastles sets each column's bottom block so
+        // its bottom edge == round(heights[col]); comparing against the rounded
+        // surface here guarantees a freshly built castle on unchanged terrain is
+        // never falsely undermined, on any seed/slope. A real crater lowers
+        // heights[col] far past this, so genuine collapses still trigger.
+        const surface = Math.round(heights[col]);
+        // Sort cells in this column from lowest (largest y) to highest (smallest
+        // y) so support checks see the already-resolved cell beneath.
+        idxs.sort((a, c) => blocks[c].y - blocks[a].y);
+        for (const bi of idxs) {
+          const b = blocks[bi];
+          if (!b || b.destroyed) continue;
+          const bottomEdge = b.y + 1; // cell occupies [y, y+1); bottom edge = y+1
+          // Terrain surface dropped below the block bottom by more than 2 px?
+          if (surface <= bottomEdge + 2) continue; // still supported by ground
+          // Intact block directly beneath? (a cell whose top edge == this bottom
+          // edge, i.e. block at y = bottomEdge, same column, not destroyed).
+          let supported = false;
+          for (const oj of idxs) {
+            if (oj === bi) continue;
+            const ob = blocks[oj];
+            if (!ob || ob.destroyed) continue;
+            if (ob.y === bottomEdge) {
+              supported = true;
+              break;
+            }
+          }
+          if (supported) continue;
+          // Floating: collapse.
+          b.destroyed = true;
+          destroyedThis.push(bi);
+        }
+      }
+    }
+
+    if (destroyedThis.length > 0) {
+      destroyedThis.sort((a, c) => a - c);
+      destroyedTotal += destroyedThis.length;
+      const n = destroyedThis.length;
+      const dmg = Math.min(
+        CASTLE_DMG_CAP,
+        Math.ceil(n * CASTLE_DMG_PER_BLOCK)
+      );
+      castleHits.push({
+        id: castle.id != null ? castle.id : null,
+        dmg,
+        blocks: destroyedThis,
+      });
+    }
+  }
+
+  return { castleHits, destroyed: destroyedTotal };
 }
