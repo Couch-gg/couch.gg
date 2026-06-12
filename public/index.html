@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#0a0a12" />
+  <title>TREBUCHET</title>
+
+  <!-- Retro pixel font: 'Press Start 2P' with monospace fallback -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap"
+    rel="stylesheet"
+  />
+
+  <link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+  <!-- Centered 16:9 stage holding the canvas + HTML overlay -->
+  <div id="stage">
+    <!-- Phaser mounts its <canvas> in here -->
+    <div id="game" aria-hidden="true"></div>
+
+    <!-- HTML UI overlay (menu / lobby / game-over / toasts / banners) -->
+    <div id="ui">
+      <!-- MENU -->
+      <section id="screen-menu" class="screen" hidden>
+        <div class="title-wrap">
+          <h1 class="title" aria-label="TREBUCHET">
+            <span class="title-glyph">T</span><span class="title-glyph">R</span><span class="title-glyph">E</span><span class="title-glyph">B</span><span class="title-glyph">U</span><span class="title-glyph">C</span><span class="title-glyph">H</span><span class="title-glyph">E</span><span class="title-glyph">T</span>
+          </h1>
+          <p class="subtitle">RETRO ARTILLERY DUEL</p>
+        </div>
+
+        <div class="panel menu-panel">
+          <label class="field">
+            <span class="field-label">YOUR NAME</span>
+            <input
+              id="menu-name"
+              class="text-input"
+              type="text"
+              maxlength="12"
+              autocomplete="off"
+              autocapitalize="characters"
+              spellcheck="false"
+              placeholder="PLAYER"
+            />
+          </label>
+
+          <button id="btn-create" class="btn btn-primary" type="button">
+            CREATE GAME
+          </button>
+
+          <div class="menu-divider"><span>OR</span></div>
+
+          <label class="field">
+            <span class="field-label">ROOM CODE</span>
+            <input
+              id="menu-code"
+              class="text-input"
+              type="text"
+              maxlength="4"
+              autocomplete="off"
+              autocapitalize="characters"
+              spellcheck="false"
+              placeholder="XXXX"
+            />
+          </label>
+
+          <button id="btn-join" class="btn" type="button">
+            JOIN GAME
+          </button>
+        </div>
+
+        <p class="hint blink-slow">INVITE 1-3 FRIENDS ON YOUR NETWORK</p>
+      </section>
+
+      <!-- LOBBY -->
+      <section id="screen-lobby" class="screen" hidden>
+        <div class="panel lobby-panel">
+          <p class="lobby-eyebrow">ROOM</p>
+          <div id="lobby-code" class="lobby-code">----</div>
+
+          <div class="invite-row">
+            <input
+              id="lobby-link"
+              class="text-input invite-input"
+              type="text"
+              readonly
+              aria-label="Invite link"
+            />
+            <button id="btn-copy" class="btn btn-small" type="button">COPY</button>
+          </div>
+
+          <p class="players-eyebrow">PLAYERS <span id="lobby-count">(0/4)</span></p>
+          <ul id="lobby-players" class="player-list"></ul>
+
+          <div class="lobby-actions">
+            <button id="btn-start" class="btn btn-primary" type="button" hidden>
+              START GAME
+            </button>
+            <p id="lobby-wait" class="wait-note blink-slow" hidden>WAITING FOR HOST&hellip;</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- GAME OVER -->
+      <section id="screen-gameover" class="screen" hidden>
+        <div class="panel gameover-panel">
+          <p class="gameover-eyebrow blink">GAME OVER</p>
+          <div id="gameover-banner" class="gameover-banner">&mdash;</div>
+          <div class="gameover-actions">
+            <button id="btn-rematch" class="btn btn-primary" type="button" hidden>
+              REMATCH
+            </button>
+            <button id="btn-leave" class="btn" type="button">LEAVE</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Toast stack (errors / notices) -->
+      <div id="toast-stack" class="toast-stack" aria-live="polite"></div>
+
+      <!-- Connection-lost banner -->
+      <div id="conn-banner" class="conn-banner" hidden>
+        CONNECTION LOST &mdash; RELOAD
+      </div>
+
+      <!-- Scanline / CRT overlay (purely decorative) -->
+      <div class="scanlines" aria-hidden="true"></div>
+      <div class="crt-vignette" aria-hidden="true"></div>
+    </div>
+  </div>
+
+  <!-- Phaser global (loaded as plain script per contract) -->
+  <script src="/vendor/phaser.min.js"></script>
+  <!-- Game entry point (ES module) -->
+  <script type="module" src="/js/main.js"></script>
+</body>
+</html>

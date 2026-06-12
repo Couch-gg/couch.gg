@@ -1,0 +1,16 @@
+{
+  "name": "trebuchet",
+  "version": "1.0.0",
+  "description": "Multiplayer retro artillery game with trebuchets",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node server/index.js",
+    "test": "node shared/sim.test.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "phaser": "^3.85.0",
+    "ws": "^8.18.0"
+  }
+}
