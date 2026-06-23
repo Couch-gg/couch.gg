@@ -1,8 +1,16 @@
-import { Crown, Gamepad2, LogOut, Play, Send } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { ChevronLeft, ChevronRight, Crown, Gamepad2, LogOut, Play, Send } from 'lucide-react';
+import { useEffect, useRef, useState, type PointerEvent } from 'react';
 import type { Socket } from 'socket.io-client';
 import type { GameManifest, JoinLobbyResponse, Lobby, Player } from '@couch/types';
-import type { TrebuchetEvent, TrebuchetSnapshot } from '@couch/trebuchet';
+import {
+  CHARGE_TIME_MS,
+  ELEV_MAX,
+  ELEV_MIN,
+  POWER_MAX,
+  POWER_MIN,
+  type TrebuchetEvent,
+  type TrebuchetSnapshot
+} from '@couch/trebuchet';
 import { fetchLobby } from '../api.js';
 import { createSocket, emitAck } from '../socket.js';
 
@@ -13,10 +21,15 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   const [lobby, setLobby] = useState<Lobby | null>(null);
   const [games, setGames] = useState<GameManifest[]>([]);
   const [angle, setAngle] = useState(72);
-  const [power, setPower] = useState(68);
+  const [power, setPower] = useState(POWER_MIN);
+  const [aimStep, setAimStep] = useState(1);
+  const [charging, setCharging] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastEvent, setLastEvent] = useState<TrebuchetEvent | null>(null);
   const [socket, setSocket] = useState<Socket | null>(null);
+  const chargeStartRef = useRef<number | null>(null);
+  const chargeTimerRef = useRef<number | null>(null);
+  const lastChargeSendRef = useRef(0);
 
   useEffect(() => {
     const nextSocket = createSocket();
@@ -28,6 +41,10 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
       setSocket(null);
     };
   }, [slug]);
+
+  useEffect(() => {
+    return () => stopChargeTimer();
+  }, []);
 
   const join = async () => {
     setError(null);
@@ -89,20 +106,108 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     await emitAck(socket, 'game:start', { slug, playerToken });
   };
 
-  const fire = async () => {
-    if (!socket) return;
+  const sendPreview = async (control: 'trebuchet.aim' | 'trebuchet.charge', value: unknown) => {
+    if (!socket || !myTurn) return;
+    try {
+      await emitAck(socket, 'controller:event', {
+        slug,
+        playerToken,
+        event: {
+          playerId: player?.id,
+          type: 'game',
+          control,
+          value,
+          timestamp: Date.now()
+        }
+      });
+    } catch {
+      // Preview events are best-effort; final fire remains acknowledged below.
+    }
+  };
+
+  const aim = (direction: -1 | 1) => {
+    if (!myTurn || charging) return;
+    const nextAngle = snapAim(angle + direction * aimStep, direction);
+    setAngle(nextAngle);
+    void sendPreview('trebuchet.aim', { angle: nextAngle, direction, step: aimStep });
+  };
+
+  const fire = async (shotPower = power) => {
+    if (!socket || !myTurn) return;
     await emitAck(socket, 'controller:event', {
       slug,
       playerToken,
       event: {
         playerId: player?.id,
         type: 'game',
-        control: 'fire',
-        value: { angle, power },
+        control: 'trebuchet.fire',
+        value: { angle, power: shotPower },
         timestamp: Date.now()
       }
     });
   };
+
+  const beginCharge = (event: PointerEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    if (!myTurn || charging) return;
+    const now = performance.now();
+    chargeStartRef.current = now;
+    lastChargeSendRef.current = now;
+    setCharging(true);
+    setPower(POWER_MIN);
+    void sendPreview('trebuchet.charge', { active: true, power: POWER_MIN });
+    stopChargeTimer();
+    chargeTimerRef.current = window.setInterval(() => {
+      const nextPower = chargePower();
+      setPower(nextPower);
+      const tick = performance.now();
+      if (tick - lastChargeSendRef.current > 120 || nextPower >= POWER_MAX) {
+        lastChargeSendRef.current = tick;
+        void sendPreview('trebuchet.charge', { active: true, power: nextPower });
+      }
+      if (nextPower >= POWER_MAX) {
+        void releaseCharge();
+      }
+    }, 40);
+  };
+
+  const releaseCharge = async () => {
+    if (chargeStartRef.current == null) return;
+    const shotPower = chargePower();
+    stopChargeTimer();
+    chargeStartRef.current = null;
+    setCharging(false);
+    setPower(shotPower);
+    await sendPreview('trebuchet.charge', { active: false, power: shotPower });
+    await fire(shotPower);
+  };
+
+  const cancelCharge = () => {
+    if (chargeStartRef.current == null) return;
+    stopChargeTimer();
+    chargeStartRef.current = null;
+    setCharging(false);
+    setPower(POWER_MIN);
+    void sendPreview('trebuchet.charge', { active: false, power: POWER_MIN });
+  };
+
+  function stopChargeTimer() {
+    if (chargeTimerRef.current != null) {
+      window.clearInterval(chargeTimerRef.current);
+      chargeTimerRef.current = null;
+    }
+  }
+
+  function chargePower(): number {
+    const startedAt = chargeStartRef.current;
+    if (startedAt == null) return POWER_MIN;
+    const fraction = Math.min(1, (performance.now() - startedAt) / CHARGE_TIME_MS);
+    return Math.round(POWER_MIN + (POWER_MAX - POWER_MIN) * fraction);
+  }
+
+  useEffect(() => {
+    if (!myTurn) cancelCharge();
+  }, [myTurn]);
 
   if (!player) {
     return (
@@ -165,16 +270,39 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
               <span>{myTurn ? 'Your turn' : 'Waiting'}</span>
               <strong>{turnName(snapshot, currentTurn)}</strong>
             </div>
-            <label className="range-control">
-              <span>Angle <strong>{angle}°</strong></span>
-              <input min={50} max={130} step={1} value={angle} type="range" onChange={(event) => setAngle(Number(event.target.value))} />
-            </label>
-            <label className="range-control">
-              <span>Power <strong>{power}%</strong></span>
-              <input min={10} max={100} step={1} value={power} type="range" onChange={(event) => setPower(Number(event.target.value))} />
-            </label>
-            <button className="fire-btn" disabled={!myTurn} onClick={fire}>
-              <Send size={20} /> Fire
+            <div className="aim-pad" aria-label="Trebuchet aim controls">
+              <button type="button" className="aim-btn" disabled={!myTurn || charging} onClick={() => aim(1)} aria-label="Aim left">
+                <ChevronLeft size={28} />
+              </button>
+              <div className="aim-readout">
+                <span>ARC</span>
+                <strong>{arcLabel(angle)}</strong>
+                <button type="button" className="step-toggle" onClick={() => setAimStep((value) => (value === 1 ? 5 : 1))}>
+                  {aimStep}°
+                </button>
+              </div>
+              <button type="button" className="aim-btn" disabled={!myTurn || charging} onClick={() => aim(-1)} aria-label="Aim right">
+                <ChevronRight size={28} />
+              </button>
+            </div>
+            <div className="charge-readout">
+              <span>POWER</span>
+              <div className="charge-track">
+                <span style={{ width: `${power}%` }} />
+              </div>
+              <strong>{power}%</strong>
+            </div>
+            <button
+              className={charging ? 'fire-btn charging' : 'fire-btn'}
+              disabled={!myTurn}
+              onPointerDown={beginCharge}
+              onPointerUp={() => void releaseCharge()}
+              onPointerCancel={cancelCharge}
+              onPointerLeave={() => {
+                if (charging) void releaseCharge();
+              }}
+            >
+              <Send size={20} /> {charging ? 'Release to fire' : 'Hold fire'}
             </button>
             {lastEvent?.type === 'shot' ? <p className="muted">Last shot: {lastEvent.power}% at {lastEvent.angle}°</p> : null}
           </div>
@@ -201,4 +329,28 @@ function tokenKey(slug: string): string {
 function turnName(snapshot: TrebuchetSnapshot | undefined, playerId: string | null | undefined): string {
   if (!snapshot || !playerId) return 'Game over';
   return snapshot.units.find((unit) => unit.id === playerId)?.name ?? 'Player';
+}
+
+const RIGHT_LO = ELEV_MIN;
+const RIGHT_HI = ELEV_MAX;
+const LEFT_LO = 180 - ELEV_MAX;
+const LEFT_HI = 180 - ELEV_MIN;
+
+function snapAim(rawAngle: number, direction: -1 | 0 | 1): number {
+  let next = Math.round(rawAngle);
+  if (!Number.isFinite(next)) next = RIGHT_LO;
+  if (next < RIGHT_LO) next = RIGHT_LO;
+  else if (next > LEFT_HI) next = LEFT_HI;
+  else if (next > RIGHT_HI && next < LEFT_LO) {
+    if (direction > 0) next = LEFT_LO;
+    else if (direction < 0) next = RIGHT_HI;
+    else next = next - RIGHT_HI <= LEFT_LO - next ? RIGHT_HI : LEFT_LO;
+  }
+  return next;
+}
+
+function arcLabel(angle: number): string {
+  const right = angle <= RIGHT_HI;
+  const elevation = right ? angle : 180 - angle;
+  return `${right ? '►' : '◄'} ${elevation}°`;
 }

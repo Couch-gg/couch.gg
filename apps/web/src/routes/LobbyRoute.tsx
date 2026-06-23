@@ -6,12 +6,13 @@ import { createLobby, fetchGames, fetchLobby } from '../api.js';
 import { createSocket, emitAck } from '../socket.js';
 import { PlayerRoster } from '../components/PlayerRoster.js';
 import { QrPanel } from '../components/QrPanel.js';
-import { TrebuchetStage } from '../components/TrebuchetStage.js';
+import { TrebuchetStage, type TrebuchetControlEvent } from '../components/TrebuchetStage.js';
 
 export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: string) => void }) {
   const [lobby, setLobby] = useState<Lobby | null>(null);
   const [games, setGames] = useState<GameManifest[]>([]);
   const [lastEvent, setLastEvent] = useState<TrebuchetEvent | null>(null);
+  const [lastControlEvent, setLastControlEvent] = useState<TrebuchetControlEvent | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -31,6 +32,7 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
 
     socket.on('lobby:snapshot', (next: Lobby) => setLobby(next));
     socket.on('game:event', (event: TrebuchetEvent) => setLastEvent(event));
+    socket.on('game:control', (control: TrebuchetControlEvent) => setLastControlEvent(control));
 
     const refreshTimer = window.setInterval(() => {
       void fetchLobby(slug)
@@ -120,7 +122,7 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
               {lobby?.state === 'playing' ? 'Live' : lobby?.players.length ? 'Ready' : 'Waiting'}
             </span>
           </div>
-          <TrebuchetStage snapshot={snapshot ?? null} event={lastEvent} />
+          <TrebuchetStage snapshot={snapshot ?? null} event={lastEvent} controlEvent={lastControlEvent} />
           {lobby?.state !== 'playing' ? (
             <div className="screen-hint">
               Scan the code, join with two phones, then the host starts Trebuchet from their controller.

@@ -158,11 +158,25 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
         const controllerEvent = payload?.event;
         if (!controllerEvent) throw new LobbyError('Controller-Event fehlt');
         let event = null;
+        let controlPreview: { playerId: PlayerId; control: string; value: unknown; timestamp: number } | null = null;
         if (controllerEvent.control === 'fire' || controllerEvent.control === 'trebuchet.fire') {
           const value = controllerEvent.value as { angle?: number; power?: number };
           event = store.fire(slug, String(payload?.playerToken ?? ''), value?.angle, value?.power);
+        } else if (isTrebuchetPreviewControl(controllerEvent.control)) {
+          const player = store.controllerForCurrentTurn(slug, String(payload?.playerToken ?? ''));
+          if (player) {
+            controlPreview = {
+              playerId: player.id,
+              control: canonicalTrebuchetControl(controllerEvent.control),
+              value: controllerEvent.value,
+              timestamp: controllerEvent.timestamp
+            };
+          }
         }
         ack?.({ ok: true, event });
+        if (controlPreview) {
+          io.to(room(slug)).emit('game:control', controlPreview);
+        }
         if (event) {
           await saveLobby(slug);
           io.to(room(slug)).emit('game:event', event);
@@ -293,6 +307,16 @@ function room(slug: string): string {
 function socketError(err: unknown): { ok: false; error: string; status: number } {
   if (err instanceof LobbyError) return { ok: false, error: err.message, status: err.status };
   return { ok: false, error: err instanceof Error ? err.message : 'Unbekannter Fehler', status: 500 };
+}
+
+function isTrebuchetPreviewControl(control: string): boolean {
+  return control === 'aim' || control === 'trebuchet.aim' || control === 'charge' || control === 'trebuchet.charge';
+}
+
+function canonicalTrebuchetControl(control: string): string {
+  if (control === 'aim') return 'trebuchet.aim';
+  if (control === 'charge') return 'trebuchet.charge';
+  return control;
 }
 
 function sendHttpError(res: express.Response, err: unknown): void {

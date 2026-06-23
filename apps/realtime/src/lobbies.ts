@@ -215,6 +215,14 @@ export class LobbyStore {
     return event;
   }
 
+  controllerForCurrentTurn(slug: string, playerToken: string): Player | null {
+    const lobby = this.getLobby(slug);
+    const player = this.playerByToken(lobby, playerToken);
+    const turn = lobby.gameSession?.snapshot.turn ?? null;
+    if (lobby.state !== 'playing' || turn !== player.id) return null;
+    return this.publicPlayer(lobby, player);
+  }
+
   skipTurn(slug: string): TrebuchetEvent | null {
     const lobby = this.getLobby(slug);
     const event = lobby.engine?.skipTurn() ?? null;

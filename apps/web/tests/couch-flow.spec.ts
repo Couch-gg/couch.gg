@@ -36,6 +36,14 @@ test('TV lobby can be started from phone controllers', async ({ browser }) => {
   await expect(phoneOne.getByText(/Your turn|Waiting/i)).toBeVisible();
   await expect(phoneTwo.getByText(/Your turn|Waiting/i)).toBeVisible();
 
+  const activePhone = await phoneOne.getByText('Your turn').isVisible() ? phoneOne : phoneTwo;
+  await activePhone.getByRole('button', { name: /Aim left/i }).click();
+  const fireButton = activePhone.getByRole('button', { name: /Hold fire/i });
+  await fireButton.dispatchEvent('pointerdown', { pointerId: 1, pointerType: 'touch', isPrimary: true, bubbles: true });
+  await activePhone.waitForTimeout(450);
+  await fireButton.dispatchEvent('pointerup', { pointerId: 1, pointerType: 'touch', isPrimary: true, bubbles: true });
+  await expect(activePhone.getByText(/Last shot:/i)).toBeVisible();
+
   await tv.close();
   await phoneOne.close();
   await phoneTwo.close();

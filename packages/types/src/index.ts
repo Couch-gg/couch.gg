@@ -13,6 +13,9 @@ export type ControllerControl =
   | 'angle'
   | 'power'
   | 'fire'
+  | 'trebuchet.aim'
+  | 'trebuchet.charge'
+  | 'trebuchet.fire'
   | 'start'
   | 'rematch'
   | 'select-game';

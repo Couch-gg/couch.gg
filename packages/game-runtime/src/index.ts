@@ -9,9 +9,9 @@ export const TREBUCHET_MANIFEST: GameManifest = {
   controllerLayout: {
     kind: 'trebuchet-aim-fire',
     controls: [
-      { control: 'angle', type: 'slider', label: 'Angle', min: 50, max: 130, step: 1 },
-      { control: 'power', type: 'slider', label: 'Power', min: 10, max: 100, step: 1 },
-      { control: 'fire', type: 'hold', label: 'Fire' }
+      { control: 'trebuchet.aim', type: 'button', label: 'Aim' },
+      { control: 'trebuchet.charge', type: 'hold', label: 'Charge' },
+      { control: 'trebuchet.fire', type: 'button', label: 'Fire' }
     ]
   },
   aspectRatio: '16:9',
