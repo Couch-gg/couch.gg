@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src",
+    "declaration": true,
+    "sourceMap": true,
+    "noEmit": false
+  },
+  "references": [
+    { "path": "../../packages/types" },
+    { "path": "../../packages/game-runtime" },
+    { "path": "../../packages/games/trebuchet" }
+  ],
+  "include": ["src"]
+}

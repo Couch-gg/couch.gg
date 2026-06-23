@@ -1,2 +1,12 @@
 node_modules/
 *.log
+*.tsbuildinfo
+dist/
+apps/*/dist/
+packages/*/dist/
+packages/games/*/dist/
+playwright-report/
+test-results/
+.env
+.env.local
+.vercel

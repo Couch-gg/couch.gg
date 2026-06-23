@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "types": ["vite/client", "node"],
+    "noEmit": true
+  },
+  "references": [
+    { "path": "../../packages/types" },
+    { "path": "../../packages/game-runtime" },
+    { "path": "../../packages/games/trebuchet" }
+  ],
+  "include": ["src", "vite.config.ts"]
+}
