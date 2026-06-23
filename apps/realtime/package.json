@@ -20,6 +20,7 @@
     "@couch/game-runtime": "workspace:*",
     "@couch/trebuchet": "workspace:*",
     "@couch/types": "workspace:*",
+    "@vercel/queue": "^0.3.1",
     "cors": "^2.8.5",
     "express": "^4.21.2",
     "redis": "^5.10.0",

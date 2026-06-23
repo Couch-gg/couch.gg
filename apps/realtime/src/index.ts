@@ -6,7 +6,7 @@ import { Server, type ServerOptions } from 'socket.io';
 import { GAME_MANIFESTS } from '@couch/game-runtime';
 import type { ControllerEvent, GameId, PlayerId } from '@couch/types';
 import { LobbyError, LobbyStore, RECONNECT_GRACE_MS, type LobbyRecord } from './lobbies.js';
-import { createLobbyPersistence } from './persistence.js';
+import { createProductionLobbyPersistence } from './persistence.js';
 
 interface SocketContext {
   role: 'screen' | 'controller';
@@ -33,7 +33,7 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   const apiPrefix = normalizeApiPrefix(options.apiPrefix ?? process.env.API_PREFIX ?? '/api');
   const socketPath = options.socketPath ?? process.env.SOCKET_PATH ?? '/socket.io';
   const store = new LobbyStore();
-  const persistence = createLobbyPersistence();
+  const persistence = createProductionLobbyPersistence();
   const turnTimers = new Map<string, NodeJS.Timeout>();
 
   const app = express();

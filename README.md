@@ -51,11 +51,11 @@ The web app and realtime endpoint deploy together on Vercel. Vercel routes the
 app shell from apps/web/dist and the authoritative realtime server through
 /api/realtime/* with WebSocket transport at /api/realtime/socket.io.
 
-Fluid Compute is enabled in vercel.json. For a reliable production multiplayer
-room, connect the Vercel Redis marketplace resource so REDIS_URL is available
-to the project. Without Redis, local development still works, but a production
-deployment can split TV and phone connections across different Function
-instances.
+Fluid Compute is enabled in vercel.json. Production multiplayer uses the Vercel
+Redis marketplace resource through REDIS_URL so TV and phone requests share the
+same lobby state across Function instances. Local development still works without
+Redis, and the server also has a Vercel Queues snapshot fallback for production
+environments where Redis is not configured.
 
 Useful production checks:
 
