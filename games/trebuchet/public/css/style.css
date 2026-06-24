@@ -43,6 +43,16 @@ body {
   -webkit-font-smoothing: none;
   font-smooth: never;
   -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+/* Safe-area fallbacks so env(safe-area-inset-*) is always defined (0 when the
+   UA / device exposes no inset). Used by the stage chrome below. */
+:root {
+  --safe-top:    env(safe-area-inset-top, 0px);
+  --safe-right:  env(safe-area-inset-right, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left:   env(safe-area-inset-left, 0px);
 }
 
 body {
@@ -100,7 +110,13 @@ body {
   align-items: center;
   justify-content: center;
   gap: clamp(10px, 2.2vh, 26px);
-  padding: clamp(12px, 3vh, 40px);
+  /* Base padding + safe-area insets so notches / home indicators never cover
+     panels or buttons. The insets resolve to 0 on devices without them. */
+  padding:
+    calc(clamp(12px, 3vh, 40px) + var(--safe-top))
+    calc(clamp(12px, 3vh, 40px) + var(--safe-right))
+    calc(clamp(12px, 3vh, 40px) + var(--safe-bottom))
+    calc(clamp(12px, 3vh, 40px) + var(--safe-left));
   pointer-events: auto;
   background:
     radial-gradient(ellipse at 50% 30%, rgba(20, 20, 40, 0.72) 0%, rgba(4, 4, 12, 0.92) 70%, rgba(4, 4, 10, 0.97) 100%);
@@ -653,6 +669,171 @@ body {
 }
 
 /* ============================================================
+   PERSISTENT SOUND TOGGLE — pinned top-right of the stage
+   Sits above the UI overlay so it stays clickable on every
+   screen, including during gameplay. Respects the safe area.
+   ============================================================ */
+.btn-mute {
+  position: absolute;
+  top: calc(8px + var(--safe-top));
+  right: calc(8px + var(--safe-right));
+  z-index: 50;
+  pointer-events: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: inherit;
+  font-size: clamp(7px, 1.1vw, 11px);
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--ink);
+  background: var(--panel-bg-2);
+  border: 3px solid var(--border-lit);
+  box-shadow: 2px 2px 0 0 #000;
+  padding: 7px 9px;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+  transition: transform 0.04s steps(1), background-color 0.08s steps(2), color 0.08s steps(2);
+}
+
+.btn-mute:hover,
+.btn-mute:focus-visible {
+  background: var(--ink);
+  color: #07070f;
+  border-color: var(--ink);
+  outline: none;
+}
+
+.btn-mute:active {
+  transform: translate(2px, 2px);
+  box-shadow: 0 0 0 0 #000;
+}
+
+.btn-mute-glyph {
+  font-size: 1.1em;
+  line-height: 1;
+}
+
+/* Muted state: amber-warned, struck-through glyph + MUTE label. */
+.btn-mute.is-muted {
+  color: var(--accent-2);
+  border-color: var(--accent-2);
+}
+.btn-mute.is-muted:hover,
+.btn-mute.is-muted:focus-visible {
+  background: var(--accent-2);
+  color: #07070f;
+  border-color: var(--accent-2);
+}
+
+/* ============================================================
+   PORTRAIT "ROTATE DEVICE" HINT — advisory overlay only.
+   Hidden by default; shown only for coarse pointers in portrait
+   (see the orientation media query further down). Never blocks
+   the game from loading and does not capture input by default.
+   ============================================================ */
+.rotate-hint {
+  position: absolute;
+  inset: 0;
+  z-index: 48;
+  display: none;            /* shown only via the media query below */
+  align-items: center;
+  justify-content: center;
+  padding:
+    calc(16px + var(--safe-top))
+    calc(16px + var(--safe-right))
+    calc(16px + var(--safe-bottom))
+    calc(16px + var(--safe-left));
+  background:
+    radial-gradient(ellipse at 50% 45%, rgba(12, 12, 26, 0.96) 0%, rgba(4, 4, 10, 0.99) 70%);
+  pointer-events: auto;     /* dim the stage; advisory only, has no controls */
+  text-align: center;
+}
+
+.rotate-hint-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+}
+
+.rotate-hint-glyph {
+  position: relative;
+  width: 64px;
+  height: 40px;
+}
+
+.rotate-hint-glyph .rotate-phone {
+  display: block;
+  font-size: 44px;
+  line-height: 1;
+  color: var(--accent);
+  /* draw a wide landscape rectangle from the square glyph */
+  transform: scaleX(1.5);
+  text-shadow: 0 0 10px rgba(93, 201, 97, 0.4);
+  animation: rotate-tilt 2.4s ease-in-out infinite;
+}
+
+.rotate-hint-glyph .rotate-arrow {
+  position: absolute;
+  top: -10px;
+  right: -14px;
+  font-size: 22px;
+  line-height: 1;
+  color: var(--accent-2);
+}
+
+.rotate-hint-text {
+  font-size: clamp(11px, 4vw, 18px);
+  letter-spacing: 2px;
+  color: var(--accent-2);
+  text-shadow: 2px 2px 0 #000;
+}
+
+.rotate-hint-sub {
+  font-size: clamp(7px, 2.6vw, 11px);
+  letter-spacing: 1px;
+  color: var(--ink-dim);
+}
+
+@keyframes rotate-tilt {
+  0%, 100% { transform: scaleX(1.5) rotate(0deg); }
+  50%      { transform: scaleX(1.5) rotate(-12deg); }
+}
+
+/* ============================================================
+   COARSE-POINTER (TOUCH) HARDENING
+   - Inputs >= 16px font so iOS doesn't zoom on focus.
+   - Tap targets >= 44px min-height.
+   ============================================================ */
+@media (pointer: coarse) {
+  .text-input {
+    /* >= 16px prevents iOS Safari from auto-zooming on focus */
+    font-size: max(16px, clamp(10px, 1.7vw, 15px));
+    min-height: 44px;
+  }
+  .invite-input,
+  .local-row .text-input {
+    font-size: max(16px, clamp(7px, 1.2vw, 13px));
+  }
+
+  .btn {
+    min-height: 44px;
+  }
+  .btn-small {
+    min-height: 44px;
+  }
+
+  /* Larger, easier-to-hit mute toggle on touch. */
+  .btn-mute {
+    min-height: 44px;
+    font-size: 11px;
+    padding: 8px 11px;
+  }
+}
+
+/* ============================================================
    Small / short viewports — keep the layout solid
    ============================================================ */
 @media (max-height: 560px) {
@@ -669,13 +850,65 @@ body {
   .menu-divider { margin: 0; }
 }
 
+/* ============================================================
+   PORTRAIT ON A TOUCH DEVICE — show the rotate advisory.
+   Only fires for coarse pointers (real phones/tablets), never
+   on a desktop browser resized to a narrow window. Auto-hides
+   the instant the device is rotated to landscape.
+   ============================================================ */
+@media (orientation: portrait) and (pointer: coarse) {
+  .rotate-hint {
+    display: flex;
+  }
+}
+
+/* ============================================================
+   LANDSCAPE PHONE — short, wide viewport. Tighten panels so the
+   menu / lobby / local-setup / game-over screens fit without
+   awkward scrolling on ~640x360 .. ~844x390 devices. The #stage
+   already caps to 16:9 and fills the viewport via 100vw/100vh.
+   ============================================================ */
+@media (orientation: landscape) and (max-height: 480px) and (pointer: coarse) {
+  #ui .screen {
+    gap: 6px;
+    justify-content: center;
+  }
+
+  .title { font-size: clamp(18px, 5vw, 34px); }
+  .title-wrap { margin-bottom: 0; }
+  .subtitle { display: none; }
+  .hint { display: none; }
+
+  .panel {
+    padding: 10px 14px;
+    gap: 7px;
+    /* Cap panel height to the visible stage and scroll inside the panel
+       only if a player list overflows, instead of clipping the screen. */
+    max-height: calc(100vh - var(--safe-top) - var(--safe-bottom) - 12px);
+    overflow-y: auto;
+  }
+
+  .menu-panel { gap: 6px; }
+  .menu-divider { margin: 0; }
+
+  /* Two-column menu so CREATE / JOIN / LOCAL fit a short landscape window. */
+  .field { gap: 4px; }
+
+  .lobby-code { font-size: clamp(26px, 7vw, 48px); padding: 2px 0 4px; }
+  .player-list { max-height: 30vh; }
+  .local-list { max-height: 30vh; }
+
+  .gameover-banner { font-size: clamp(16px, 4vw, 28px); }
+}
+
 /* Respect users who prefer reduced motion */
 @media (prefers-reduced-motion: reduce) {
   .title-glyph,
   .blink,
   .blink-slow,
   .conn-banner,
-  .btn.btn-highlight {
+  .btn.btn-highlight,
+  .rotate-hint-glyph .rotate-phone {
     animation: none !important;
   }
 }

@@ -42,11 +42,18 @@ the same players.
 
 Turn-based siege duel. Last trebuchet standing wins.
 
+**Desktop (keyboard):**
+
 | Input | Action |
 |---|---|
 | ← / → | Sweep your launch arc (hold **Shift** for ±5°) |
 | **Hold** Space or the FIRE button | Charge the throw — longer hold = more power |
 | Release | Launch! (full charge fires automatically) |
+
+**Phone / touch:** play in **landscape**. Drag on the battlefield to aim, or tap
+the ◄ ► pads (bottom-left) to fine-tune your arc; **hold the FIRE pad**
+(bottom-right) to charge and release to launch. A sound toggle sits in the
+top-right corner.
 
 - Trebuchets only **lob**: the arc stays between 50° and 85° above the horizon —
   sweep past vertical to switch sides. No flat shots; this is a siege engine.

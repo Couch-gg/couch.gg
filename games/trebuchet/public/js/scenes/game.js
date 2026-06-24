@@ -84,12 +84,43 @@ export class Game extends Phaser.Scene {
     // (now stale) m.next if a later turn/left advanced the epoch meanwhile.
     this._turnEpoch = 0;
     this._projUpdate = null;
+
+    // --- V3 §8.3 touch / VFX scratch ---------------------------------------
+    // Touch UI handles (created only when TOUCH). Reset so a rematch restart
+    // (which re-runs init+create) never carries stale references.
+    this._touchUi = null;          // { arcL, arcR, fire, ... } container of pads
+    this._padHold = null;          // active arc-pad repeat state
+    this._dragAiming = false;      // a battlefield drag-aim is in progress
+    this._dragPointerId = null;    // pointer id that owns the active drag-aim
+    this._lastAimSfx = 0;          // throttle for SFX.play('aim')
+    this._chargeToneOn = false;    // guards SFX.startCharge/stopCharge pairing
+    // VFX emitters / objects that must be torn down on shutdown.
+    this._trailEmitter = null;     // projectile trail particle emitter
+    this._chargeGlow = null;       // pulsing aura on the active trebuchet
+    this._flashRect = null;        // reused white-flash overlay
+    this._fxEmitters = [];         // transient burst emitters awaiting cleanup
+    this._whistled = false;        // 'whistle' fires once per shot at apex
+    this._crumbledThisShot = false; // 'crumble' fires once per shot
+    // prefers-reduced-motion: skip flash + heavy bursts when it matches.
+    this._reducedMotion = !!(window.matchMedia &&
+      window.matchMedia('(prefers-reduced-motion: reduce)').matches);
   }
 
   create() {
     const data = this.payload;
     this.seed = data.seed;
     this.players = (data.players || []).map((p) => ({ ...p }));
+
+    // --- V3 §8.3 touch detection -------------------------------------------
+    // Coarse-pointer / touch devices get the on-screen pads + drag-aim; desktop
+    // keeps the keyboard path EXACTLY as before. Computed once per create().
+    this.TOUCH = !!(
+      (this.sys.game.device.input && this.sys.game.device.input.touch) ||
+      (window.matchMedia && window.matchMedia('(pointer: coarse)').matches)
+    );
+
+    // Subtle in-game music bed (no-op if audio is locked/muted/unavailable).
+    try { SFX.musicScene('game'); } catch (e) { /* ignore */ }
 
     // --- Rebuild terrain deterministically from the seed -------------------
     // generateTerrain + placePlayers reproduce the flattened pads exactly as on
@@ -162,6 +193,13 @@ export class Game extends Phaser.Scene {
     // shot still fires (and the bar never sticks).
     this.input.on('gameout', this._onPointerUp, this);
 
+    // --- Touch controls (only on coarse-pointer/touch devices) -------------
+    // Builds the arc pads + fire pad and registers the drag-to-aim handlers.
+    // No-op on desktop, so the keyboard path is untouched.
+    if (this.TOUCH) {
+      this._buildTouchControls();
+    }
+
     // --- Net listeners (ALL removed in shutdown) ---------------------------
     // Seed hostId from the registry (set by main.js from the lobby that preceded
     // this start); keep listening for live host changes (e.g. host promotion).
@@ -199,6 +237,21 @@ export class Game extends Phaser.Scene {
     if (this._projUpdate) {
       this.events.off('update', this._projUpdate);
       this._projUpdate = null;
+    }
+    // --- V3 §8.3 cleanup ---------------------------------------------------
+    // Always stop the sustained charge tone, even if a charge was mid-flight.
+    this._stopChargeTone();
+    // Tear down touch UI pad listeners + drag-aim handlers.
+    this._teardownTouchControls();
+    // Clear the charge glow aura.
+    this._clearChargeGlow();
+    // Destroy the projectile trail + every transient burst emitter SYNCHRONOUSLY
+    // (any deferred fade timers won't run once the scene is torn down).
+    this._destroyFxEmitters();
+    // Reusable white-flash overlay.
+    if (this._flashRect) {
+      this._flashRect.destroy();
+      this._flashRect = null;
     }
   }
 
@@ -361,14 +414,25 @@ export class Game extends Phaser.Scene {
   _applyCastleHit(ownerId, blockIndices) {
     const state = this._castles.get(ownerId);
     if (!state || !Array.isArray(blockIndices)) return;
+    let destroyedAny = false;
     for (const idx of blockIndices) {
       if (idx == null || idx < 0 || idx >= state.alive.length) continue;
       if (!state.alive[idx]) continue;
       state.alive[idx] = false;
+      destroyedAny = true;
       const b = state.blocks[idx];
       if (b) {
-        this._debrisPuff(b.x + (b.w || 1) / 2, b.y + (b.h || 1) / 2);
+        const cx = b.x + (b.w || 1) / 2;
+        const cy = b.y + (b.h || 1) / 2;
+        this._debrisPuff(cx, cy);
+        // Stony chunks flung with gravity/spin (skipped under reduced motion).
+        this._spawnDebris(cx, cy);
       }
+    }
+    // Gravelly 'crumble' once per shot that breaks any masonry.
+    if (destroyedAny && !this._crumbledThisShot) {
+      this._crumbledThisShot = true;
+      try { SFX.play('crumble'); } catch (e) { /* ignore */ }
     }
     this._redrawCastle(state);
   }
@@ -681,6 +745,7 @@ export class Game extends Phaser.Scene {
     this._drawFireBtn();
     this._drawChargeMeter();
     this._drawAimLine();
+    if (this.TOUCH) this._refreshTouchPads();
   }
 
   _drawAimLine() {
@@ -786,6 +851,10 @@ export class Game extends Phaser.Scene {
     this._chargeSource = source;
     this._chargeStart = this.time.now;
     this._chargePower = POWER_MIN;
+    this._chargeFullPinged = false;
+    // Sustained "winding up" whine + a starting charge glow on the trebuchet.
+    this._startChargeTone();
+    this._updateChargeGlow();
     this._refreshHud();
   }
 
@@ -798,6 +867,9 @@ export class Game extends Phaser.Scene {
     const power = this._chargePower;
     this._charging = false;
     this._chargeSource = null;
+    // Stop the charge whine + clear the glow before the shot animates.
+    this._stopChargeTone();
+    this._clearChargeGlow();
     this._fire(power);
   }
 
@@ -805,6 +877,10 @@ export class Game extends Phaser.Scene {
   // is left as-is: a still-held key must not start a brand new charge on the
   // next turn until it is physically released (keyup clears the latch).
   _cancelCharge() {
+    // Always silence the charge tone + clear the glow on a cancel, even if the
+    // _charging flag was already cleared (defensive: turn end mid-release).
+    this._stopChargeTone();
+    this._clearChargeGlow();
     if (!this._charging) return;
     this._charging = false;
     this._chargeSource = null;
@@ -870,6 +946,14 @@ export class Game extends Phaser.Scene {
       } else {
         const frac = Math.min(1, (this.time.now - this._chargeStart) / CHARGE_TIME_MS);
         this._chargePower = Math.round(POWER_MIN + (POWER_MAX - POWER_MIN) * frac);
+        // Nudge the sustained whine pitch + grow the trebuchet charge glow.
+        try { SFX.setChargeLevel(frac); } catch (e) { /* ignore */ }
+        this._updateChargeGlow();
+        // One-shot ping the instant charge tops out.
+        if (frac >= 1 && !this._chargeFullPinged) {
+          this._chargeFullPinged = true;
+          try { SFX.play('charge_full'); } catch (e) { /* ignore */ }
+        }
         this._drawFireBtn();
         this._drawChargeMeter();
         this._drawAimLine();
@@ -879,6 +963,8 @@ export class Game extends Phaser.Scene {
           const power = POWER_MAX;
           this._charging = false;
           this._chargeSource = null;
+          this._stopChargeTone();
+          this._clearChargeGlow();
           this._fire(power);
         }
       }
@@ -888,6 +974,12 @@ export class Game extends Phaser.Scene {
     if (this._myTurn && !this._animating && !this._gameOver) {
       this._handleAimKeys(time);
     }
+
+    // Touch controls: arc-pad hold-repeat + fire-pad fill redraw.
+    if (this.TOUCH) this._updateTouch(time);
+
+    // Keep the charge glow pulsing/growing while charging.
+    if (this._charging) this._updateChargeGlow();
   }
 
   _handleAimKeys(time) {
@@ -914,11 +1006,23 @@ export class Game extends Phaser.Scene {
     if (repeatOk(this.cursors.right)) { this._aimAngle -= step; dir = -1; changed = true; }
 
     if (changed) {
+      const before = this._aimAngle;
       this._snapAim(dir);
       this._heldAngle = this._aimAngle;
       this.aimText.setText(this._arcLabel());
       this._drawAimLine();
+      // Quiet tick when the arc actually moved (throttled in _emitAimSfx).
+      if (this._aimAngle !== before || dir !== 0) this._emitAimSfx();
     }
+  }
+
+  // Throttled 'aim' tick (very quiet) shared by keyboard, pads and drag-aim so
+  // a fast sweep doesn't machine-gun the cue. ~70 ms minimum spacing.
+  _emitAimSfx() {
+    const now = this.time ? this.time.now : 0;
+    if (now - this._lastAimSfx < 70) return;
+    this._lastAimSfx = now;
+    try { SFX.play('aim'); } catch (e) { /* ignore */ }
   }
 
   // Sweep snap (7.1): keep the angle in a valid band, jumping the dead gap in
@@ -938,6 +1042,523 @@ export class Game extends Phaser.Scene {
     this._aimAngle = a;
   }
 
+  // -- touch controls (§8.3) ----------------------------------------------
+  // Builds two arc pads (bottom-left) + a fire pad (bottom-right) and the
+  // battlefield drag-to-aim handler. Only called when this.TOUCH is true, so
+  // the desktop keyboard path is never affected.
+  _buildTouchControls() {
+    // Allow two simultaneous touch points (e.g. hold fire while drag-aiming, or
+    // press both arc pads). Phaser starts with one; bump to a comfortable few.
+    try { this.input.addPointer(2); } catch (e) { /* ignore */ }
+
+    // Bump the in-canvas hint so it reads on a phone; the actual buttons below
+    // are large hit targets regardless.
+    if (this.hintText) {
+      this.hintText.setText('DRAG = AIM   HOLD = FIRE');
+      this.hintText.setFontSize(7);
+    }
+    if (this.aimText) this.aimText.setFontSize(7);
+
+    const pads = [];
+
+    // --- Arc pads (bottom-left). 24x24 hit area each (>= 22 required). -----
+    // ui_arc_l raises the angle toward 180 (more leftward); ui_arc_r lowers it
+    // (more rightward) — mirroring the LEFT/RIGHT keyboard semantics.
+    const PAD = 24;
+    const arcY = WORLD_H - PAD - 3;
+    const arcL = this._makePad('ui_arc_l', 4, arcY, PAD, PAD, 0xffe066);
+    const arcR = this._makePad('ui_arc_r', 4 + PAD + 4, arcY, PAD, PAD, 0xffe066);
+    // dir +1 sweeps leftward (increase angle), -1 sweeps rightward.
+    this._wirePad(arcL, () => this._arcStep(+1));
+    this._wirePad(arcR, () => this._arcStep(-1));
+    pads.push(arcL, arcR);
+
+    // --- Fire pad (bottom-right). 40x40 (>= 34 required). ------------------
+    const FIRE = 40;
+    const fireX = WORLD_W - FIRE - 4;
+    const fireY = WORLD_H - FIRE - 3;
+    const fire = this._makePad('ui_fire', fireX, fireY, FIRE, FIRE, 0xff8a3a);
+    // Reuse the existing pointer charge path. Press-hold = charge, release =
+    // fire. We add a dedicated fill ring drawn in _drawTouchFire().
+    fire.glyph.on('pointerdown', (pointer) => {
+      // Mark this pointer as "owned" by the fire pad so the drag-aim handler
+      // ignores it (pads win the hit-test).
+      pointer._trebFirePad = true;
+      this._beginCharge('pointer');
+    });
+    // Releasing anywhere is handled by the global pointerup -> _onPointerUp ->
+    // _releaseCharge('pointer'); we just clear our flag here for tidiness.
+    fire.glyph.on('pointerup', (pointer) => { pointer._trebFirePad = false; });
+    fire.fillGfx = this.add.graphics();
+    fire.fillGfx.setDepth(83);
+    pads.push(fire);
+
+    this._touchPads = pads;
+    this._firePad = fire;
+    this._arcPads = [arcL, arcR];
+
+    // --- Drag-to-aim on the open battlefield -------------------------------
+    // A drag NOT starting on a pad/HUD sets the arc from the angle between the
+    // active trebuchet and the pointer. Registered after the pads so the pad
+    // pointerdown (which sets _trebFirePad / runs the repeat) takes priority.
+    this._onTouchAimDown = (pointer) => this._dragAimDown(pointer);
+    this._onTouchAimMove = (pointer) => this._dragAimMove(pointer);
+    this._onTouchAimUp = (pointer) => this._dragAimUp(pointer);
+    this.input.on('pointerdown', this._onTouchAimDown, this);
+    this.input.on('pointermove', this._onTouchAimMove, this);
+    this.input.on('pointerup', this._onTouchAimUp, this);
+    this.input.on('gameout', this._onTouchAimUp, this);
+
+    this._drawTouchFire();
+    this._refreshTouchPads();
+  }
+
+  // Create one pad: a tinted glyph image with an explicit rectangular hit area.
+  _makePad(textureKey, x, y, w, h, tint) {
+    const glyph = this.add.image(x + w / 2, y + h / 2, textureKey);
+    glyph.setDepth(82);
+    glyph.setScrollFactor(0);
+    if (tint != null) glyph.setTint(tint);
+    // Scale the glyph art up to roughly fill the pad while keeping the larger
+    // rectangular hit area for easy tapping. Remember the base scale so the
+    // press feedback can scale relative to it without drifting.
+    const src = glyph.width || 14;
+    const base = Math.max(1, (w - 8) / src);
+    glyph.setScale(base);
+    glyph.setInteractive(
+      new Phaser.Geom.Rectangle(-w / 2, -h / 2, w, h),
+      Phaser.Geom.Rectangle.Contains
+    );
+    return { glyph, baseScale: base, rect: new Phaser.Geom.Rectangle(x, y, w, h) };
+  }
+
+  // Wire a hold-to-repeat action onto an arc pad. While held, `action` runs on
+  // an initial press then auto-repeats (timed in update via _padHold).
+  _wirePad(pad, action) {
+    pad._action = action;
+    pad.glyph.on('pointerdown', (pointer) => {
+      pointer._trebArcPad = true;
+      if (!this._canAimTouch()) return;
+      action();                 // immediate response
+      this._padHold = { pad, nextAt: this.time.now + 260 };
+      this._setPadPressed(pad, true);
+    });
+    const release = () => {
+      if (this._padHold && this._padHold.pad === pad) this._padHold = null;
+      this._setPadPressed(pad, false);
+    };
+    pad.glyph.on('pointerup', release);
+    pad.glyph.on('pointerout', release);
+  }
+
+  _setPadPressed(pad, pressed) {
+    if (!pad || !pad.glyph) return;
+    pad.glyph.setAlpha(pressed ? 1 : 0.85);
+    // Scale relative to the remembered base so repeated presses never drift.
+    pad.glyph.setScale((pad.baseScale || 1) * (pressed ? 0.9 : 1));
+  }
+
+  // One arc step in direction `dir` (+1 left / -1 right), reusing the keyboard
+  // sweep + snap so behaviour matches exactly, plus a throttled aim tick.
+  _arcStep(dir) {
+    if (!this._canAimTouch()) return;
+    const step = 1;
+    const before = this._aimAngle;
+    this._aimAngle += dir * step;
+    this._snapAim(dir);
+    if (this._aimAngle === before) return;
+    this._heldAngle = this._aimAngle;
+    if (this.aimText) this.aimText.setText(this._arcLabel());
+    this._drawAimLine();
+    this._emitAimSfx();
+  }
+
+  // True when the player may currently change aim (their turn, idle, alive).
+  _canAimTouch() {
+    if (!this._myTurn || this._animating || this._gameOver) return false;
+    const me = this._trebs.get(net.you);
+    return !!(me && !me.dead);
+  }
+
+  // --- drag-to-aim -------------------------------------------------------
+  _dragAimDown(pointer) {
+    if (!this.TOUCH) return;
+    if (!this._canAimTouch()) return;
+    const x = pointer.worldX;
+    const y = pointer.worldY;
+    // Pads + HUD win the hit-test: ignore drags that begin on them.
+    if (this._pointInControls(x, y)) return;
+    if (pointer._trebFirePad || pointer._trebArcPad) return;
+    this._dragAiming = true;
+    this._dragPointerId = pointer.id;
+    this._applyDragAim(x, y);
+  }
+
+  _dragAimMove(pointer) {
+    if (!this._dragAiming) return;
+    if (pointer.id !== this._dragPointerId) return;
+    if (!pointer.isDown) return;
+    if (!this._canAimTouch()) { this._dragAiming = false; return; }
+    this._applyDragAim(pointer.worldX, pointer.worldY);
+  }
+
+  _dragAimUp(pointer) {
+    // gameout passes no pointer; treat any matching/absent pointer as an end.
+    if (pointer && pointer.id != null && this._dragPointerId != null &&
+        pointer.id !== this._dragPointerId) return;
+    this._dragAiming = false;
+    this._dragPointerId = null;
+  }
+
+  // Set the aim from the angle between the active trebuchet's muzzle and the
+  // pointer, then clamp into a valid band and update the HUD live.
+  _applyDragAim(x, y) {
+    const me = this._trebs.get(net.you);
+    if (!me || me.dead) return;
+    const baseX = me.container.x;
+    const baseY = me.container.y - MUZZLE_DY;
+    // Screen y grows downward; our convention is 0=right/90=up/180=left, so
+    // negate dy to put "up" at +90.
+    const dx = x - baseX;
+    const dy = baseY - y;
+    let ang = Math.atan2(dy, dx) * 180 / Math.PI; // -180..180
+    if (ang < 0) ang += 360;
+    // Aiming is a forward lob only: fold anything below the horizon up onto it.
+    if (ang > 180) ang = 360 - ang;
+    const before = this._aimAngle;
+    this._aimAngle = ang;
+    this._clampAim();
+    if (this._aimAngle === before) return;
+    this._heldAngle = this._aimAngle;
+    if (this.aimText) this.aimText.setText(this._arcLabel());
+    this._drawAimLine();
+    this._emitAimSfx();
+  }
+
+  // Whether a world point lies on any touch pad or a HUD element (so a drag
+  // starting there is treated as a control press, not an aim drag).
+  _pointInControls(x, y) {
+    if (this._touchPads) {
+      for (const pad of this._touchPads) {
+        if (Phaser.Geom.Rectangle.Contains(pad.rect, x, y)) return true;
+      }
+    }
+    // Also protect the FIRE button rect (shared with desktop) just in case.
+    if (this.fireBtnRect && Phaser.Geom.Rectangle.Contains(this.fireBtnRect, x, y)) {
+      return true;
+    }
+    return false;
+  }
+
+  // Per-frame touch state: arc-pad hold repeat + fire-pad fill redraw.
+  _updateTouch(time) {
+    if (!this.TOUCH) return;
+    // Arc pad hold-to-repeat.
+    if (this._padHold) {
+      const hp = this._padHold;
+      if (!this._canAimTouch()) {
+        this._setPadPressed(hp.pad, false);
+        this._padHold = null;
+      } else if (time >= hp.nextAt) {
+        hp.pad._action();
+        hp.nextAt = time + 55; // repeat cadence (matches keyboard auto-repeat)
+      }
+    }
+    this._drawTouchFire();
+  }
+
+  // Redraw the fire pad's charge fill ring + enabled/disabled tint.
+  _drawTouchFire() {
+    const fire = this._firePad;
+    if (!fire || !fire.fillGfx) return;
+    const g = fire.fillGfx;
+    g.clear();
+    const enabled = this._myTurn && !this._animating && !this._gameOver;
+    const r = fire.rect;
+    const cx = r.x + r.width / 2;
+    const cy = r.y + r.height / 2;
+    const radius = r.width / 2 - 1;
+    // Dim glyph when disabled.
+    fire.glyph.setAlpha(enabled ? 0.95 : 0.4);
+    fire.glyph.setTint(enabled ? 0xff8a3a : 0x885533);
+    if (this._charging) {
+      const frac = this._chargeFrac();
+      // Background track.
+      g.lineStyle(2, 0x000000, 0.5);
+      g.strokeCircle(cx, cy, radius);
+      // Charge arc (sweeps clockwise from top).
+      g.lineStyle(2, frac >= 0.999 ? 0xffe26a : 0xe8c44d, 1);
+      g.beginPath();
+      const start = -Math.PI / 2;
+      g.arc(cx, cy, radius, start, start + frac * Math.PI * 2, false);
+      g.strokePath();
+    } else if (enabled) {
+      g.lineStyle(2, 0xfff0b0, 0.8);
+      g.strokeCircle(cx, cy, radius);
+    }
+  }
+
+  // Show/hide + reposition pads on turn changes (visible only when it's the
+  // local player's turn and the game is live).
+  _refreshTouchPads() {
+    if (!this.TOUCH) return;
+    const live = !this._gameOver;
+    if (this._touchPads) {
+      for (const pad of this._touchPads) {
+        if (pad.glyph) pad.glyph.setVisible(live);
+        if (pad.fillGfx) pad.fillGfx.setVisible(live);
+      }
+    }
+    this._drawTouchFire();
+  }
+
+  _teardownTouchControls() {
+    if (this._onTouchAimDown && this.input) {
+      this.input.off('pointerdown', this._onTouchAimDown, this);
+      this.input.off('pointermove', this._onTouchAimMove, this);
+      this.input.off('pointerup', this._onTouchAimUp, this);
+      this.input.off('gameout', this._onTouchAimUp, this);
+    }
+    this._onTouchAimDown = this._onTouchAimMove = this._onTouchAimUp = null;
+    if (this._touchPads) {
+      for (const pad of this._touchPads) {
+        if (pad.glyph) pad.glyph.destroy();
+        if (pad.fillGfx) pad.fillGfx.destroy();
+      }
+    }
+    this._touchPads = null;
+    this._arcPads = null;
+    this._firePad = null;
+    this._padHold = null;
+    this._dragAiming = false;
+    this._dragPointerId = null;
+  }
+
+  // -- charge tone + glow (§8.3 VFX) --------------------------------------
+  _startChargeTone() {
+    if (this._chargeToneOn) return;
+    this._chargeToneOn = true;
+    try { SFX.startCharge(); } catch (e) { /* ignore */ }
+  }
+
+  _stopChargeTone() {
+    // Idempotent + safe to call any time (stopCharge no-ops if not running).
+    this._chargeToneOn = false;
+    try { SFX.stopCharge(); } catch (e) { /* ignore */ }
+  }
+
+  // Pulsing heat aura on the active trebuchet that grows with charge fraction.
+  _updateChargeGlow() {
+    if (this._reducedMotion) return; // keep it calm under reduced motion
+    const me = this._trebs.get(net.you);
+    if (!me || me.dead) { this._clearChargeGlow(); return; }
+    const frac = this._charging ? this._chargeFrac() : 0;
+    if (!this._chargeGlow) {
+      const g = this.add.image(me.container.x, me.container.y - 8, 'fx_ring');
+      // Behind the trebuchet container (depth 30) so it haloes the machine
+      // rather than covering it; additive so it reads as heat.
+      g.setDepth(29);
+      g.setBlendMode(Phaser.BlendModes.ADD);
+      g.setTint(0xffcf6a);
+      this._chargeGlow = g;
+    }
+    const g = this._chargeGlow;
+    g.setPosition(me.container.x, me.container.y - 8);
+    // Grow + brighten with charge; gentle pulse from the frame time.
+    const pulse = 0.85 + 0.15 * Math.sin((this.time ? this.time.now : 0) / 90);
+    const scale = (0.9 + frac * 1.6) * pulse;
+    g.setScale(scale);
+    g.setAlpha(0.25 + 0.5 * frac);
+    g.setVisible(true);
+  }
+
+  _clearChargeGlow() {
+    if (this._chargeGlow) {
+      this._chargeGlow.destroy();
+      this._chargeGlow = null;
+    }
+  }
+
+  // -- projectile trail (§8.3 VFX) ----------------------------------------
+  // A faint warm trail following the rock. Uses the modern Phaser 3.60+
+  // particle API; feature-detected so a missing API never throws.
+  _startProjectileTrail() {
+    this._clearProjectileTrail();
+    if (this._reducedMotion) return;
+    if (typeof this.add.particles !== 'function') return;
+    try {
+      const em = this.add.particles(0, 0, 'fx_trail', {
+        speed: { min: 2, max: 10 },
+        scale: { start: 1, end: 0 },
+        alpha: { start: 0.8, end: 0 },
+        lifespan: 360,
+        frequency: 18,
+        blendMode: 'ADD',
+        follow: this.rock,
+      });
+      em.setDepth(39);
+      this._trailEmitter = em;
+    } catch (e) { /* ignore — trail is purely cosmetic */ }
+  }
+
+  _clearProjectileTrail() {
+    if (this._trailEmitter) {
+      try {
+        // Stop emitting, let live particles fade, then destroy shortly after.
+        this._trailEmitter.stop();
+        const em = this._trailEmitter;
+        this.time.delayedCall(420, () => { try { em.destroy(); } catch (e) {} });
+      } catch (e) {
+        try { this._trailEmitter.destroy(); } catch (e2) {}
+      }
+      this._trailEmitter = null;
+    }
+  }
+
+  // -- enhanced impact VFX (§8.3) -----------------------------------------
+  // Expanding shockwave ring + spark/ember burst + smoke puff. Heavy bursts are
+  // skipped under reduced-motion (the ring is kept, it's cheap + informative).
+  _impactVfx(x, y, big) {
+    // Expanding shockwave ring (scale up + fade) — always shown (lightweight).
+    const ring = this.add.image(x, y, 'fx_ring');
+    ring.setDepth(59);
+    ring.setBlendMode(Phaser.BlendModes.ADD);
+    ring.setTint(big ? 0xffd0a0 : 0xffffff);
+    ring.setScale(0.4);
+    ring.setAlpha(0.9);
+    this.tweens.add({
+      targets: ring,
+      scale: big ? 3.4 : 2.4,
+      alpha: 0,
+      duration: big ? 420 : 320,
+      ease: 'Quad.easeOut',
+      onComplete: () => ring.destroy(),
+    });
+
+    if (this._reducedMotion) return; // skip the heavy bursts
+    if (typeof this.add.particles !== 'function') return;
+
+    // Hot spark + ember burst.
+    this._burst('fx_spark', x, y, {
+      speed: { min: 30, max: big ? 120 : 80 },
+      scale: { start: 1, end: 0 },
+      alpha: { start: 1, end: 0 },
+      lifespan: { min: 200, max: 460 },
+      quantity: big ? 16 : 9,
+      blendMode: 'ADD',
+      gravityY: 60,
+    });
+    this._burst('fx_ember', x, y, {
+      speed: { min: 20, max: big ? 90 : 60 },
+      scale: { start: 1, end: 0 },
+      alpha: { start: 1, end: 0 },
+      lifespan: { min: 260, max: 620 },
+      quantity: big ? 12 : 7,
+      blendMode: 'ADD',
+      gravityY: 90,
+    });
+    // Soft smoke puff rising.
+    this._burst('fx_smoke', x, y - 2, {
+      speed: { min: 6, max: 26 },
+      scale: { start: 0.6, end: 1.6 },
+      alpha: { start: 0.55, end: 0 },
+      lifespan: { min: 420, max: 820 },
+      quantity: big ? 8 : 5,
+      gravityY: -22,
+    });
+  }
+
+  // Emit a one-shot particle burst from a transient emitter, tracked so it can
+  // be torn down on shutdown and auto-destroyed once its particles die out.
+  _burst(key, x, y, cfg) {
+    if (typeof this.add.particles !== 'function') return;
+    try {
+      const conf = Object.assign({ emitting: false }, cfg);
+      const quantity = conf.quantity || 8;
+      delete conf.quantity;
+      const em = this.add.particles(x, y, key, conf);
+      em.setDepth(60);
+      this._fxEmitters.push(em);
+      em.explode(quantity, x, y);
+      const maxLife = (conf.lifespan && conf.lifespan.max) || conf.lifespan || 800;
+      this.time.delayedCall(maxLife + 120, () => {
+        const i = this._fxEmitters.indexOf(em);
+        if (i >= 0) this._fxEmitters.splice(i, 1);
+        try { em.destroy(); } catch (e) {}
+      });
+    } catch (e) { /* ignore — cosmetic */ }
+  }
+
+  _destroyFxEmitters() {
+    if (this._trailEmitter) {
+      try { this._trailEmitter.destroy(); } catch (e) {}
+      this._trailEmitter = null;
+    }
+    if (this._fxEmitters) {
+      for (const em of this._fxEmitters) {
+        try { em.destroy(); } catch (e) {}
+      }
+      this._fxEmitters = [];
+    }
+  }
+
+  // Brief, subtle white screen flash for a big plunge. Skipped under reduced
+  // motion. Reuses a single full-screen rectangle.
+  _bigFlash() {
+    if (this._reducedMotion) return;
+    if (!this._flashRect) {
+      this._flashRect = this.add.rectangle(
+        WORLD_W / 2, WORLD_H / 2, WORLD_W, WORLD_H, 0xffffff
+      );
+      this._flashRect.setDepth(95);
+      this._flashRect.setScrollFactor(0);
+    }
+    const r = this._flashRect;
+    r.setAlpha(0.5);
+    r.setVisible(true);
+    this.tweens.add({
+      targets: r,
+      alpha: 0,
+      duration: 180,
+      ease: 'Quad.easeOut',
+      onComplete: () => { if (r) r.setVisible(false); },
+    });
+  }
+
+  // Stony debris chunks flung from a destroyed castle block — gravity + spin,
+  // fading out. Skipped under reduced motion (the existing dust puff remains).
+  _spawnDebris(x, y) {
+    if (this._reducedMotion) return;
+    const n = 3 + Math.floor(Math.random() * 3);
+    for (let i = 0; i < n; i++) {
+      const chunk = this.add.image(x, y, 'fx_debris');
+      chunk.setDepth(59);
+      const vx = (Math.random() * 2 - 1) * 22;
+      const vy = -(14 + Math.random() * 26);
+      const spin = (Math.random() * 2 - 1) * 6;
+      // Simple ballistic toss via a value tween driving x/y/rotation.
+      const startX = x;
+      const startY = y;
+      const dur = 520 + Math.random() * 200;
+      const g = 140; // px/s^2-ish (scaled to the tween's 0..1 progress)
+      const obj = { t: 0 };
+      this.tweens.add({
+        targets: obj,
+        t: 1,
+        duration: dur,
+        ease: 'Linear',
+        onUpdate: () => {
+          const ts = (obj.t * dur) / 1000;
+          chunk.x = startX + vx * ts;
+          chunk.y = startY + vy * ts + 0.5 * g * ts * ts;
+          chunk.rotation += spin * 0.016;
+          chunk.alpha = 1 - obj.t;
+        },
+        onComplete: () => chunk.destroy(),
+      });
+    }
+  }
+
   // -- shot animation -----------------------------------------------------
   _handleShot(m) {
     if (!m) return;
@@ -955,6 +1576,10 @@ export class Game extends Phaser.Scene {
     const shotEpoch = this._turnEpoch;
 
     const traj = m.trajectory || [];
+
+    // Reset per-shot one-shot cue guards (whistle at apex / crumble on masonry).
+    this._whistled = false;
+    this._crumbledThisShot = false;
 
     // Fire sequence (7.4): idle -> swing (90 ms) -> release (held ~360 ms) ->
     // idle. The projectile + whoosh start AT the swing->release boundary, so we
@@ -1004,11 +1629,15 @@ export class Game extends Phaser.Scene {
     this.rock.setPosition(traj[0][0], traj[0][1]);
     this.rock.setRotation(0);
 
+    // Faint warm particle trail follows the rock (cleared on impact).
+    this._startProjectileTrail();
+
     // Each sample represents 1/60 s of flight. Step through time-based.
     const sampleDt = 1 / 60; // seconds per sample
     let elapsed = 0;
     const totalT = (traj.length - 1) * sampleDt;
     const startTime = this.time.now;
+    let prevY = traj[0][1]; // track y to detect the apex (start of the fall)
 
     const tick = () => {
       elapsed = (this.time.now - startTime) / 1000;
@@ -1030,6 +1659,13 @@ export class Game extends Phaser.Scene {
       const b = traj[Math.min(traj.length - 1, i + 1)];
       const x = a[0] + (b[0] - a[0]) * frac;
       const y = a[1] + (b[1] - a[1]) * frac;
+      // Descending whistle once, when the rock passes its apex (y starts
+      // increasing — screen y grows downward). Guarded so it plays only once.
+      if (!this._whistled && y > prevY + 0.01 && f > 0.05) {
+        this._whistled = true;
+        try { SFX.play('whistle'); } catch (e) { /* ignore */ }
+      }
+      prevY = y;
       this.rock.setPosition(x, y);
       this.rock.rotation += 0.35;
     };
@@ -1039,11 +1675,17 @@ export class Game extends Phaser.Scene {
 
   _resolveImpact(m, shotEpoch) {
     this.rock.setVisible(false);
+    // Stop + tidy the projectile trail now that the rock has landed.
+    this._clearProjectileTrail();
     const res = m.result || {};
 
     // Big-hit emphasis (7.2): plunge >= 1.25 renders popups 1px larger + flash.
     const plunge = typeof res.plunge === 'number' ? res.plunge : 1;
     const bigHit = plunge >= 1.25;
+
+    // Did this shot hit a player directly (any blast/castle damage)?
+    const playerHit = ((res.hits || []).some((h) => h && h.dmg > 0)) ||
+      ((res.castleHits || []).some((ch) => ch && ch.dmg > 0));
 
     // Explosion at impact (if any).
     const impact = res.impact;
@@ -1051,8 +1693,26 @@ export class Game extends Phaser.Scene {
     if (impact) {
       this._explode(impact.x, impact.y, hasDeaths);
       try { SFX.play(hasDeaths ? 'death' : 'explode'); } catch (e) { /* ignore */ }
-      // Camera shake.
-      this.cameras.main.shake(hasDeaths ? 320 : 180, hasDeaths ? 0.012 : 0.006);
+      // Layered impact accents on top of the boom:
+      //   - direct player hit  -> 'hit'
+      //   - terrain-only (no damage) -> 'thud'
+      //   - big plunge -> 'bighit'
+      if (playerHit) { try { SFX.play('hit'); } catch (e) { /* ignore */ } }
+      else { try { SFX.play('thud'); } catch (e) { /* ignore */ } }
+      if (bigHit) { try { SFX.play('bighit'); } catch (e) { /* ignore */ } }
+
+      // Enhanced impact VFX (ring shockwave + spark/ember/smoke bursts).
+      this._impactVfx(impact.x, impact.y, bigHit || hasDeaths);
+
+      // Camera shake — bigger for a deep plunge / a kill.
+      const strongShake = bigHit || hasDeaths;
+      this.cameras.main.shake(
+        strongShake ? 360 : 180,
+        bigHit ? 0.018 : (hasDeaths ? 0.012 : 0.006)
+      );
+      // Big-plunge white screen flash (skipped under reduced motion).
+      if (bigHit) this._bigFlash();
+
       // Carve terrain.
       if (res.crater) {
         applyCrater(this.heights, res.crater);

@@ -2,7 +2,10 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover"
+  />
   <meta name="theme-color" content="#0a0a12" />
   <title>TREBUCHET</title>
 
@@ -156,6 +159,33 @@
       <!-- Scanline / CRT overlay (purely decorative) -->
       <div class="scanlines" aria-hidden="true"></div>
       <div class="crt-vignette" aria-hidden="true"></div>
+    </div>
+
+    <!-- Persistent sound toggle: pinned top-right of the stage, visible on
+         every screen including during gameplay. Wired in ui.js to SFX. -->
+    <button
+      id="btn-mute"
+      class="btn-mute"
+      type="button"
+      aria-pressed="false"
+      aria-label="Mute sound"
+      title="Mute sound"
+    >
+      <span class="btn-mute-glyph" aria-hidden="true">&#9834;</span>
+      <span class="btn-mute-label">SND</span>
+    </button>
+
+    <!-- Portrait advisory: shown only on coarse-pointer devices held in
+         portrait. Purely advisory — never blocks the game from loading. -->
+    <div id="rotate-hint" class="rotate-hint" aria-hidden="true">
+      <div class="rotate-hint-inner">
+        <div class="rotate-hint-glyph" aria-hidden="true">
+          <span class="rotate-phone">&#9633;</span>
+          <span class="rotate-arrow">&#8635;</span>
+        </div>
+        <p class="rotate-hint-text">ROTATE YOUR DEVICE</p>
+        <p class="rotate-hint-sub">PLAY IN LANDSCAPE</p>
+      </div>
     </div>
   </div>
 

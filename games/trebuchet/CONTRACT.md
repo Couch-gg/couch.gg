@@ -495,3 +495,139 @@ live in `shared/constants.js` (owner: Agent SIM).
 - Agent CLIENT: public/js/scenes/game.js (charge input, popups, castle render, swing sync,
   HUD `ARC`), plus a one-line controls hint if ui.js has one (do not restructure ui.js)
 - Agent SRV: server/game.js, public/js/local.js (exact parity), scripts/headless-player.js
+
+---
+
+## 8. V3 — MOBILE, AUDIO & EFFECTS (binding spec)
+
+Four concerns: real touch controls + responsive layout for phones, reliable audio
+when deployed (HTTPS/iOS), subtle background music, and richer SFX/VFX. File
+ownership for this wave is disjoint:
+
+- AUDIO  -> public/js/sfx.js
+- ART    -> public/js/sprites.js
+- GAME   -> public/js/scenes/game.js
+- SHELL  -> public/index.html, public/css/style.css, public/js/ui.js
+
+Everyone codes against the APIs/keys defined here, not against each other's code.
+
+### 8.1 Audio engine (sfx.js) — owner AUDIO
+Keep the existing surface working: `export const SFX = { play(name) }` + default
+export. play() and EVERY new method must NEVER throw (wrap internals; no-op when
+WebAudio is unavailable/suspended/muted).
+
+DEPLOY/iOS UNLOCK HARDENING (this is "make sure there is sound when deployed"):
+- The gesture-unlock listeners must NOT be removed until `ctx.state === 'running'`
+  (today they self-remove after the first gesture even if resume() didn't take —
+  the bug). Re-attempt resume on every gesture until running.
+- Gesture set: `pointerdown, pointerup, touchstart, touchend, mousedown, keydown`
+  (capture phase). On a successful unlock, also play one silent 1-frame buffer
+  (iOS requires an actual buffer play to fully unlock output).
+- Page visibility: when `document.hidden`, suspend the context / pause music; on
+  visible, resume IF unlocked and not muted.
+
+EXPANDED play(name) NAMES — existing: `click, fire, explode, death, yourturn,
+win, lose, tick`. ADD: `aim` (tiny tick when the arc changes — keep very quiet),
+`charge_full` (ping when charge hits max), `whistle` (descending pitch as a
+projectile falls), `thud` (terrain hit, no damage — dull), `hit` (direct player
+hit accent), `bighit` (heavy plunging hit), `crumble` (castle stone shatter —
+noisy, gravelly). Unknown names stay a silent no-op.
+
+SUSTAINED CHARGE TONE:
+- `SFX.startCharge()` starts a quiet rising oscillator (a "winding up" whine).
+- `SFX.setChargeLevel(p01)` optional: nudge its pitch with charge fraction 0..1.
+- `SFX.stopCharge()` stops it cleanly (short release). Safe to call any time,
+  idempotent, never throws, no-op if locked/muted.
+
+BACKGROUND MUSIC (subtle, synthesized, zero assets):
+- A separate music GainNode (~0.12, well under SFX) so it sits behind effects.
+- `SFX.musicScene('menu' | 'game' | 'none')` selects/cross-changes the bed and is
+  the primary control. `menu` = calm; `game` = slightly more driving but still
+  subtle; `none` = fade out. Loop must be seamless and quiet (slow pad +
+  sparse minor-key arpeggio, 8-bit timbres). Music starts only after unlock.
+- `SFX.startMusic()/stopMusic()` low-level helpers allowed but musicScene is the
+  contract the rest of the game calls.
+
+MUTE:
+- `SFX.toggleMute() -> boolean` (returns new muted state), `SFX.setMuted(bool)`,
+  `SFX.isMuted() -> boolean`. Mutes ALL audio (master gain 0 / restore).
+- Persist in `localStorage['treb.muted']` ('1'/'0'); read on load; default UNMUTED.
+
+### 8.2 VFX + touch textures (sprites.js) — owner ART
+Additive ONLY — keep every existing texture and key unchanged. Bake these new
+keys at runtime (transparent bg, NEAREST, same approach as existing):
+- `fx_spark` 3x3 hot spark (white core -> yellow).
+- `fx_ember` 2x2 orange ember.
+- `fx_smoke` 8x8 soft gray puff (a few alpha shades, rounded).
+- `fx_debris` 3x3 stony chunk (2-3 grays) — terrain/castle debris.
+- `fx_ring` 16x16 hollow shockwave ring: a 1px-thick white circle outline,
+  fully transparent center (GAME scales + fades it).
+- `fx_trail` 2x2 pale warm dot — projectile trail.
+- `ui_arc_l` 14x14 chunky LEFT curved/elevation arrow (white).
+- `ui_arc_r` 14x14 chunky RIGHT arrow (white, mirror of ui_arc_l).
+- `ui_fire` 16x16 bold fire/burst glyph (white, GAME tints).
+All transparent bg, NEAREST filter. GAME uses these as Phaser particle/sprite
+textures and tints them per team/heat.
+
+### 8.3 Touch controls, mobile HUD & VFX wiring (scenes/game.js) — owner GAME
+TOUCH DETECTION: `const TOUCH = this.sys.game.device.input.touch ||
+(window.matchMedia && window.matchMedia('(pointer: coarse)').matches)`.
+
+TOUCH CONTROLS (only render/enable when TOUCH; desktop keyboard path stays EXACTLY
+as today — arrows aim, SPACE charges, existing FIRE button works):
+- Arc pads bottom-LEFT: two buttons using `ui_arc_l` / `ui_arc_r`, each with a
+  hit area >= 22x22 logical px, HOLD-TO-REPEAT sweeping the aim through the
+  elevation bands (reuse the existing sweep + `_snapAim`); throttle `SFX.play('aim')`.
+- Fire pad bottom-RIGHT: large button (>= 34x34 logical) using `ui_fire`; press-
+  hold to charge via the existing charge path (`_beginCharge('pointer')`), shows a
+  charge fill, release to fire. `SFX.startCharge()` on begin, `SFX.setChargeLevel`
+  as it ramps, `SFX.stopCharge()` on release; `SFX.play('charge_full')` at max.
+- DRAG-TO-AIM: a drag on the battlefield (anywhere NOT on a pad/HUD) sets the arc
+  from the angle between the active trebuchet and the pointer, clamped into the
+  valid elevation bands; live HUD update. Tap on a pad must not be hijacked by drag.
+- Hit-test pads/fire BEFORE drag-aim so controls win. Keep all controls inside
+  480x270; bump HUD font/elements up slightly when TOUCH for legibility.
+- The existing `_canCharge()`/turn-end cancel/turn-epoch/online+local parity and
+  scene shutdown listener removal MUST keep working; add cleanup for any new
+  input handlers, tweens, emitters, and the charge tone (`SFX.stopCharge()` on
+  shutdown / turn change).
+
+VFX (apply on BOTH touch and desktop):
+- Charge glow: a heat glow / pulsing aura on the active trebuchet that grows with
+  charge fraction; clear on fire/cancel.
+- Projectile trail: a faint `fx_trail`/`fx_smoke` emitter following the rock; stop
+  + tidy on impact. Play `SFX.play('whistle')` once when the rock starts falling
+  (vy turns positive / passes apex).
+- Enhanced impact: expanding `fx_ring` shockwave (scale up + fade), a burst of
+  `fx_spark` + `fx_ember`, and `fx_smoke`; keep the existing boom anim + camera
+  shake. Direct player hit adds `SFX.play('hit')`; terrain-only (no damage) plays
+  `SFX.play('thud')`.
+- Big plunge (`result.plunge >= 1.25`): brief white screen flash (short, subtle),
+  stronger shake, `SFX.play('bighit')`.
+- Castle destruction: for destroyed blocks, spawn a few `fx_debris` chunks with
+  gravity/spin that fade; `SFX.play('crumble')` once per shot that breaks masonry.
+- Keep existing damage popups. Call `SFX.musicScene('game')` in create().
+- Respect prefers-reduced-motion: if `matchMedia('(prefers-reduced-motion: reduce)')`
+  matches, skip the screen flash and heavy particle bursts (keep core readout).
+
+### 8.4 Responsive shell + controls chrome (index.html, css, ui.js) — owner SHELL
+- Inputs: `font-size >= 16px` on coarse pointers (prevent iOS focus-zoom); tap
+  targets (buttons) >= 44px min-height on coarse pointers; honor
+  `env(safe-area-inset-*)` padding so notches/home-bars don't cover UI.
+- Landscape phone: the #stage should use the full available viewport (it already
+  caps to 16:9 — ensure no wasted clipping and that menu panels fit without
+  scroll on a ~360x640..844 device in landscape).
+- Portrait phone (coarse pointer + portrait orientation): show a tasteful
+  `#rotate-hint` overlay ("ROTATE YOUR DEVICE" + landscape glyph) over the stage;
+  it must auto-hide when the device is landscape (CSS media/orientation), and must
+  NOT permanently block interaction (purely an advisory; the game still loads).
+- Sound toggle: a persistent `#btn-mute` button pinned top-right of the stage
+  (respecting safe-area), pointer-events auto, visible on ALL screens including
+  during gameplay. Wire to `SFX.toggleMute()`; reflect muted/unmuted in its label
+  (e.g. SND / MUTE or a speaker glyph). Seed its initial state from
+  `SFX.isMuted()`.
+- Music scene: call `SFX.musicScene('menu')` whenever the menu/lobby/local/
+  gameover screens are shown (the game scene owns 'game'). ui.js already imports
+  SFX for clicks — extend that import.
+- Preserve all existing retro styling and desktop behavior; this is additive +
+  responsive hardening, not a redesign.

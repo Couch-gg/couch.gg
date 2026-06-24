@@ -21,6 +21,17 @@ function clickSound() {
   }
 }
 
+/** Safe SFX music-scene select — never let audio break the UI. The game scene
+ *  owns the 'game' bed; the shell selects 'menu' whenever an overlay screen is
+ *  on top. */
+function setMusicScene(scene) {
+  try {
+    if (SFX && typeof SFX.musicScene === 'function') SFX.musicScene(scene);
+  } catch (err) {
+    /* no-op */
+  }
+}
+
 /** Trim + uppercase a name candidate for display/transport.
  *  Strips ASCII control characters; the server does final validation. */
 function cleanName(raw) {
@@ -69,6 +80,7 @@ export function initUI(net) {
 
   const toastStack = $('toast-stack');
   const connBanner = $('conn-banner');
+  const btnMute = $('btn-mute');
 
   // ---- Local UI state ------------------------------------------------------
   let inGame = false;          // true once a 'start' has hidden the overlay
@@ -83,6 +95,10 @@ export function initUI(net) {
       if (!el) continue;
       el.hidden = key !== which;
     }
+    // Any overlay screen (menu / local / lobby / gameover) plays the calm
+    // menu bed. The Game scene switches to the 'game' bed itself when a match
+    // starts (and hideAll() leaves it untouched).
+    setMusicScene('menu');
   }
 
   function hideAll() {
@@ -438,6 +454,53 @@ export function initUI(net) {
   // ---- CONNECTION BANNER ---------------------------------------------------
   function showConnLost() {
     connBanner.hidden = false;
+  }
+
+  // ---- SOUND TOGGLE --------------------------------------------------------
+  // Persistent mute button, pinned to the stage and visible on every screen
+  // (including during gameplay, since it lives outside #ui's screens).
+  // Speaker glyph + label reflect the current state; initial state is seeded
+  // from SFX.isMuted() (which itself reads the persisted localStorage flag).
+  const MUTE_GLYPH = '♪';   // ♪  (sound on)
+  const MUTED_GLYPH = '✕';  // ✕  (muted)
+
+  function paintMute(muted) {
+    if (!btnMute) return;
+    const glyph = btnMute.querySelector('.btn-mute-glyph');
+    const label = btnMute.querySelector('.btn-mute-label');
+    btnMute.classList.toggle('is-muted', !!muted);
+    if (glyph) glyph.textContent = muted ? MUTED_GLYPH : MUTE_GLYPH;
+    if (label) label.textContent = muted ? 'MUTE' : 'SND';
+    btnMute.setAttribute('aria-pressed', muted ? 'true' : 'false');
+    btnMute.setAttribute('aria-label', muted ? 'Unmute sound' : 'Mute sound');
+    btnMute.title = muted ? 'Unmute sound' : 'Mute sound';
+  }
+
+  function seedMuteState() {
+    let muted = false;
+    try {
+      if (SFX && typeof SFX.isMuted === 'function') muted = !!SFX.isMuted();
+    } catch (err) {
+      /* audio unavailable — treat as unmuted for display */
+    }
+    paintMute(muted);
+  }
+
+  if (btnMute) {
+    btnMute.addEventListener('click', () => {
+      let muted = false;
+      try {
+        if (SFX && typeof SFX.toggleMute === 'function') {
+          muted = !!SFX.toggleMute();
+        }
+      } catch (err) {
+        /* swallow — never let audio break the button */
+      }
+      paintMute(muted);
+      // Click feedback only makes sense when we just turned sound ON.
+      if (!muted) clickSound();
+    });
+    seedMuteState();
   }
 
   // ---- Net wiring ----------------------------------------------------------
