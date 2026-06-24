@@ -1,0 +1,30 @@
+{
+  "name": "couch-gg",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.30.3",
+  "dependencies": {
+    "@couch/realtime": "workspace:*"
+  },
+  "scripts": {
+    "build:packages": "pnpm --filter @couch/types build && pnpm --filter @couch/game-runtime build && pnpm --filter @couch/trebuchet build",
+    "build": "pnpm build:packages && pnpm --filter @couch/realtime build && pnpm --filter @couch/web build",
+    "dev": "pnpm build:packages && concurrently -n realtime,web -c cyan,magenta \"pnpm --filter @couch/realtime dev\" \"pnpm --filter @couch/web dev -- --host 0.0.0.0\"",
+    "test": "pnpm test:unit && pnpm test:e2e",
+    "test:unit": "pnpm build:packages && pnpm --filter @couch/trebuchet test && pnpm --filter @couch/realtime test",
+    "test:e2e": "pnpm exec playwright test",
+    "typecheck": "pnpm build:packages && pnpm --filter @couch/realtime typecheck && pnpm --filter @couch/web typecheck"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.1",
+    "@types/node": "^24.10.1",
+    "@vitejs/plugin-react": "^5.1.1",
+    "concurrently": "^9.2.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.7",
+    "vitest": "^4.0.16",
+    "wait-on": "^9.0.3"
+  }
+}
