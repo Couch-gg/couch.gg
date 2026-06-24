@@ -1,4 +1,4 @@
-import { Copy, Plus, RotateCcw, Smartphone } from 'lucide-react';
+import { Copy, Plus, RotateCcw, Smartphone, Volume2, VolumeX } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import type { GameManifest, Lobby } from '@couch/types';
 import type { TrebuchetEvent, TrebuchetSnapshot } from '@couch/trebuchet';
@@ -8,12 +8,42 @@ import { PlayerRoster } from '../components/PlayerRoster.js';
 import { QrPanel } from '../components/QrPanel.js';
 import { TrebuchetStage, type TrebuchetControlEvent } from '../components/TrebuchetStage.js';
 
+// The audio engine lives in public/ (served at /js/sfx.js), not in src/, so it must be loaded via a
+// runtime dynamic import rather than a static one. We wrap import() in `new Function` so Vite leaves
+// the specifier untouched (the same approach TrebuchetStage uses for its public modules). The module
+// is a shared singleton — the Phaser game imports the same URL — so muting here also mutes gameplay.
+interface SfxModule {
+  musicScene: (scene: 'menu' | 'game' | 'none') => void;
+  toggleMute: () => boolean;
+  isMuted: () => boolean;
+  setMuted: (muted: boolean) => void;
+}
+
+let sfxPromise: Promise<SfxModule | null> | null = null;
+
+function loadSfx(): Promise<SfxModule | null> {
+  if (sfxPromise) return sfxPromise;
+  sfxPromise = (async () => {
+    try {
+      if (typeof window === 'undefined') return null;
+      const importer = new Function('p', 'return import(p)') as (p: string) => Promise<any>;
+      const mod = await importer('/js/sfx.js');
+      return (mod?.SFX ?? mod?.default ?? null) as SfxModule | null;
+    } catch {
+      // Audio is optional — never let a load failure break the screen.
+      return null;
+    }
+  })();
+  return sfxPromise;
+}
+
 export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: string) => void }) {
   const [lobby, setLobby] = useState<Lobby | null>(null);
   const [games, setGames] = useState<GameManifest[]>([]);
   const [lastEvent, setLastEvent] = useState<TrebuchetEvent | null>(null);
   const [lastControlEvent, setLastControlEvent] = useState<TrebuchetControlEvent | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [muted, setMuted] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -49,6 +79,36 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
     };
   }, [slug]);
 
+  // Load the shared audio engine, seed the mute toggle from its persisted state, and select the
+  // pre-game "menu" music bed. Gameplay music ('game') is owned by the Phaser scene's create(), so
+  // we only ask for 'menu' here — when the game starts it will override to 'game' on its own.
+  useEffect(() => {
+    let active = true;
+    void loadSfx().then((sfx) => {
+      if (!active || !sfx) return;
+      try {
+        setMuted(sfx.isMuted());
+        sfx.musicScene('menu');
+      } catch {
+        // never block render on audio
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const toggleMute = () => {
+    void loadSfx().then((sfx) => {
+      if (!sfx) return;
+      try {
+        setMuted(sfx.toggleMute());
+      } catch {
+        // never throw out of a click handler
+      }
+    });
+  };
+
   const controllerUrl = useMemo(() => `${window.location.origin}/c/${slug}`, [slug]);
   const eventSnapshot = lastEvent && 'snapshot' in lastEvent ? (lastEvent.snapshot as TrebuchetSnapshot) : undefined;
   const snapshot = (lobby?.gameSession?.snapshot as TrebuchetSnapshot | undefined) ?? eventSnapshot;
@@ -82,6 +142,15 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
           <strong>{slug}</strong>
         </div>
         <div className="header-actions">
+          <button
+            className="icon-toggle"
+            onClick={toggleMute}
+            aria-pressed={muted}
+            aria-label={muted ? 'Ton einschalten' : 'Ton ausschalten'}
+            title={muted ? 'Ton einschalten' : 'Ton ausschalten'}
+          >
+            {muted ? <VolumeX size={18} /> : <Volume2 size={18} />}
+          </button>
           <button className="icon-btn" onClick={() => void navigator.clipboard?.writeText(controllerUrl)} title="Controller-Link kopieren">
             <Copy size={18} />
           </button>

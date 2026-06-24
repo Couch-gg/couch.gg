@@ -1,5 +1,14 @@
-import { ChevronLeft, ChevronRight, Crown, Gamepad2, LogOut, Play, Send } from 'lucide-react';
-import { useEffect, useRef, useState, type PointerEvent } from 'react';
+import {
+  ChevronLeft,
+  ChevronRight,
+  Crosshair,
+  Crown,
+  Flame,
+  Gamepad2,
+  LogOut,
+  Play
+} from 'lucide-react';
+import { useCallback, useEffect, useRef, useState, type PointerEvent } from 'react';
 import type { Socket } from 'socket.io-client';
 import type { GameManifest, JoinLobbyResponse, Lobby, Player } from '@couch/types';
 import {
@@ -24,12 +33,23 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   const [power, setPower] = useState(POWER_MIN);
   const [aimStep, setAimStep] = useState(1);
   const [charging, setCharging] = useState(false);
+  const [atFull, setAtFull] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastEvent, setLastEvent] = useState<TrebuchetEvent | null>(null);
   const [socket, setSocket] = useState<Socket | null>(null);
   const chargeStartRef = useRef<number | null>(null);
   const chargeTimerRef = useRef<number | null>(null);
   const lastChargeSendRef = useRef(0);
+
+  // --- Hold-to-repeat aim state -------------------------------------------
+  const aimRepeatRef = useRef<number | null>(null);
+  const aimHoldStartRef = useRef(0);
+  const angleRef = useRef(angle);
+  angleRef.current = angle;
+
+  // --- Drag-to-aim state ---------------------------------------------------
+  const gaugeRef = useRef<HTMLDivElement | null>(null);
+  const draggingRef = useRef(false);
 
   useEffect(() => {
     const nextSocket = createSocket();
@@ -43,7 +63,10 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   }, [slug]);
 
   useEffect(() => {
-    return () => stopChargeTimer();
+    return () => {
+      stopChargeTimer();
+      stopAimRepeat();
+    };
   }, []);
 
   const join = async () => {
@@ -125,11 +148,102 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     }
   };
 
-  const aim = (direction: -1 | 1) => {
+  // Apply a raw angle (already snapped) and broadcast the aim preview.
+  const applyAngle = useCallback(
+    (nextAngle: number, direction: -1 | 0 | 1) => {
+      if (nextAngle === angleRef.current) return;
+      setAngle(nextAngle);
+      void sendPreview('trebuchet.aim', { angle: nextAngle, direction, step: aimStep });
+    },
+    // sendPreview closes over myTurn/socket; we intentionally keep deps lean and
+    // read fresh values via refs/state inside the callback at call time.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [aimStep]
+  );
+
+  // Step the arc by `direction` button-presses worth of `aimStep`.
+  const aimStepBy = useCallback(
+    (direction: -1 | 1, amount: number) => {
+      const next = snapAim(angleRef.current + direction * amount, direction);
+      applyAngle(next, direction);
+    },
+    [applyAngle]
+  );
+
+  // --- Hold-to-repeat with mild acceleration ------------------------------
+  const startAimRepeat = (direction: -1 | 1) => {
     if (!myTurn || charging) return;
-    const nextAngle = snapAim(angle + direction * aimStep, direction);
-    setAngle(nextAngle);
-    void sendPreview('trebuchet.aim', { angle: nextAngle, direction, step: aimStep });
+    stopAimRepeat();
+    aimHoldStartRef.current = performance.now();
+    // Immediate first tick on press.
+    aimStepBy(direction, aimStep);
+    let lastTick = performance.now();
+    const tick = () => {
+      const now = performance.now();
+      const held = now - aimHoldStartRef.current;
+      // Acceleration: start slow (~5 ticks/s), ramp to fast (~16 ticks/s) over 1.2s.
+      const ramp = Math.min(1, held / 1200);
+      const interval = 200 - ramp * 140; // 200ms -> 60ms
+      if (now - lastTick >= interval) {
+        lastTick = now;
+        // After holding past the ramp, step in coarser increments for fast travel.
+        const accelStep = aimStep * (ramp >= 1 ? 2 : 1);
+        aimStepBy(direction, accelStep);
+      }
+      aimRepeatRef.current = window.requestAnimationFrame(tick);
+    };
+    aimRepeatRef.current = window.requestAnimationFrame(tick);
+  };
+
+  function stopAimRepeat() {
+    if (aimRepeatRef.current != null) {
+      window.cancelAnimationFrame(aimRepeatRef.current);
+      aimRepeatRef.current = null;
+    }
+  }
+
+  // --- Drag-to-aim on the elevation gauge ---------------------------------
+  const aimFromPointer = (clientX: number, clientY: number) => {
+    const el = gaugeRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    // Vertical position drives elevation; horizontal half drives side.
+    // Top of gauge = max elevation, bottom = min elevation.
+    const t = clamp01(1 - (clientY - rect.top) / rect.height);
+    const elevation = Math.round(ELEV_MIN + t * (ELEV_MAX - ELEV_MIN));
+    const leftSide = clientX - rect.left < rect.width / 2;
+    const nextAngle = leftSide ? 180 - elevation : elevation;
+    const prev = angleRef.current;
+    const direction: -1 | 0 | 1 = nextAngle > prev ? 1 : nextAngle < prev ? -1 : 0;
+    applyAngle(snapAim(nextAngle, direction), direction);
+  };
+
+  const onGaugePointerDown = (event: PointerEvent<HTMLDivElement>) => {
+    if (!myTurn || charging) return;
+    event.preventDefault();
+    draggingRef.current = true;
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // setPointerCapture can throw on stale ids; safe to ignore.
+    }
+    aimFromPointer(event.clientX, event.clientY);
+  };
+
+  const onGaugePointerMove = (event: PointerEvent<HTMLDivElement>) => {
+    if (!draggingRef.current) return;
+    event.preventDefault();
+    aimFromPointer(event.clientX, event.clientY);
+  };
+
+  const onGaugePointerUp = (event: PointerEvent<HTMLDivElement>) => {
+    if (!draggingRef.current) return;
+    draggingRef.current = false;
+    try {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    } catch {
+      // ignore
+    }
   };
 
   const fire = async (shotPower = power) => {
@@ -150,10 +264,14 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   const beginCharge = (event: PointerEvent<HTMLButtonElement>) => {
     event.preventDefault();
     if (!myTurn || charging) return;
+    // A new charge cancels any in-progress aim repeat.
+    stopAimRepeat();
+    haptic(15);
     const now = performance.now();
     chargeStartRef.current = now;
     lastChargeSendRef.current = now;
     setCharging(true);
+    setAtFull(false);
     setPower(POWER_MIN);
     void sendPreview('trebuchet.charge', { active: true, power: POWER_MIN });
     stopChargeTimer();
@@ -166,6 +284,8 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
         void sendPreview('trebuchet.charge', { active: true, power: nextPower });
       }
       if (nextPower >= POWER_MAX) {
+        setAtFull(true);
+        haptic([30, 40, 30]);
         void releaseCharge();
       }
     }, 40);
@@ -177,7 +297,9 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     stopChargeTimer();
     chargeStartRef.current = null;
     setCharging(false);
+    setAtFull(false);
     setPower(shotPower);
+    haptic(45);
     await sendPreview('trebuchet.charge', { active: false, power: shotPower });
     await fire(shotPower);
   };
@@ -187,6 +309,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     stopChargeTimer();
     chargeStartRef.current = null;
     setCharging(false);
+    setAtFull(false);
     setPower(POWER_MIN);
     void sendPreview('trebuchet.charge', { active: false, power: POWER_MIN });
   };
@@ -206,7 +329,11 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   }
 
   useEffect(() => {
-    if (!myTurn) cancelCharge();
+    if (!myTurn) {
+      cancelCharge();
+      stopAimRepeat();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [myTurn]);
 
   if (!player) {
@@ -227,6 +354,8 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
       </main>
     );
   }
+
+  const aiming = arcInfo(angle);
 
   return (
     <main className="controller-shell">
@@ -270,30 +399,103 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
               <span>{myTurn ? 'Your turn' : 'Waiting'}</span>
               <strong>{turnName(snapshot, currentTurn)}</strong>
             </div>
-            <div className="aim-pad" aria-label="Trebuchet aim controls">
-              <button type="button" className="aim-btn" disabled={!myTurn || charging} onClick={() => aim(1)} aria-label="Aim left">
-                <ChevronLeft size={28} />
-              </button>
-              <div className="aim-readout">
-                <span>ARC</span>
-                <strong>{arcLabel(angle)}</strong>
-                <button type="button" className="step-toggle" onClick={() => setAimStep((value) => (value === 1 ? 5 : 1))}>
-                  {aimStep}°
+
+            {/* AIM: elevation gauge + drag + hold-repeat buttons */}
+            <div className="aim-block" aria-label="Trebuchet aim controls">
+              <div className="aim-headline">
+                <span className="aim-side-label">
+                  <Crosshair size={14} /> {aiming.side === 'left' ? 'Firing LEFT' : 'Firing RIGHT'}
+                </span>
+                <span className="aim-elev-label">
+                  <strong>{aiming.elevation}°</strong> elevation
+                </span>
+              </div>
+
+              <div className="aim-pad">
+                <button
+                  type="button"
+                  className="aim-btn"
+                  disabled={!myTurn || charging}
+                  onPointerDown={(e) => {
+                    e.preventDefault();
+                    startAimRepeat(1);
+                  }}
+                  onPointerUp={stopAimRepeat}
+                  onPointerLeave={stopAimRepeat}
+                  onPointerCancel={stopAimRepeat}
+                  aria-label="Aim left"
+                >
+                  <ChevronLeft size={30} />
+                </button>
+
+                <div
+                  ref={gaugeRef}
+                  className={`elev-gauge${myTurn && !charging ? '' : ' disabled'} side-${aiming.side}`}
+                  role="slider"
+                  aria-label="Elevation"
+                  aria-valuemin={ELEV_MIN}
+                  aria-valuemax={ELEV_MAX}
+                  aria-valuenow={aiming.elevation}
+                  aria-valuetext={`${aiming.elevation} degrees, firing ${aiming.side}`}
+                  aria-orientation="vertical"
+                  tabIndex={myTurn && !charging ? 0 : -1}
+                  onPointerDown={onGaugePointerDown}
+                  onPointerMove={onGaugePointerMove}
+                  onPointerUp={onGaugePointerUp}
+                  onPointerCancel={onGaugePointerUp}
+                  onKeyDown={(e) => {
+                    if (!myTurn || charging) return;
+                    if (e.key === 'ArrowUp' || e.key === 'ArrowRight') {
+                      e.preventDefault();
+                      aimStepBy(aiming.side === 'left' ? -1 : 1, aimStep);
+                    } else if (e.key === 'ArrowDown' || e.key === 'ArrowLeft') {
+                      e.preventDefault();
+                      aimStepBy(aiming.side === 'left' ? 1 : -1, aimStep);
+                    }
+                  }}
+                >
+                  <div className="elev-fill" style={{ height: `${aiming.fillPct}%` }} />
+                  <div className="elev-needle" style={{ bottom: `${aiming.fillPct}%` }}>
+                    <span className="elev-needle-val">{aiming.elevation}°</span>
+                  </div>
+                  <span className="elev-tick top">{ELEV_MAX}°</span>
+                  <span className="elev-tick bottom">{ELEV_MIN}°</span>
+                  <span className="elev-hint">drag</span>
+                </div>
+
+                <button
+                  type="button"
+                  className="aim-btn"
+                  disabled={!myTurn || charging}
+                  onPointerDown={(e) => {
+                    e.preventDefault();
+                    startAimRepeat(-1);
+                  }}
+                  onPointerUp={stopAimRepeat}
+                  onPointerLeave={stopAimRepeat}
+                  onPointerCancel={stopAimRepeat}
+                  aria-label="Aim right"
+                >
+                  <ChevronRight size={30} />
                 </button>
               </div>
-              <button type="button" className="aim-btn" disabled={!myTurn || charging} onClick={() => aim(-1)} aria-label="Aim right">
-                <ChevronRight size={28} />
-              </button>
-            </div>
-            <div className="charge-readout">
-              <span>POWER</span>
-              <div className="charge-track">
-                <span style={{ width: `${power}%` }} />
+
+              <div className="aim-foot">
+                <span className="aim-arc-text">ARC {aiming.side === 'left' ? '◄' : '►'} {angle}°</span>
+                <button
+                  type="button"
+                  className="step-toggle"
+                  onClick={() => setAimStep((value) => (value === 1 ? 5 : 1))}
+                  aria-label={`Aim step ${aimStep} degrees, tap to toggle`}
+                >
+                  Step {aimStep}°
+                </button>
               </div>
-              <strong>{power}%</strong>
             </div>
+
+            {/* CHARGE + FIRE */}
             <button
-              className={charging ? 'fire-btn charging' : 'fire-btn'}
+              className={`fire-btn${charging ? ' charging' : ''}${atFull ? ' full' : ''}`}
               disabled={!myTurn}
               onPointerDown={beginCharge}
               onPointerUp={() => void releaseCharge()}
@@ -301,10 +503,20 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
               onPointerLeave={() => {
                 if (charging) void releaseCharge();
               }}
+              onContextMenu={(e) => e.preventDefault()}
+              aria-label={charging ? 'Release to fire' : 'Hold to charge and fire'}
             >
-              <Send size={20} /> {charging ? 'Release to fire' : 'Hold fire'}
+              <span className="fire-fill" style={{ width: `${power}%` }} aria-hidden="true" />
+              <span className="fire-content">
+                <Flame size={22} />
+                <span className="fire-label">{charging ? 'RELEASE TO FIRE' : 'HOLD TO CHARGE'}</span>
+                <span className="fire-power">{power}%</span>
+              </span>
             </button>
-            {lastEvent?.type === 'shot' ? <p className="muted">Last shot: {lastEvent.power}% at {lastEvent.angle}°</p> : null}
+
+            {lastEvent?.type === 'shot' ? (
+              <p className="muted last-shot">Last shot: {lastEvent.power}% at {lastEvent.angle}°</p>
+            ) : null}
           </div>
         )}
 
@@ -331,6 +543,23 @@ function turnName(snapshot: TrebuchetSnapshot | undefined, playerId: string | nu
   return snapshot.units.find((unit) => unit.id === playerId)?.name ?? 'Player';
 }
 
+// Guarded haptics: no-op when the device/browser does not support vibration.
+function haptic(pattern: number | number[]): void {
+  try {
+    if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
+      navigator.vibrate(pattern);
+    }
+  } catch {
+    // Some browsers throw if called without a user gesture; ignore.
+  }
+}
+
+function clamp01(value: number): number {
+  if (value < 0) return 0;
+  if (value > 1) return 1;
+  return value;
+}
+
 const RIGHT_LO = ELEV_MIN;
 const RIGHT_HI = ELEV_MAX;
 const LEFT_LO = 180 - ELEV_MAX;
@@ -349,8 +578,18 @@ function snapAim(rawAngle: number, direction: -1 | 0 | 1): number {
   return next;
 }
 
-function arcLabel(angle: number): string {
+type ArcInfo = {
+  side: 'left' | 'right';
+  elevation: number;
+  fillPct: number;
+};
+
+// Resolve a raw angle into the side, elevation-above-horizon, and a 0-100% fill
+// where 0% = ELEV_MIN (flattest valid) and 100% = ELEV_MAX (steepest).
+function arcInfo(angle: number): ArcInfo {
   const right = angle <= RIGHT_HI;
   const elevation = right ? angle : 180 - angle;
-  return `${right ? '►' : '◄'} ${elevation}°`;
+  const span = ELEV_MAX - ELEV_MIN || 1;
+  const fillPct = clamp01((elevation - ELEV_MIN) / span) * 100;
+  return { side: right ? 'right' : 'left', elevation, fillPct };
 }

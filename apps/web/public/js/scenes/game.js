@@ -84,12 +84,32 @@ export class Game extends Phaser.Scene {
     // (now stale) m.next if a later turn/left advanced the epoch meanwhile.
     this._turnEpoch = 0;
     this._projUpdate = null;
+
+    // --- V3 §8.3 audio + VFX scratch ---------------------------------------
+    // Reset so a rematch restart (which re-runs init+create) never carries
+    // stale references. These back the sustained charge tone, the charge glow
+    // aura, the projectile trail, transient impact bursts, the big-plunge
+    // screen flash and the one-shot impact cue guards.
+    this._chargeToneOn = false;    // guards SFX.startCharge/stopCharge pairing
+    this._trailEmitter = null;     // projectile trail particle emitter
+    this._chargeGlow = null;       // pulsing aura on the active trebuchet
+    this._flashRect = null;        // reused white-flash overlay
+    this._fxEmitters = [];         // transient burst emitters awaiting cleanup
+    this._whistled = false;        // 'whistle' fires once per shot at apex
+    this._crumbledThisShot = false; // 'crumble' fires once per shot
+    this._chargeFullPinged = false; // 'charge_full' fires once per charge
+    // prefers-reduced-motion: skip flash + heavy bursts when it matches.
+    this._reducedMotion = !!(window.matchMedia &&
+      window.matchMedia('(prefers-reduced-motion: reduce)').matches);
   }
 
   create() {
     const data = this.payload;
     this.seed = data.seed;
     this.players = (data.players || []).map((p) => ({ ...p }));
+
+    // Subtle in-game music bed (no-op if audio is locked/muted/unavailable).
+    try { SFX.musicScene('game'); } catch (e) { /* ignore */ }
 
     // --- Rebuild terrain deterministically from the seed -------------------
     // generateTerrain + placePlayers reproduce the flattened pads exactly as on
@@ -213,6 +233,20 @@ export class Game extends Phaser.Scene {
     if (this._projUpdate) {
       this.events.off('update', this._projUpdate);
       this._projUpdate = null;
+    }
+    // --- V3 §8.3 cleanup ---------------------------------------------------
+    // Always stop the sustained charge tone, even if a charge (local OR remote)
+    // was mid-flight when the scene tore down.
+    this._stopChargeTone();
+    // Clear the charge glow aura.
+    this._clearChargeGlow();
+    // Destroy the projectile trail + every transient burst emitter SYNCHRONOUSLY
+    // (any deferred fade timers won't run once the scene is torn down).
+    this._destroyFxEmitters();
+    // Reusable white-flash overlay.
+    if (this._flashRect) {
+      this._flashRect.destroy();
+      this._flashRect = null;
     }
   }
 
@@ -375,14 +409,25 @@ export class Game extends Phaser.Scene {
   _applyCastleHit(ownerId, blockIndices) {
     const state = this._castles.get(ownerId);
     if (!state || !Array.isArray(blockIndices)) return;
+    let destroyedAny = false;
     for (const idx of blockIndices) {
       if (idx == null || idx < 0 || idx >= state.alive.length) continue;
       if (!state.alive[idx]) continue;
       state.alive[idx] = false;
+      destroyedAny = true;
       const b = state.blocks[idx];
       if (b) {
-        this._debrisPuff(b.x + (b.w || 1) / 2, b.y + (b.h || 1) / 2);
+        const cx = b.x + (b.w || 1) / 2;
+        const cy = b.y + (b.h || 1) / 2;
+        this._debrisPuff(cx, cy);
+        // Stony chunks flung with gravity/spin (skipped under reduced motion).
+        this._spawnDebris(cx, cy);
       }
+    }
+    // Gravelly 'crumble' once per shot that breaks any masonry.
+    if (destroyedAny && !this._crumbledThisShot) {
+      this._crumbledThisShot = true;
+      try { SFX.play('crumble'); } catch (e) { /* ignore */ }
     }
     this._redrawCastle(state);
   }
@@ -800,6 +845,12 @@ export class Game extends Phaser.Scene {
     this._chargeSource = source;
     this._chargeStart = this.time.now;
     this._chargePower = POWER_MIN;
+    this._chargeFullPinged = false;
+    // Sustained "winding up" whine + a starting charge glow on the trebuchet.
+    // Hooked into the shared lifecycle so it fires for local charging; the
+    // remote path mirrors this in _handleControl.
+    this._startChargeTone();
+    this._updateChargeGlow();
     this._refreshHud();
   }
 
@@ -812,6 +863,9 @@ export class Game extends Phaser.Scene {
     const power = this._chargePower;
     this._charging = false;
     this._chargeSource = null;
+    // Stop the charge whine + clear the glow before the shot animates.
+    this._stopChargeTone();
+    this._clearChargeGlow();
     this._fire(power);
   }
 
@@ -819,6 +873,12 @@ export class Game extends Phaser.Scene {
   // is left as-is: a still-held key must not start a brand new charge on the
   // next turn until it is physically released (keyup clears the latch).
   _cancelCharge() {
+    // Always silence the charge tone + clear the glow on a cancel, even if the
+    // _charging flag was already cleared (defensive: turn end mid-release).
+    // This is the shared abort path for BOTH local and remote charges — turn
+    // changes (_applyTurn) and shots (_handleShot) route through here.
+    this._stopChargeTone();
+    this._clearChargeGlow();
     if (!this._charging) return;
     this._charging = false;
     this._chargeSource = null;
@@ -879,6 +939,17 @@ export class Game extends Phaser.Scene {
     // CHARGE_TIME_MS; reaching full charge auto-fires.
     if (this._charging) {
       if (this._chargeSource === 'remote') {
+        // Remote charge: power is set directly by _handleControl (the React
+        // controller drives the ramp). We still drive the SHARED audio/VFX off
+        // the current charge fraction so the sustained tone pitch, the
+        // charge_full ping and the glow behave identically to local charging.
+        const frac = this._chargeFrac();
+        try { SFX.setChargeLevel(frac); } catch (e) { /* ignore */ }
+        this._updateChargeGlow();
+        if (frac >= 1 && !this._chargeFullPinged) {
+          this._chargeFullPinged = true;
+          try { SFX.play('charge_full'); } catch (e) { /* ignore */ }
+        }
         this._drawFireBtn();
         this._drawChargeMeter();
         this._drawAimLine();
@@ -889,6 +960,14 @@ export class Game extends Phaser.Scene {
       } else {
         const frac = Math.min(1, (this.time.now - this._chargeStart) / CHARGE_TIME_MS);
         this._chargePower = Math.round(POWER_MIN + (POWER_MAX - POWER_MIN) * frac);
+        // Nudge the sustained whine pitch + grow the trebuchet charge glow.
+        try { SFX.setChargeLevel(frac); } catch (e) { /* ignore */ }
+        this._updateChargeGlow();
+        // One-shot ping the instant charge tops out.
+        if (frac >= 1 && !this._chargeFullPinged) {
+          this._chargeFullPinged = true;
+          try { SFX.play('charge_full'); } catch (e) { /* ignore */ }
+        }
         this._drawFireBtn();
         this._drawChargeMeter();
         this._drawAimLine();
@@ -898,6 +977,8 @@ export class Game extends Phaser.Scene {
           const power = POWER_MAX;
           this._charging = false;
           this._chargeSource = null;
+          this._stopChargeTone();
+          this._clearChargeGlow();
           this._fire(power);
         }
       }
@@ -907,6 +988,9 @@ export class Game extends Phaser.Scene {
     if (this._myTurn && !this._animating && !this._gameOver) {
       this._handleAimKeys(time);
     }
+
+    // Keep the charge glow pulsing/growing while charging (both sources).
+    if (this._charging) this._updateChargeGlow();
   }
 
   _handleAimKeys(time) {
@@ -984,15 +1068,255 @@ export class Game extends Phaser.Scene {
       if (!active) {
         this._charging = false;
         this._chargeSource = null;
+        // Stop the sustained tone + clear the glow when the remote controller
+        // releases (mirrors the local _releaseCharge cleanup).
+        this._stopChargeTone();
+        this._clearChargeGlow();
       } else {
         const nextPower = Number(value.power);
+        const wasCharging = this._charging;
         this._charging = true;
         this._chargeSource = 'remote';
         this._chargePower = Math.max(POWER_MIN, Math.min(POWER_MAX, Number.isFinite(nextPower) ? Math.round(nextPower) : POWER_MIN));
+        // On the leading edge of a remote charge, start the sustained whine +
+        // glow (mirrors local _beginCharge). _startChargeTone is idempotent, so
+        // subsequent power updates won't restack it; the level/glow then ramp
+        // off the shared update() path.
+        if (!wasCharging) this._chargeFullPinged = false;
+        this._startChargeTone();
+        this._updateChargeGlow();
       }
       this._drawFireBtn();
       this._drawChargeMeter();
       this._drawAimLine();
+    }
+  }
+
+  // -- charge tone + glow (§8.3 VFX) --------------------------------------
+  // Shared by BOTH the local (key/pointer) and remote ('trebuchet.charge')
+  // charge lifecycles — the tone/glow are driven from _beginCharge/_handleControl
+  // and the update() ramp, never from a specific input source.
+  _startChargeTone() {
+    if (this._chargeToneOn) return;
+    this._chargeToneOn = true;
+    try { SFX.startCharge(); } catch (e) { /* ignore */ }
+  }
+
+  _stopChargeTone() {
+    // Idempotent + safe to call any time (stopCharge no-ops if not running).
+    this._chargeToneOn = false;
+    try { SFX.stopCharge(); } catch (e) { /* ignore */ }
+  }
+
+  // Pulsing heat aura on the active trebuchet that grows with charge fraction.
+  _updateChargeGlow() {
+    if (this._reducedMotion) return; // keep it calm under reduced motion
+    const me = this._trebs.get(net.you);
+    if (!me || me.dead) { this._clearChargeGlow(); return; }
+    const frac = this._charging ? this._chargeFrac() : 0;
+    if (!this._chargeGlow) {
+      const g = this.add.image(me.container.x, me.container.y - 8, 'fx_ring');
+      // Behind the trebuchet container (depth 30) so it haloes the machine
+      // rather than covering it; additive so it reads as heat.
+      g.setDepth(29);
+      g.setBlendMode(Phaser.BlendModes.ADD);
+      g.setTint(0xffcf6a);
+      this._chargeGlow = g;
+    }
+    const g = this._chargeGlow;
+    g.setPosition(me.container.x, me.container.y - 8);
+    // Grow + brighten with charge; gentle pulse from the frame time.
+    const pulse = 0.85 + 0.15 * Math.sin((this.time ? this.time.now : 0) / 90);
+    const scale = (0.9 + frac * 1.6) * pulse;
+    g.setScale(scale);
+    g.setAlpha(0.25 + 0.5 * frac);
+    g.setVisible(true);
+  }
+
+  _clearChargeGlow() {
+    if (this._chargeGlow) {
+      this._chargeGlow.destroy();
+      this._chargeGlow = null;
+    }
+  }
+
+  // -- projectile trail (§8.3 VFX) ----------------------------------------
+  // A faint warm trail following the rock. Uses the modern Phaser 3.60+
+  // particle API; feature-detected so a missing API never throws.
+  _startProjectileTrail() {
+    this._clearProjectileTrail();
+    if (this._reducedMotion) return;
+    if (typeof this.add.particles !== 'function') return;
+    try {
+      const em = this.add.particles(0, 0, 'fx_trail', {
+        speed: { min: 2, max: 10 },
+        scale: { start: 1, end: 0 },
+        alpha: { start: 0.8, end: 0 },
+        lifespan: 360,
+        frequency: 18,
+        blendMode: 'ADD',
+        follow: this.rock,
+      });
+      em.setDepth(39);
+      this._trailEmitter = em;
+    } catch (e) { /* ignore — trail is purely cosmetic */ }
+  }
+
+  _clearProjectileTrail() {
+    if (this._trailEmitter) {
+      try {
+        // Stop emitting, let live particles fade, then destroy shortly after.
+        this._trailEmitter.stop();
+        const em = this._trailEmitter;
+        this.time.delayedCall(420, () => { try { em.destroy(); } catch (e) {} });
+      } catch (e) {
+        try { this._trailEmitter.destroy(); } catch (e2) {}
+      }
+      this._trailEmitter = null;
+    }
+  }
+
+  // -- enhanced impact VFX (§8.3) -----------------------------------------
+  // Expanding shockwave ring + spark/ember burst + smoke puff. Heavy bursts are
+  // skipped under reduced-motion (the ring is kept, it's cheap + informative).
+  _impactVfx(x, y, big) {
+    // Expanding shockwave ring (scale up + fade) — always shown (lightweight).
+    const ring = this.add.image(x, y, 'fx_ring');
+    ring.setDepth(59);
+    ring.setBlendMode(Phaser.BlendModes.ADD);
+    ring.setTint(big ? 0xffd0a0 : 0xffffff);
+    ring.setScale(0.4);
+    ring.setAlpha(0.9);
+    this.tweens.add({
+      targets: ring,
+      scale: big ? 3.4 : 2.4,
+      alpha: 0,
+      duration: big ? 420 : 320,
+      ease: 'Quad.easeOut',
+      onComplete: () => ring.destroy(),
+    });
+
+    if (this._reducedMotion) return; // skip the heavy bursts
+    if (typeof this.add.particles !== 'function') return;
+
+    // Hot spark + ember burst.
+    this._burst('fx_spark', x, y, {
+      speed: { min: 30, max: big ? 120 : 80 },
+      scale: { start: 1, end: 0 },
+      alpha: { start: 1, end: 0 },
+      lifespan: { min: 200, max: 460 },
+      quantity: big ? 16 : 9,
+      blendMode: 'ADD',
+      gravityY: 60,
+    });
+    this._burst('fx_ember', x, y, {
+      speed: { min: 20, max: big ? 90 : 60 },
+      scale: { start: 1, end: 0 },
+      alpha: { start: 1, end: 0 },
+      lifespan: { min: 260, max: 620 },
+      quantity: big ? 12 : 7,
+      blendMode: 'ADD',
+      gravityY: 90,
+    });
+    // Soft smoke puff rising.
+    this._burst('fx_smoke', x, y - 2, {
+      speed: { min: 6, max: 26 },
+      scale: { start: 0.6, end: 1.6 },
+      alpha: { start: 0.55, end: 0 },
+      lifespan: { min: 420, max: 820 },
+      quantity: big ? 8 : 5,
+      gravityY: -22,
+    });
+  }
+
+  // Emit a one-shot particle burst from a transient emitter, tracked so it can
+  // be torn down on shutdown and auto-destroyed once its particles die out.
+  _burst(key, x, y, cfg) {
+    if (typeof this.add.particles !== 'function') return;
+    try {
+      const conf = Object.assign({ emitting: false }, cfg);
+      const quantity = conf.quantity || 8;
+      delete conf.quantity;
+      const em = this.add.particles(x, y, key, conf);
+      em.setDepth(60);
+      this._fxEmitters.push(em);
+      em.explode(quantity, x, y);
+      const maxLife = (conf.lifespan && conf.lifespan.max) || conf.lifespan || 800;
+      this.time.delayedCall(maxLife + 120, () => {
+        const i = this._fxEmitters.indexOf(em);
+        if (i >= 0) this._fxEmitters.splice(i, 1);
+        try { em.destroy(); } catch (e) {}
+      });
+    } catch (e) { /* ignore — cosmetic */ }
+  }
+
+  _destroyFxEmitters() {
+    if (this._trailEmitter) {
+      try { this._trailEmitter.destroy(); } catch (e) {}
+      this._trailEmitter = null;
+    }
+    if (this._fxEmitters) {
+      for (const em of this._fxEmitters) {
+        try { em.destroy(); } catch (e) {}
+      }
+      this._fxEmitters = [];
+    }
+  }
+
+  // Brief, subtle white screen flash for a big plunge. Skipped under reduced
+  // motion. Reuses a single full-screen rectangle.
+  _bigFlash() {
+    if (this._reducedMotion) return;
+    if (!this._flashRect) {
+      this._flashRect = this.add.rectangle(
+        WORLD_W / 2, WORLD_H / 2, WORLD_W, WORLD_H, 0xffffff
+      );
+      this._flashRect.setDepth(95);
+      this._flashRect.setScrollFactor(0);
+    }
+    const r = this._flashRect;
+    r.setAlpha(0.5);
+    r.setVisible(true);
+    this.tweens.add({
+      targets: r,
+      alpha: 0,
+      duration: 180,
+      ease: 'Quad.easeOut',
+      onComplete: () => { if (r) r.setVisible(false); },
+    });
+  }
+
+  // Stony debris chunks flung from a destroyed castle block — gravity + spin,
+  // fading out. Skipped under reduced motion (the existing dust puff remains).
+  _spawnDebris(x, y) {
+    if (this._reducedMotion) return;
+    const n = 3 + Math.floor(Math.random() * 3);
+    for (let i = 0; i < n; i++) {
+      const chunk = this.add.image(x, y, 'fx_debris');
+      chunk.setDepth(59);
+      const vx = (Math.random() * 2 - 1) * 22;
+      const vy = -(14 + Math.random() * 26);
+      const spin = (Math.random() * 2 - 1) * 6;
+      // Simple ballistic toss via a value tween driving x/y/rotation.
+      const startX = x;
+      const startY = y;
+      const dur = 520 + Math.random() * 200;
+      const g = 140; // px/s^2-ish (scaled to the tween's 0..1 progress)
+      const obj = { t: 0 };
+      this.tweens.add({
+        targets: obj,
+        t: 1,
+        duration: dur,
+        ease: 'Linear',
+        onUpdate: () => {
+          const ts = (obj.t * dur) / 1000;
+          chunk.x = startX + vx * ts;
+          chunk.y = startY + vy * ts + 0.5 * g * ts * ts;
+          chunk.rotation += spin * 0.016;
+          chunk.alpha = 1 - obj.t;
+        },
+        onComplete: () => chunk.destroy(),
+      });
     }
   }
 
@@ -1013,6 +1337,10 @@ export class Game extends Phaser.Scene {
     const shotEpoch = this._turnEpoch;
 
     const traj = m.trajectory || [];
+
+    // Reset per-shot one-shot cue guards (whistle at apex / crumble on masonry).
+    this._whistled = false;
+    this._crumbledThisShot = false;
 
     // Fire sequence (7.4): idle -> swing (90 ms) -> release (held ~360 ms) ->
     // idle. The projectile + whoosh start AT the swing->release boundary, so we
@@ -1062,11 +1390,15 @@ export class Game extends Phaser.Scene {
     this.rock.setPosition(traj[0][0], traj[0][1]);
     this.rock.setRotation(0);
 
+    // Faint warm particle trail follows the rock (cleared on impact).
+    this._startProjectileTrail();
+
     // Each sample represents 1/60 s of flight. Step through time-based.
     const sampleDt = 1 / 60; // seconds per sample
     let elapsed = 0;
     const totalT = (traj.length - 1) * sampleDt;
     const startTime = this.time.now;
+    let prevY = traj[0][1]; // track y to detect the apex (start of the fall)
 
     const tick = () => {
       elapsed = (this.time.now - startTime) / 1000;
@@ -1088,6 +1420,13 @@ export class Game extends Phaser.Scene {
       const b = traj[Math.min(traj.length - 1, i + 1)];
       const x = a[0] + (b[0] - a[0]) * frac;
       const y = a[1] + (b[1] - a[1]) * frac;
+      // Descending whistle once, when the rock passes its apex (y starts
+      // increasing — screen y grows downward). Guarded so it plays only once.
+      if (!this._whistled && y > prevY + 0.01 && f > 0.05) {
+        this._whistled = true;
+        try { SFX.play('whistle'); } catch (e) { /* ignore */ }
+      }
+      prevY = y;
       this.rock.setPosition(x, y);
       this.rock.rotation += 0.35;
     };
@@ -1097,11 +1436,17 @@ export class Game extends Phaser.Scene {
 
   _resolveImpact(m, shotEpoch) {
     this.rock.setVisible(false);
+    // Stop + tidy the projectile trail now that the rock has landed.
+    this._clearProjectileTrail();
     const res = m.result || {};
 
     // Big-hit emphasis (7.2): plunge >= 1.25 renders popups 1px larger + flash.
     const plunge = typeof res.plunge === 'number' ? res.plunge : 1;
     const bigHit = plunge >= 1.25;
+
+    // Did this shot hit a player directly (any blast/castle damage)?
+    const playerHit = ((res.hits || []).some((h) => h && h.dmg > 0)) ||
+      ((res.castleHits || []).some((ch) => ch && ch.dmg > 0));
 
     // Explosion at impact (if any).
     const impact = res.impact;
@@ -1109,8 +1454,26 @@ export class Game extends Phaser.Scene {
     if (impact) {
       this._explode(impact.x, impact.y, hasDeaths);
       try { SFX.play(hasDeaths ? 'death' : 'explode'); } catch (e) { /* ignore */ }
-      // Camera shake.
-      this.cameras.main.shake(hasDeaths ? 320 : 180, hasDeaths ? 0.012 : 0.006);
+      // Layered impact accents on top of the boom:
+      //   - direct player hit  -> 'hit'
+      //   - terrain-only (no damage) -> 'thud'
+      //   - big plunge -> 'bighit'
+      if (playerHit) { try { SFX.play('hit'); } catch (e) { /* ignore */ } }
+      else { try { SFX.play('thud'); } catch (e) { /* ignore */ } }
+      if (bigHit) { try { SFX.play('bighit'); } catch (e) { /* ignore */ } }
+
+      // Enhanced impact VFX (ring shockwave + spark/ember/smoke bursts).
+      this._impactVfx(impact.x, impact.y, bigHit || hasDeaths);
+
+      // Camera shake — bigger for a deep plunge / a kill.
+      const strongShake = bigHit || hasDeaths;
+      this.cameras.main.shake(
+        strongShake ? 360 : 180,
+        bigHit ? 0.018 : (hasDeaths ? 0.012 : 0.006)
+      );
+      // Big-plunge white screen flash (skipped under reduced motion).
+      if (bigHit) this._bigFlash();
+
       // Carve terrain.
       if (res.crater) {
         applyCrater(this.heights, res.crater);

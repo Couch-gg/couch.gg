@@ -465,6 +465,104 @@ const WIND_PAL = {
 };
 
 // ---------------------------------------------------------------------------------------------
+// VFX TEXTURES — additive; existing keys above are untouched.
+// All: transparent bg, NEAREST filter, white/light so game can tint.
+// ---------------------------------------------------------------------------------------------
+
+// fx_spark (3x3) — hot spark: white core, yellow surround.
+const FX_SPARK = [
+  '.Y.',
+  'YWY',
+  '.Y.',
+];
+const FX_SPARK_PAL = {
+  W: 0xffffff,
+  Y: 0xffee55,
+};
+
+// fx_ember (2x2) — orange ember dot.
+const FX_EMBER = [
+  'OL',
+  'Lo',
+];
+const FX_EMBER_PAL = {
+  O: 0xff8822,
+  L: 0xffaa44,
+  o: 0xdd6600,
+};
+
+// fx_smoke (8x8) — soft gray puff with alpha shades (rounded edges implied by transparency).
+const FX_SMOKE = [
+  '..bbb...',
+  '.bBBBb..',
+  'bBWWBBb.',
+  'bBWWBBbb',
+  '.bBBBBb.',
+  '.bbBBb..',
+  '..bbb...',
+  '........',
+];
+const FX_SMOKE_PAL = {
+  W: 'rgba(230,230,230,0.90)',
+  B: 'rgba(190,190,190,0.70)',
+  b: 'rgba(150,150,150,0.40)',
+};
+
+// fx_debris (3x3) — stony chunk, 2-3 grays.
+const FX_DEBRIS = [
+  'LMM',
+  'MDD',
+  'MMD',
+];
+const FX_DEBRIS_PAL = {
+  L: 0xcccccc,
+  M: 0x999999,
+  D: 0x666666,
+};
+
+// fx_trail (2x2) — pale warm dot for projectile trail.
+const FX_TRAIL = [
+  'WL',
+  'Lw',
+];
+const FX_TRAIL_PAL = {
+  W: 0xfffbee,
+  L: 0xffe8aa,
+  w: 0xffcc77,
+};
+
+// fx_ring (16x16) — hollow shockwave ring: 1px-thick white circle outline, transparent center.
+// Drawn procedurally so the circle is mathematically exact.
+function bakeFxRing(scene) {
+  const SIZE = 16;
+  const canvas = document.createElement('canvas');
+  canvas.width = SIZE;
+  canvas.height = SIZE;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, SIZE, SIZE);
+
+  // Draw a 1px-thick circle outline. For each pixel, check if it falls within the
+  // 1px ring at radius 7 (outer edge at 7.5, inner edge at 6.5 from center 7.5,7.5).
+  const cx = 7.5;
+  const cy = 7.5;
+  const rOuter = 7.5;
+  const rInner = 6.5;
+  ctx.fillStyle = '#ffffff';
+  for (let y = 0; y < SIZE; y++) {
+    for (let x = 0; x < SIZE; x++) {
+      const dx = x + 0.5 - cx;
+      const dy = y + 0.5 - cy;
+      const d2 = dx * dx + dy * dy;
+      if (d2 >= rInner * rInner && d2 < rOuter * rOuter) {
+        ctx.fillRect(x, y, 1, 1);
+      }
+    }
+  }
+
+  registerCanvas(scene, 'fx_ring', canvas);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Public entry point — bake everything onto the given scene's texture manager.
 // ---------------------------------------------------------------------------------------------
 export function bakeTextures(scene) {
@@ -486,4 +584,12 @@ export function bakeTextures(scene) {
 
   // Wind arrow.
   bakeGrid(scene, 'wind_arrow', WIND_ARROW, WIND_PAL);
+
+  // --- VFX textures ---
+  bakeGrid(scene, 'fx_spark', FX_SPARK, FX_SPARK_PAL);
+  bakeGrid(scene, 'fx_ember', FX_EMBER, FX_EMBER_PAL);
+  bakeGrid(scene, 'fx_smoke', FX_SMOKE, FX_SMOKE_PAL);
+  bakeGrid(scene, 'fx_debris', FX_DEBRIS, FX_DEBRIS_PAL);
+  bakeFxRing(scene);
+  bakeGrid(scene, 'fx_trail', FX_TRAIL, FX_TRAIL_PAL);
 }
