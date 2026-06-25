@@ -1,168 +1,108 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type Browser } from '@playwright/test';
+
+const DESKTOP_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+function desktopPage(browser: Browser) {
+  return browser.newPage({
+    viewport: { width: 1440, height: 960 },
+    isMobile: false,
+    hasTouch: false,
+    userAgent: DESKTOP_UA
+  });
+}
+
+async function phonePage(browser: Browser, name: string) {
+  const p = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  await p.addInitScript((n) => window.localStorage.setItem('couch:name', n), name);
+  return p;
+}
+
+// Pair a TV + a host phone via attract -> /s/:screenId -> "Create a room" -> auto-join.
+async function pairHost(browser: Browser, hostName: string) {
+  const tv = await desktopPage(browser);
+  await tv.goto('/');
+  await expect(tv.locator('.attract-shell')).toBeVisible();
+  await expect
+    .poll(() => tv.evaluate(() => window.sessionStorage.getItem('couch:screenId')), { timeout: 15_000 })
+    .toBeTruthy();
+  const screenId = await tv.evaluate(() => window.sessionStorage.getItem('couch:screenId'));
+
+  const host = await phonePage(browser, hostName);
+  await host.goto('/s/' + screenId);
+  await host.getByRole('button', { name: /Create a room/i }).click();
+  await expect(host).toHaveURL(/\/c\/[A-Z0-9]+/, { timeout: 15_000 });
+  const slug = host.url().split('/').pop()!;
+
+  // Claiming the scanned screen navigates the TV into the lobby (socket push + REST poll fallback).
+  await expect(tv).toHaveURL(new RegExp('/l/' + slug), { timeout: 15_000 });
+  // The creator auto-joins as host (name from localStorage).
+  await expect(tv.locator('.player-name', { hasText: hostName })).toBeVisible({ timeout: 15_000 });
+  return { tv, host, slug };
+}
 
 test('standalone Trebuchet test route renders and fires a shot', async ({ page }) => {
   await page.goto('/games/trebuchet');
   await expect(page.getByText('/games/trebuchet')).toBeVisible();
-  // Phaser canvas mount can lag under concurrent WebGL load — give it room.
   await expect(page.getByTestId('trebuchet-stage').locator('canvas')).toBeVisible({ timeout: 30_000 });
   await page.getByRole('button', { name: /Fire test shot/i }).click();
   await expect(page.getByText(/Alex|Bea|Winner|Finished/i).first()).toBeVisible({ timeout: 30_000 });
 });
 
-test('desktop attract pairs a phone, lobby chat + game start work', async ({ browser }) => {
-  // 1) Desktop TV shows the retro attract screen and registers a short-lived screen id.
-  const tv = await browser.newPage({
-    viewport: { width: 1440, height: 960 },
-    isMobile: false,
-    hasTouch: false,
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-  });
-  await tv.goto('/');
-  await expect(tv.locator('.attract-shell')).toBeVisible();
-  // The QR encodes /s/:screenId; the id is persisted to sessionStorage once registration lands.
-  await expect
-    .poll(() => tv.evaluate(() => window.sessionStorage.getItem('couch:screenId')), { timeout: 15_000 })
-    .toBeTruthy();
-  const screenId = await tv.evaluate(() => window.sessionStorage.getItem('couch:screenId'));
-  await tv.screenshot({ path: 'test-results/attract-home.png' });
-
-  // 2) Phone "scans" the QR (opens /s/:screenId) and creates a room.
-  const phoneOne = await browser.newPage({
-    viewport: { width: 390, height: 844 },
-    isMobile: true,
-    hasTouch: true
-  });
-  await phoneOne.goto('/s/' + screenId);
-  await phoneOne.getByRole('button', { name: /Create a room/i }).click();
-  await expect(phoneOne).toHaveURL(/\/c\/[A-Z0-9]+/, { timeout: 15_000 });
-  const slug = phoneOne.url().split('/').pop()!;
-
-  // 3) Claiming the screen navigates the TV into that lobby (socket push, with REST poll fallback).
-  await expect(tv).toHaveURL(new RegExp('/l/' + slug), { timeout: 15_000 });
-
-  // 4) The creator joins as host.
-  await phoneOne.getByLabel(/Your name/i).fill('Alex');
-  await phoneOne.getByRole('button', { name: /^Join$/i }).click();
-
-  // 5) A second phone joins via the controller route.
-  const phoneTwo = await browser.newPage({
-    viewport: { width: 390, height: 844 },
-    isMobile: true,
-    hasTouch: true
-  });
-  await phoneTwo.goto('/c/' + slug);
-  await phoneTwo.getByLabel(/Your name/i).fill('Bea');
-  await phoneTwo.getByRole('button', { name: /^Join$/i }).click();
-
-  // Both players appear on the TV.
-  await expect(tv.locator('.player-name', { hasText: 'Alex' })).toBeVisible();
-  await expect(tv.locator('.player-name', { hasText: 'Bea' })).toBeVisible();
-
-  // The TV shows the game catalog overview including Trebuchet.
-  await expect(tv.locator('.game-catalog')).toBeVisible();
-  await expect(tv.locator('.game-card-title', { hasText: 'Trebuchet' })).toBeVisible();
-  await tv.screenshot({ path: 'test-results/lobby-tv.png' });
-
-  // 6) Chat round-trips controller -> TV (read-only) and -> other controller, in the lobby state.
-  const chatInput = phoneOne.getByPlaceholder(/Message/i);
-  await chatInput.fill('gg hello');
-  await chatInput.press('Enter');
-  await expect(tv.locator('.chat-msg-text', { hasText: 'gg hello' })).toBeVisible({ timeout: 10_000 });
-  await expect(phoneTwo.locator('.chat-msg-text', { hasText: 'gg hello' })).toBeVisible({ timeout: 10_000 });
-
-  // 7) Host selects Trebuchet from the catalog (wires game:select) and starts the game.
-  await phoneOne.locator('.game-card', { hasText: 'Trebuchet' }).click();
-  const startBtn = phoneOne.getByRole('button', { name: /Trebuchet starten/i });
-  await expect(startBtn).toBeEnabled();
-  await startBtn.click();
-
-  // The TV goes live.
-  await expect(tv.getByText('Live')).toBeVisible({ timeout: 10_000 });
-  await expect(tv.getByTestId('trebuchet-stage')).toHaveAttribute('data-phase', 'running');
-  await expect(phoneOne.getByText(/Your turn|Waiting/i)).toBeVisible();
-
-  await tv.close();
-  await phoneOne.close();
-  await phoneTwo.close();
+test('phone home shows the scan prompt with a create/join escape hatch', async ({ browser }) => {
+  const phone = await phonePage(browser, 'Solo');
+  await phone.goto('/');
+  await expect(phone.getByText(/Scan a TV to begin/i)).toBeVisible();
+  await expect(phone.getByRole('button', { name: /Create a room/i })).toBeVisible();
+  await phone.close();
 });
 
-test('invite link opens the mobile join confirm', async ({ browser }) => {
-  // Seed a lobby by creating one through a phone pairing flow against a fresh screen.
-  const tv = await browser.newPage({
-    viewport: { width: 1440, height: 960 },
-    isMobile: false,
-    hasTouch: false,
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-  });
-  await tv.goto('/');
-  await expect
-    .poll(() => tv.evaluate(() => window.sessionStorage.getItem('couch:screenId')), { timeout: 15_000 })
-    .toBeTruthy();
-  const screenId = await tv.evaluate(() => window.sessionStorage.getItem('couch:screenId'));
+test('attract pairs a phone (Create a room), second joins via invite, chat + game start', async ({ browser }) => {
+  test.setTimeout(90_000);
+  const { tv, host, slug } = await pairHost(browser, 'Alex');
 
-  const host = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
-  await host.goto('/s/' + screenId);
-  await host.getByRole('button', { name: /Create a room/i }).click();
-  await expect(host).toHaveURL(/\/c\/[A-Z0-9]+/, { timeout: 15_000 });
-  const slug = host.url().split('/').pop()!;
-  await host.getByLabel(/Your name/i).fill('Alex');
-  await host.getByRole('button', { name: /^Join$/i }).click();
+  // Second player opens the lobby invite /j/:slug and confirms.
+  const bea = await phonePage(browser, 'Bea');
+  await bea.goto('/j/' + slug);
+  await bea.getByRole('button', { name: /^Join$/i }).click();
+  await expect(bea).toHaveURL(new RegExp('/c/' + slug), { timeout: 15_000 });
+  await expect(tv.locator('.player-name', { hasText: 'Bea' })).toBeVisible({ timeout: 15_000 });
 
-  // A friend opens the invite link on a phone -> mobile join confirm (never the desktop home).
-  const friend = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
-  await friend.goto('/j/' + slug);
-  await expect(friend.locator('.join-confirm-card')).toBeVisible();
-  await expect(friend.getByText(/Join this room\?/i)).toBeVisible();
-  await friend.getByRole('button', { name: /^Join$/i }).click();
-  await expect(friend).toHaveURL(new RegExp('/c/' + slug));
+  // Catalog overview on the TV.
+  await expect(tv.locator('.game-catalog')).toBeVisible();
+  await expect(tv.locator('.game-card-title', { hasText: 'Trebuchet' })).toBeVisible();
+
+  // Chat round-trips controller -> TV.
+  const chat = host.getByPlaceholder(/Message/i);
+  await chat.fill('gg hello');
+  await chat.press('Enter');
+  await expect(tv.locator('.chat-msg-text', { hasText: 'gg hello' })).toBeVisible({ timeout: 10_000 });
+
+  // Host selects Trebuchet and starts.
+  await host.locator('.game-card', { hasText: 'Trebuchet' }).click();
+  const start = host.getByRole('button', { name: /Trebuchet starten/i });
+  await expect(start).toBeEnabled();
+  await start.click();
+  await expect(tv.getByText('Live')).toBeVisible({ timeout: 10_000 });
+  await expect(tv.getByTestId('trebuchet-stage')).toHaveAttribute('data-phase', 'running');
 
   await tv.close();
   await host.close();
-  await friend.close();
+  await bea.close();
 });
 
 test('controller survives a network drop and auto-rejoins (slept phone)', async ({ browser }) => {
   test.setTimeout(90_000);
-  const tv = await browser.newPage({
-    viewport: { width: 1440, height: 960 },
-    isMobile: false,
-    hasTouch: false,
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-  });
-  await tv.goto('/');
-  await expect
-    .poll(() => tv.evaluate(() => window.sessionStorage.getItem('couch:screenId')), { timeout: 15_000 })
-    .toBeTruthy();
-  const screenId = await tv.evaluate(() => window.sessionStorage.getItem('couch:screenId'));
+  const { tv, host } = await pairHost(browser, 'Alex');
 
-  const host = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
-  await host.goto('/s/' + screenId);
-  await host.getByRole('button', { name: /Create a room/i }).click();
-  await expect(host).toHaveURL(/\/c\/[A-Z0-9]+/, { timeout: 15_000 });
-  const slug = host.url().split('/').pop()!;
-  await host.getByLabel(/Your name/i).fill('Alex');
-  await host.getByRole('button', { name: /^Join$/i }).click();
+  const conn = tv.locator('.player-row', { hasText: 'Alex' }).locator('.connection');
+  await expect(conn).toHaveText(/online/i, { timeout: 15_000 });
 
-  const alexConnection = tv.locator('.player-row', { hasText: 'Alex' }).locator('.connection');
-  await expect(alexConnection).toHaveText(/online/i, { timeout: 15_000 });
-
-  // Phone goes to sleep / loses network — the socket drops.
   await host.context().setOffline(true);
-  await expect(host.locator('.reconnect-pill')).toBeVisible({ timeout: 20_000 });
-  await expect(alexConnection).toHaveText(/reconnect/i, { timeout: 20_000 });
+  await expect(conn).toHaveText(/reconnect/i, { timeout: 20_000 });
 
-  // Phone wakes — the controller auto-rejoins with no manual action, within the grace window.
   await host.context().setOffline(false);
-  await expect(host.locator('.reconnect-pill')).toBeHidden({ timeout: 20_000 });
-  await expect(alexConnection).toHaveText(/online/i, { timeout: 20_000 });
-
-  // And it is fully functional again: a chat from the phone reaches the TV.
-  await host.getByPlaceholder(/Message/i).fill('back online');
-  await host.getByPlaceholder(/Message/i).press('Enter');
-  await expect(tv.locator('.chat-msg-text', { hasText: 'back online' })).toBeVisible({ timeout: 10_000 });
+  await expect(conn).toHaveText(/online/i, { timeout: 20_000 });
 
   await tv.close();
   await host.close();

@@ -7,12 +7,14 @@ import {
   Flame,
   Gamepad2,
   LogOut,
+  Pencil,
   Play,
-  Share2
+  Share2,
+  X
 } from 'lucide-react';
-import { useCallback, useEffect, useRef, useState, type PointerEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type FormEvent, type MutableRefObject, type PointerEvent } from 'react';
 import type { Socket } from 'socket.io-client';
-import type { GameManifest, JoinLobbyResponse, Lobby, Player } from '@couch/types';
+import type { GameManifest, JoinLobbyResponse, Lobby, Player, RenamePlayerResponse } from '@couch/types';
 import {
   CHARGE_TIME_MS,
   ELEV_MAX,
@@ -20,8 +22,10 @@ import {
   POWER_MAX,
   POWER_MIN,
   TEAM_COLORS,
+  WORLD_W,
   type TrebuchetEvent,
-  type TrebuchetSnapshot
+  type TrebuchetSnapshot,
+  type TrebuchetUnit
 } from '@couch/trebuchet';
 import { GameCatalog } from '../components/GameCatalog.js';
 import { ChatPanel } from '../components/ChatPanel.js';
@@ -40,6 +44,8 @@ interface SfxModule {
 }
 
 let sfxPromise: Promise<SfxModule | null> | null = null;
+const REMOTE_SHARE_KEY_PREFIX = 'couch:share-room:';
+const DEFAULT_AIM_ELEVATION = 72;
 
 function loadSfx(): Promise<SfxModule | null> {
   if (sfxPromise) return sfxPromise;
@@ -61,8 +67,12 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   const [name, setName] = useState(() => window.localStorage.getItem('couch:name') || '');
   const [player, setPlayer] = useState<Player | null>(null);
   const [playerToken, setPlayerToken] = useState(() => window.localStorage.getItem(tokenKey(slug)) || '');
+  const [joinStatus, setJoinStatus] = useState<'idle' | 'joining' | 'failed'>('idle');
   const [lobby, setLobby] = useState<Lobby | null>(null);
   const [games, setGames] = useState<GameManifest[]>([]);
+  const [editingName, setEditingName] = useState(false);
+  const [draftName, setDraftName] = useState('');
+  const [renaming, setRenaming] = useState(false);
   const [angle, setAngle] = useState(72);
   const [power, setPower] = useState(POWER_MIN);
   const [aimStep, setAimStep] = useState(1);
@@ -72,11 +82,23 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   const [lastEvent, setLastEvent] = useState<TrebuchetEvent | null>(null);
   const [socket, setSocket] = useState<Socket | null>(null);
   const [copied, setCopied] = useState(false);
+  const shareKey = `${REMOTE_SHARE_KEY_PREFIX}${slug}`;
+  const [shareRoomOpen, setShareRoomOpen] = useState(() => {
+    try {
+      return window.sessionStorage.getItem(shareKey) === '1';
+    } catch {
+      return false;
+    }
+  });
+  const [shareCopied, setShareCopied] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
   const copiedTimerRef = useRef<number | null>(null);
+  const shareTimerRef = useRef<number | null>(null);
   const chargeStartRef = useRef<number | null>(null);
   const chargeTimerRef = useRef<number | null>(null);
   const lastChargeSendRef = useRef(0);
+  const rememberedAnglesRef = useRef<Record<string, number>>({});
+  const lastTurnAimKeyRef = useRef<string | null>(null);
 
   // Retro button sounds. Loaded once on mount into a ref (not state) so input
   // handlers can fire it synchronously without triggering re-renders; null until
@@ -173,15 +195,21 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
         window.clearTimeout(copiedTimerRef.current);
         copiedTimerRef.current = null;
       }
+      if (shareTimerRef.current != null) {
+        window.clearTimeout(shareTimerRef.current);
+        shareTimerRef.current = null;
+      }
     };
   }, []);
 
-  const join = async () => {
+  const join = useCallback(async () => {
     setError(null);
     if (!socket) {
       setError('Realtime-Verbindung startet noch');
+      setJoinStatus('failed');
       return;
     }
+    setJoinStatus('joining');
     try {
       const joined = await emitAck<JoinLobbyResponse & { ok: true; games: GameManifest[] }>(socket, 'controller:join', {
         slug,
@@ -195,12 +223,19 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
       window.localStorage.setItem(tokenKey(slug), joined.playerToken);
       window.localStorage.setItem('couch:activeSlug', slug);
       window.localStorage.setItem('couch:name', joined.player.name);
+      setJoinStatus('idle');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Join fehlgeschlagen');
+      setJoinStatus('failed');
     }
-  };
+  }, [name, playerToken, slug, socket]);
 
-  // (Returning users auto-join + reconnect via the socket effect's 'connect' listener above.)
+  // First-time visitors should land directly in the controller. Returning users
+  // still auto-join + reconnect via the socket effect's 'connect' listener above.
+  useEffect(() => {
+    if (player || !socket || joinStatus !== 'idle') return;
+    void join();
+  }, [join, joinStatus, player, socket]);
 
   useEffect(() => {
     if (!player) return;
@@ -225,10 +260,60 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   const currentTurn = snapshot?.turn;
   const myTurn = Boolean(player && currentTurn === player.id);
   const canStart = Boolean(isHost && lobby && lobby.players.length >= 2 && lobby.state !== 'playing');
+  const myUnit = player ? snapshot?.units.find((unit) => unit.id === player.id) : undefined;
+
+  useEffect(() => {
+    if (player && !editingName) setDraftName(player.name);
+  }, [editingName, player]);
+
+  useEffect(() => {
+    if (!player || !myTurn || !snapshot || !myUnit) return;
+    const turnKey = [snapshot.seed, snapshot.turn, snapshot.turnEndsAt ?? 0].join(':');
+    if (lastTurnAimKeyRef.current === turnKey) return;
+    lastTurnAimKeyRef.current = turnKey;
+    const nextAngle = rememberedAnglesRef.current[player.id] ?? defaultAimForUnit(myUnit);
+    angleRef.current = nextAngle;
+    setAngle(nextAngle);
+    setPower(POWER_MIN);
+  }, [myTurn, myUnit, player, snapshot]);
 
   const start = async () => {
     if (!socket) return;
     await emitAck(socket, 'game:start', { slug, playerToken });
+  };
+
+  const startNameEdit = () => {
+    setDraftName((player?.name ?? name) || 'Player');
+    setEditingName(true);
+  };
+
+  const cancelNameEdit = () => {
+    setDraftName(player?.name ?? 'Player');
+    setEditingName(false);
+  };
+
+  const saveNameEdit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!socket || !player) return;
+    setError(null);
+    setRenaming(true);
+    try {
+      const renamed = await emitAck<RenamePlayerResponse & { ok: true }>(socket, 'controller:rename', {
+        slug,
+        playerToken,
+        name: draftName
+      });
+      setPlayer(renamed.player);
+      setLobby(renamed.lobby);
+      setName(renamed.player.name);
+      setDraftName(renamed.player.name);
+      window.localStorage.setItem('couch:name', renamed.player.name);
+      setEditingName(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Name konnte nicht geändert werden');
+    } finally {
+      setRenaming(false);
+    }
   };
 
   const selectGame = async (gameId: string) => {
@@ -253,24 +338,54 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     }
   };
 
-  const copyInvite = async () => {
-    const url = `${window.location.origin}/j/${slug}`;
+  const flashCopied = (setter: (value: boolean) => void, timerRef: MutableRefObject<number | null>) => {
+    setter(true);
+    if (timerRef.current != null) {
+      window.clearTimeout(timerRef.current);
+    }
+    timerRef.current = window.setTimeout(() => {
+      setter(false);
+      timerRef.current = null;
+    }, 1500);
+  };
+
+  const copyRoomNumber = async () => {
     try {
-      await navigator.clipboard?.writeText(url);
-      setCopied(true);
-      if (copiedTimerRef.current != null) {
-        window.clearTimeout(copiedTimerRef.current);
-      }
-      copiedTimerRef.current = window.setTimeout(() => {
-        setCopied(false);
-        copiedTimerRef.current = null;
-      }, 1500);
+      await navigator.clipboard?.writeText(slug);
+      flashCopied(setCopied, copiedTimerRef);
     } catch {
       // Clipboard may be unavailable (insecure context / no permission); ignore.
     }
   };
 
-  const sendPreview = async (control: 'trebuchet.aim' | 'trebuchet.charge', value: unknown) => {
+  const shareRoomNumber = async () => {
+    try {
+      if (navigator.share) {
+        await navigator.share({ title: 'Couch.gg Remote Couch', text: slug });
+      } else {
+        await navigator.clipboard?.writeText(slug);
+      }
+      flashCopied(setShareCopied, shareTimerRef);
+    } catch {
+      try {
+        await navigator.clipboard?.writeText(slug);
+        flashCopied(setShareCopied, shareTimerRef);
+      } catch {
+        // Sharing is a convenience; the visible room number remains usable.
+      }
+    }
+  };
+
+  const dismissRoomShare = () => {
+    try {
+      window.sessionStorage.removeItem(shareKey);
+    } catch {
+      // Session storage may be unavailable; the modal can still close for this render.
+    }
+    setShareRoomOpen(false);
+  };
+
+  const sendPreview = useCallback(async (control: 'trebuchet.aim' | 'trebuchet.charge', value: unknown) => {
     if (!socket || !myTurn) return;
     try {
       await emitAck(socket, 'controller:event', {
@@ -287,7 +402,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     } catch {
       // Preview events are best-effort; final fire remains acknowledged below.
     }
-  };
+  }, [myTurn, player?.id, playerToken, slug, socket]);
 
   // Apply a raw angle (already snapped) and broadcast the aim preview.
   const applyAngle = useCallback(
@@ -295,12 +410,10 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
       if (nextAngle === angleRef.current) return;
       sfxRef.current?.play('aim');
       setAngle(nextAngle);
+      if (player?.id) rememberedAnglesRef.current[player.id] = nextAngle;
       void sendPreview('trebuchet.aim', { angle: nextAngle, direction, step: aimStep });
     },
-    // sendPreview closes over myTurn/socket; we intentionally keep deps lean and
-    // read fresh values via refs/state inside the callback at call time.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [aimStep]
+    [aimStep, player?.id, sendPreview]
   );
 
   // Step the arc by `direction` button-presses worth of `aimStep`.
@@ -514,11 +627,15 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
             <span className="brand-mark">c</span>
             <span>Room {slug}</span>
           </div>
-          <h1>Join as controller</h1>
-          <input value={name} onChange={(event) => setName(event.target.value)} placeholder="Your name" aria-label="Your name" />
-          <button className="primary-btn wide" onClick={join}>
-            <Gamepad2 size={18} /> Join
-          </button>
+          <h1>{joinStatus === 'failed' ? 'Controller join failed' : 'Joining room...'}</h1>
+          {joinStatus === 'failed' ? (
+            <>
+              <input value={name} onChange={(event) => setName(event.target.value)} placeholder="Your name" aria-label="Your name" />
+              <button className="primary-btn wide" onClick={join}>
+                <Gamepad2 size={18} /> Try again
+              </button>
+            </>
+          ) : null}
           {error ? <p className="error-line">{error}</p> : null}
         </section>
       </main>
@@ -536,9 +653,30 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
       <section className="controller-card tall">
         {reconnecting ? <div className="reconnect-pill">Reconnecting…</div> : null}
         <div className="controller-top">
-          <div>
+          <div className="controller-identity">
             <span className="micro-label">Room {slug}</span>
-            <h1>{player.name}</h1>
+            {editingName ? (
+              <form className="name-edit-form" onSubmit={saveNameEdit}>
+                <input
+                  autoFocus
+                  aria-label="Player name"
+                  maxLength={18}
+                  value={draftName}
+                  onChange={(event) => setDraftName(event.target.value)}
+                />
+                <button className="icon-btn compact" type="submit" aria-label="Name speichern" disabled={renaming}>
+                  <Check size={18} />
+                </button>
+                <button className="icon-btn compact" type="button" aria-label="Abbrechen" onClick={cancelNameEdit} disabled={renaming}>
+                  <X size={18} />
+                </button>
+              </form>
+            ) : (
+              <button className="name-edit-trigger" type="button" onClick={startNameEdit} aria-label="Spielernamen ändern">
+                <span>{player.name}</span>
+                <Pencil size={16} />
+              </button>
+            )}
           </div>
           {isHost ? <span className="host-pill"><Crown size={14} /> Host</span> : null}
         </div>
@@ -551,14 +689,14 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
               ))}
             </div>
 
-            <button className="text-btn" type="button" onClick={copyInvite}>
+            <button className="text-btn" type="button" onClick={copyRoomNumber}>
               {copied ? (
                 <>
                   <Check size={16} /> Copied!
                 </>
               ) : (
                 <>
-                  <Share2 size={16} /> Invite
+                  <Share2 size={16} /> Room number
                 </>
               )}
             </button>
@@ -734,6 +872,26 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
           <LogOut size={16} /> Leave
         </button>
       </section>
+      {shareRoomOpen ? (
+        <div className="room-share-backdrop" role="dialog" aria-modal="true" aria-labelledby="room-share-title">
+          <section className="room-share-modal">
+            <div className="brand-row small">
+              <span className="brand-mark">c</span>
+              <span>Remote Couch</span>
+            </div>
+            <h2 id="room-share-title">Share Room Number</h2>
+            <p>Send this room number to the other players. They scan Remote Couch on their own screen, tap Join Game, and enter it.</p>
+            <div className="room-share-code" aria-label="Remote room code">{slug}</div>
+            <button className="primary-btn wide" type="button" onClick={shareRoomNumber}>
+              {shareCopied ? <Check size={18} /> : <Share2 size={18} />}
+              {shareCopied ? 'Copied!' : 'Share Room Number'}
+            </button>
+            <button className="ghost-btn wide" type="button" onClick={dismissRoomShare}>
+              Done
+            </button>
+          </section>
+        </div>
+      ) : null}
     </main>
   );
 }
@@ -745,6 +903,10 @@ function tokenKey(slug: string): string {
 function turnName(snapshot: TrebuchetSnapshot | undefined, playerId: string | null | undefined): string {
   if (!snapshot || !playerId) return 'Game over';
   return snapshot.units.find((unit) => unit.id === playerId)?.name ?? 'Player';
+}
+
+function defaultAimForUnit(unit: Pick<TrebuchetUnit, 'x'>): number {
+  return unit.x > WORLD_W / 2 ? 180 - DEFAULT_AIM_ELEVATION : DEFAULT_AIM_ELEVATION;
 }
 
 // Guarded haptics: no-op when the device/browser does not support vibration.

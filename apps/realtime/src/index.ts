@@ -131,6 +131,20 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
       }
     });
 
+    socket.on('controller:rename', async (payload: { slug?: string; playerToken?: string; name?: string }, ack?: (value: unknown) => void) => {
+      try {
+        const slug = String(payload?.slug ?? '').toUpperCase();
+        await hydrateLobby(slug);
+        const renamed = store.renamePlayer(slug, String(payload?.playerToken ?? ''), payload?.name);
+        await saveLobby(slug);
+        ack?.({ ok: true, lobby: renamed.lobby, player: renamed.player });
+        if (renamed.gameEvent) io.to(room(slug)).emit('game:event', { type: 'snapshot', snapshot: renamed.gameEvent });
+        emitLobby(slug);
+      } catch (err) {
+        ack?.(socketError(err));
+      }
+    });
+
     socket.on('game:select', async (payload: { slug?: string; playerToken?: string; gameId?: GameId }, ack?: (value: unknown) => void) => {
       try {
         const slug = String(payload?.slug ?? '').toUpperCase();

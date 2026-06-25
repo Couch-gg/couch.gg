@@ -130,6 +130,11 @@ export interface JoinLobbyResponse {
   playerToken: PlayerToken;
 }
 
+export interface RenamePlayerResponse {
+  lobby: Lobby;
+  player: Player;
+}
+
 export interface PublicConfig {
   realtimeUrl: string;
 }

@@ -169,6 +169,12 @@ button:disabled {
   background: rgba(248, 237, 207, 0.06);
 }
 
+.icon-btn.compact {
+  width: 42px;
+  min-height: 42px;
+  padding: 0;
+}
+
 .text-btn {
   justify-content: flex-start;
   min-height: 36px;
@@ -572,6 +578,56 @@ button:disabled {
   justify-content: space-between;
   gap: 12px;
   align-items: start;
+}
+
+.controller-identity {
+  display: grid;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 6px;
+}
+
+.name-edit-trigger {
+  display: inline-flex;
+  max-width: 100%;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+}
+
+.name-edit-trigger span {
+  min-width: 0;
+  font-size: 36px;
+  font-weight: 900;
+  line-height: 1;
+  overflow-wrap: anywhere;
+}
+
+.name-edit-trigger svg {
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+
+.name-edit-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 42px 42px;
+  gap: 8px;
+  align-items: center;
+  width: 100%;
+  max-width: 320px;
+}
+
+.controller-card .name-edit-form input {
+  min-height: 42px;
+  padding: 0 12px;
+  font-size: 20px;
+  font-weight: 900;
 }
 
 .micro-label {
@@ -1065,6 +1121,10 @@ button:disabled {
     font-size: 30px;
   }
 
+  .name-edit-trigger span {
+    font-size: 30px;
+  }
+
   .aim-pad {
     grid-template-columns: 52px minmax(0, 1fr) 52px;
     gap: 8px;
@@ -1093,6 +1153,10 @@ button:disabled {
 
   .controller-card h1 {
     margin: 6px 0;
+    font-size: 26px;
+  }
+
+  .name-edit-trigger span {
     font-size: 26px;
   }
 
@@ -1160,6 +1224,7 @@ button:disabled {
   min-height: 100vh;
   min-height: 100dvh;
   padding: clamp(24px, 5vw, 72px);
+  padding-bottom: clamp(140px, 20vh, 220px);
   gap: clamp(20px, 3vw, 36px);
   text-align: center;
 }
@@ -1184,6 +1249,29 @@ button:disabled {
   line-height: 1.6;
 }
 
+.attract-qr-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(220px, 300px));
+  justify-content: space-between;
+  gap: clamp(64px, 14vw, 320px);
+  width: min(100%, 1680px);
+}
+
+.attract-choice {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.attract-choice h2 {
+  margin: 0;
+  font-family: "Press Start 2P", monospace;
+  font-size: clamp(13px, 1.7vw, 20px);
+  line-height: 1.3;
+  color: var(--text);
+  text-shadow: 0 0 16px rgba(241, 207, 106, 0.45);
+}
+
 /* Attract-screen QR variant: larger, stronger presence. */
 .qr-panel.attract {
   padding: clamp(16px, 2.5vw, 28px);
@@ -1191,6 +1279,27 @@ button:disabled {
   box-shadow:
     0 0 0 1px rgba(241, 207, 106, 0.18),
     0 20px 64px rgba(0, 0, 0, 0.55);
+}
+
+.qr-panel.attract .qr-copy span {
+  display: none;
+}
+
+.qr-panel.attract .qr-copy strong {
+  font-size: 13px;
+}
+
+@media (max-width: 760px) {
+  .attract-qr-grid {
+    grid-template-columns: minmax(220px, 320px);
+    justify-content: center;
+    gap: 20px;
+    width: min(100%, 360px);
+  }
+
+  .attract-overlay {
+    justify-content: start;
+  }
 }
 
 @media (prefers-reduced-motion: no-preference) {
@@ -1377,6 +1486,14 @@ button:disabled {
   width: 100%;
 }
 
+.pair-join-form.remote {
+  grid-template-columns: 1fr;
+}
+
+.pair-join-form.remote .control-label {
+  text-align: left;
+}
+
 .pair-join-form input {
   width: 100%;
   min-height: 46px;
@@ -1408,6 +1525,58 @@ button:disabled {
 
 .pair-join-form button:hover {
   transform: translateY(-1px);
+}
+
+/* Remote Couch host share modal. */
+.room-share-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding:
+    calc(18px + env(safe-area-inset-top, 0px))
+    calc(18px + env(safe-area-inset-right, 0px))
+    calc(18px + env(safe-area-inset-bottom, 0px))
+    calc(18px + env(safe-area-inset-left, 0px));
+  background: rgba(5, 7, 8, 0.72);
+  backdrop-filter: blur(8px);
+}
+
+.room-share-modal {
+  width: min(100%, 420px);
+  display: grid;
+  gap: 14px;
+  padding: 24px;
+  border: 1px solid rgba(241, 207, 106, 0.36);
+  border-radius: 8px;
+  background: rgba(27, 33, 31, 0.96);
+  box-shadow: var(--shadow);
+}
+
+.room-share-modal h2 {
+  margin: 0;
+  font-size: clamp(24px, 7vw, 34px);
+  line-height: 1.05;
+}
+
+.room-share-modal p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.room-share-code {
+  display: grid;
+  place-items: center;
+  min-height: 76px;
+  border: 1px solid rgba(248, 237, 207, 0.18);
+  border-radius: 8px;
+  background: rgba(248, 237, 207, 0.08);
+  color: var(--accent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: clamp(32px, 12vw, 52px);
+  font-weight: 900;
 }
 
 /* ----- Invite confirm (/j/:slug) ----- */

@@ -37,6 +37,7 @@ const RIGHT_LO = ELEV_MIN;            // 50
 const RIGHT_HI = ELEV_MAX;            // 85
 const LEFT_LO = 180 - ELEV_MAX;       // 95
 const LEFT_HI = 180 - ELEV_MIN;       // 130
+const DEFAULT_AIM_ELEVATION = 72;
 
 export class Game extends Phaser.Scene {
   constructor() {
@@ -58,11 +59,10 @@ export class Game extends Phaser.Scene {
     this._gameOver = false;
     this._turnEndsAt = 0;
     this._lastTickSecond = -1;
-    // Aim angle in the 0=right/90=up/180=left convention. Default: 60° elevation
-    // shooting right (a sensible trebuchet lob). Snapped into a valid band by
-    // _clampAim().
-    this._aimAngle = 60;
-    this._heldAngle = null; // remembered between turns
+    // Aim angle in the 0=right/90=up/180=left convention. Each player keeps
+    // their own remembered arc; first turn defaults toward the opponent side.
+    this._aimAngle = DEFAULT_AIM_ELEVATION;
+    this._heldAngles = new Map();
     // --- Hold-to-charge firing (7.3) ---------------------------------------
     // Power is no longer arrow-controlled; it charges while SPACE or the FIRE
     // button is held, from POWER_MIN to POWER_MAX over CHARGE_TIME_MS.
@@ -863,8 +863,8 @@ export class Game extends Phaser.Scene {
     this._cancelCharge();
     this._myTurn = (turnId === net.you);
     if (this._myTurn) {
-      // Restore remembered aim if any.
-      if (this._heldAngle != null) this._aimAngle = this._heldAngle;
+      const remembered = this._heldAngles.get(turnId);
+      this._aimAngle = Number.isFinite(remembered) ? remembered : this._defaultAimForPlayer(turnId);
       this._clampAim();
       if (announce && !wasMine) {
         try { SFX.play('yourturn'); } catch (e) { /* ignore */ }
@@ -872,6 +872,18 @@ export class Game extends Phaser.Scene {
     }
     this._lastTickSecond = -1;
     this._refreshHud();
+  }
+
+  _defaultAimForPlayer(playerId) {
+    const treb = this._trebs && this._trebs.get(playerId);
+    const player = (this.players || []).find((p) => p.id === playerId);
+    const x = (treb && treb.container && treb.container.x) || (player && player.x) || WORLD_W / 2;
+    return x > WORLD_W / 2 ? 180 - DEFAULT_AIM_ELEVATION : DEFAULT_AIM_ELEVATION;
+  }
+
+  _rememberAimFor(playerId) {
+    if (!playerId) return;
+    this._heldAngles.set(playerId, this._aimAngle);
   }
 
   // Snap the aim angle into a valid launch band (7.1): right [50..85] or left
@@ -978,7 +990,7 @@ export class Game extends Phaser.Scene {
     const me = this._trebs.get(net.you);
     if (!me || me.dead) { this._refreshHud(); return; }
     this._clampAim();
-    this._heldAngle = this._aimAngle;
+    this._rememberAimFor(net.you);
     const p = Math.max(POWER_MIN, Math.min(POWER_MAX, Math.round(power)));
     // Lock input until the shot resolves.
     this._animating = true;
@@ -1106,7 +1118,7 @@ export class Game extends Phaser.Scene {
 
     if (changed) {
       this._snapAim(dir);
-      this._heldAngle = this._aimAngle;
+      this._rememberAimFor(this.turn || net.you);
       this.aimText.setText(this._arcLabel());
       this._drawAimLine();
     }
@@ -1143,7 +1155,7 @@ export class Game extends Phaser.Scene {
       if (Number.isFinite(nextAngle)) this._aimAngle = nextAngle;
       else if (dir !== 0) this._aimAngle += dir * (Number(value.step) || 1);
       this._snapAim(dir);
-      this._heldAngle = this._aimAngle;
+      this._rememberAimFor(playerId || this.turn || net.you);
       if (this.aimText) this.aimText.setText(this._arcLabel());
       this._drawAimLine();
       this._refreshHud();
