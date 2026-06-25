@@ -1,4 +1,3 @@
-import { Gamepad2 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import type { Lobby } from '@couch/types';
 import { fetchLobby } from '../api.js';
@@ -6,11 +5,12 @@ import { QrPanel } from '../components/QrPanel.js';
 import { isPhone } from '../device.js';
 
 /**
- * Invite-link confirmation for `/j/:slug`. Opened from a shared link, it asks the visitor to confirm
- * joining the room. On a phone it leads straight into the controller; on desktop it shows a QR so the
- * link can be scanned onto a phone instead. It never renders the desktop attract home.
+ * Invite target for `/j/:slug`. Phones are controllers only and auto-open the
+ * controller after the room exists. Desktop/laptop stays screen-oriented and
+ * shows a QR so the link can be scanned onto a phone instead.
  */
 export function JoinRoute({ slug, navigate }: { slug: string; navigate: (to: string) => void }) {
+  const phone = isPhone();
   const [lobby, setLobby] = useState<Lobby | null>(null);
   const [notFound, setNotFound] = useState(false);
 
@@ -30,6 +30,11 @@ export function JoinRoute({ slug, navigate }: { slug: string; navigate: (to: str
     };
   }, [slug]);
 
+  useEffect(() => {
+    if (!phone || !lobby || notFound) return;
+    navigate(`/c/${slug}`);
+  }, [lobby, navigate, notFound, phone, slug]);
+
   if (notFound) {
     return (
       <main className="join-confirm-shell">
@@ -48,6 +53,18 @@ export function JoinRoute({ slug, navigate }: { slug: string; navigate: (to: str
 
   const playerCount = lobby?.players.length ?? 0;
 
+  if (phone) {
+    return (
+      <main className="join-confirm-shell">
+        <section className="join-confirm-card">
+          <h1 className="join-confirm-title">Opening controller...</h1>
+          <div className="join-confirm-room">{slug}</div>
+          <p className="muted">Checking the room and connecting this phone.</p>
+        </section>
+      </main>
+    );
+  }
+
   return (
     <main className="join-confirm-shell">
       <section className="join-confirm-card">
@@ -58,21 +75,10 @@ export function JoinRoute({ slug, navigate }: { slug: string; navigate: (to: str
             {playerCount} {playerCount === 1 ? 'player' : 'players'} in the room
           </p>
         ) : null}
-        {isPhone() ? (
-          <div className="join-confirm-actions">
-            <button className="primary-btn" onClick={() => navigate(`/c/${slug}`)}>
-              <Gamepad2 size={18} /> Join
-            </button>
-            <button className="ghost-btn" onClick={() => navigate('/')}>
-              Not now
-            </button>
-          </div>
-        ) : (
-          <div className="join-confirm-actions">
-            <p className="muted">Open on your phone to join</p>
-            <QrPanel value={`${window.location.origin}/j/${slug}`} label="Scan to join" />
-          </div>
-        )}
+        <div className="join-confirm-actions">
+          <p className="muted">Open on your phone to join</p>
+          <QrPanel value={`${window.location.origin}/j/${slug}`} label="Scan to join" />
+        </div>
       </section>
     </main>
   );
