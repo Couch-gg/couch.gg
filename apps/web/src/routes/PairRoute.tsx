@@ -1,135 +1,79 @@
-import { Play } from 'lucide-react';
 import { useEffect, useState } from 'react';
-import { claimScreen, createLobby, fetchLobby } from '../api.js';
+import { claimScreen, createLobby, fetchScreen } from '../api.js';
 import { isPhone } from '../device.js';
 
-const ACTIVE_SLUG_KEY = 'couch:activeSlug';
-
-function tokenKey(slug: string): string {
-  return `couch:player-token:${slug}`;
-}
-
 /**
- * Phone pairing target for `/s/:screenId`. The phone arrives here after scanning a TV's attract QR.
- * It can attach the TV to a room the phone is already in, or create/join a fresh room — in every
- * case it claims the scanned screen so the TV jumps into the lobby.
+ * Phone pairing target for `/s/:screenId`. Phones are controllers only: a fresh
+ * screen scan creates and claims a room, while an already-claimed screen sends
+ * the phone straight into that room.
  */
 export function PairRoute({ screenId, navigate }: { screenId: string; navigate: (to: string) => void }) {
-  const [attachSlug, setAttachSlug] = useState<string | null>(null);
-  const [joinCode, setJoinCode] = useState('');
-  const [busy, setBusy] = useState(false);
+  const phone = isPhone();
+  const [status, setStatus] = useState('Connecting this screen...');
   const [error, setError] = useState<string | null>(null);
 
-  // Detect an existing membership so the phone can stay in its lobby while pairing the TV.
   useEffect(() => {
+    if (!phone) return;
     let active = true;
-    const detect = async () => {
-      let storedSlug: string | null = null;
+
+    const goToController = (slug: string) => {
+      if (!active) return;
+      navigate(`/c/${slug}`);
+    };
+
+    const pair = async () => {
+      setError(null);
+      setStatus('Checking the screen...');
       try {
-        storedSlug = window.localStorage.getItem(ACTIVE_SLUG_KEY);
-      } catch {
-        storedSlug = null;
-      }
-      if (!storedSlug) return;
-      let token: string | null = null;
-      try {
-        token = window.localStorage.getItem(tokenKey(storedSlug));
-      } catch {
-        token = null;
-      }
-      if (!token) return;
-      try {
-        await fetchLobby(storedSlug);
-        if (active) setAttachSlug(storedSlug);
-      } catch {
-        // The remembered lobby no longer exists — fall back to create/join only.
+        const screen = await fetchScreen(screenId);
+        if (screen.claimedSlug) {
+          goToController(screen.claimedSlug);
+          return;
+        }
+
+        setStatus('Starting a room...');
+        const lobby = await createLobby();
+        try {
+          await claimScreen(screenId, lobby.slug);
+          goToController(lobby.slug);
+          return;
+        } catch (err) {
+          // If two phones scan the fresh QR at the same time, the other phone may
+          // claim first. In that case, re-read the screen and join the winner.
+          const latest = await fetchScreen(screenId).catch(() => null);
+          if (latest?.claimedSlug) {
+            goToController(latest.claimedSlug);
+            return;
+          }
+          throw err;
+        }
+      } catch (err) {
+        if (!active) return;
+        setError(err instanceof Error && err.message ? err.message : 'This screen code expired — rescan the TV');
+        setStatus('Could not connect this screen');
       }
     };
-    void detect();
+
+    void pair();
     return () => {
       active = false;
     };
-  }, []);
-
-  const claimFailMessage = (err: unknown): string => {
-    if (err instanceof Error && err.message) return err.message;
-    return 'This screen code expired — rescan the TV';
-  };
-
-  const onAttach = async () => {
-    if (!attachSlug) return;
-    setBusy(true);
-    setError(null);
-    try {
-      await claimScreen(screenId, attachSlug);
-      navigate(`/c/${attachSlug}`);
-    } catch (err) {
-      setError(claimFailMessage(err));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const onCreate = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      const lobby = await createLobby();
-      await claimScreen(screenId, lobby.slug);
-      navigate(`/c/${lobby.slug}`);
-    } catch (err) {
-      setError(claimFailMessage(err));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const onJoin = async (event: React.FormEvent) => {
-    event.preventDefault();
-    const slug = joinCode.trim().toUpperCase();
-    if (!slug) return;
-    setBusy(true);
-    setError(null);
-    try {
-      await claimScreen(screenId, slug);
-      navigate(`/c/${slug}`);
-    } catch (err) {
-      setError(claimFailMessage(err));
-    } finally {
-      setBusy(false);
-    }
-  };
+  }, [navigate, phone, screenId]);
 
   return (
     <main className="pair-shell">
       <section className="pair-card">
-        {!isPhone() ? <p className="muted">Tip: open this link on your phone.</p> : null}
-        <h1 className="pair-title">Connect this screen</h1>
-
-        {attachSlug ? (
-          <div className="pair-attach">
-            <p>Attach this TV to your room {attachSlug}</p>
-            <button className="primary-btn wide" onClick={onAttach} disabled={busy}>
-              {busy ? 'Verbinde...' : `Attach to ${attachSlug}`}
-            </button>
-          </div>
-        ) : null}
-
-        <h2 className="pair-sub">{attachSlug ? 'or start fresh' : 'Start a session'}</h2>
-        <button className="primary-btn wide" onClick={onCreate} disabled={busy}>
-          <Play size={18} /> {busy ? 'Erstelle...' : 'Create a room'}
-        </button>
-        <form className="pair-join-form" onSubmit={onJoin}>
-          <input
-            value={joinCode}
-            onChange={(event) => setJoinCode(event.target.value)}
-            placeholder="Room code"
-            aria-label="Room code"
-          />
-          <button type="submit" disabled={busy}>
-            Join
+        <h1 className="pair-title">{phone ? status : 'This link is for phones'}</h1>
+        <p className="pair-sub">
+          {phone
+            ? 'Keep this page open. Your controller will appear automatically.'
+            : 'Use this device as a screen instead: open couch.gg here, then scan its QR code with a phone.'}
+        </p>
+        {!phone ? (
+          <button className="primary-btn wide" onClick={() => navigate('/')}>
+            Open screen mode
           </button>
-        </form>
+        ) : null}
         {error ? <p className="error-line">{error}</p> : null}
       </section>
     </main>
