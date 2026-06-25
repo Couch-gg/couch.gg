@@ -126,19 +126,28 @@ export function AttractHome({ navigate }: { navigate: (to: string) => void }) {
     };
   }, [navigate]);
 
-  const pairUrl = screenId ? `${window.location.origin}/s/${screenId}` : '';
+  const localPairUrl = screenId ? `${window.location.origin}/s/${screenId}?mode=local` : '';
+  const remotePairUrl = screenId ? `${window.location.origin}/s/${screenId}?mode=remote` : '';
 
   return (
     <main className="attract-shell">
       <AttractStage className="attract-stage" />
       <div className="attract-overlay">
         <div className="attract-brand">couch.gg</div>
-        {pairUrl ? (
-          <QrPanel value={pairUrl} variant="attract" label="Scan to start" />
+        {screenId ? (
+          <div className="attract-qr-grid">
+            <div className="attract-choice">
+              <h2>Local Couch</h2>
+              <QrPanel value={localPairUrl} variant="attract" label="Same screen" />
+            </div>
+            <div className="attract-choice">
+              <h2>Remote Couch</h2>
+              <QrPanel value={remotePairUrl} variant="attract" label="Host or join" />
+            </div>
+          </div>
         ) : (
           <div className="attract-hint">Connecting…</div>
         )}
-        <div className="attract-hint">Scan with your phone to start a couch session</div>
       </div>
       <div className="crt-overlay" aria-hidden />
     </main>

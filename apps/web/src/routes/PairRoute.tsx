@@ -1,135 +1,182 @@
-import { Play } from 'lucide-react';
-import { useEffect, useState } from 'react';
-import { claimScreen, createLobby, fetchLobby } from '../api.js';
+import { Share2 } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import { claimScreen, createLobby, fetchScreen } from '../api.js';
 import { isPhone } from '../device.js';
 
-const ACTIVE_SLUG_KEY = 'couch:activeSlug';
+type RemoteStep = 'choose' | 'join';
 
-function tokenKey(slug: string): string {
-  return `couch:player-token:${slug}`;
-}
+const REMOTE_SHARE_KEY_PREFIX = 'couch:share-room:';
 
 /**
- * Phone pairing target for `/s/:screenId`. The phone arrives here after scanning a TV's attract QR.
- * It can attach the TV to a room the phone is already in, or create/join a fresh room — in every
- * case it claims the scanned screen so the TV jumps into the lobby.
+ * Phone pairing target for `/s/:screenId`. Local scans are zero-choice: they
+ * create/claim a room and open the controller. Remote scans keep the phone as a
+ * controller too, but ask whether this player is hosting or joining by room number.
  */
 export function PairRoute({ screenId, navigate }: { screenId: string; navigate: (to: string) => void }) {
-  const [attachSlug, setAttachSlug] = useState<string | null>(null);
+  const phone = isPhone();
+  const mode = useMemo(() => new URLSearchParams(window.location.search).get('mode') === 'remote' ? 'remote' : 'local', []);
+  const localPairStartedRef = useRef(false);
+  const [step, setStep] = useState<RemoteStep>('choose');
   const [joinCode, setJoinCode] = useState('');
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState(mode === 'local' && phone);
+  const [status, setStatus] = useState(mode === 'local' ? 'Connecting this screen...' : 'Remote Couch');
   const [error, setError] = useState<string | null>(null);
 
-  // Detect an existing membership so the phone can stay in its lobby while pairing the TV.
   useEffect(() => {
-    let active = true;
-    const detect = async () => {
-      let storedSlug: string | null = null;
-      try {
-        storedSlug = window.localStorage.getItem(ACTIVE_SLUG_KEY);
-      } catch {
-        storedSlug = null;
-      }
-      if (!storedSlug) return;
-      let token: string | null = null;
-      try {
-        token = window.localStorage.getItem(tokenKey(storedSlug));
-      } catch {
-        token = null;
-      }
-      if (!token) return;
-      try {
-        await fetchLobby(storedSlug);
-        if (active) setAttachSlug(storedSlug);
-      } catch {
-        // The remembered lobby no longer exists — fall back to create/join only.
-      }
-    };
-    void detect();
-    return () => {
-      active = false;
-    };
-  }, []);
+    if (!phone || mode !== 'local' || localPairStartedRef.current) return;
+    localPairStartedRef.current = true;
+    void pairLocal();
+    // pairLocal is a local flow starter; the ref prevents repeated attempts.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, phone]);
 
-  const claimFailMessage = (err: unknown): string => {
-    if (err instanceof Error && err.message) return err.message;
-    return 'This screen code expired — rescan the TV';
+  const goToController = (slug: string, shareRoomNumber = false) => {
+    if (shareRoomNumber) {
+      try {
+        window.sessionStorage.setItem(`${REMOTE_SHARE_KEY_PREFIX}${slug}`, '1');
+      } catch {
+        // Share prompt is helpful, not required.
+      }
+    }
+    navigate(`/c/${slug}`);
   };
 
-  const onAttach = async () => {
-    if (!attachSlug) return;
+  async function pairLocal() {
     setBusy(true);
     setError(null);
+    setStatus('Checking the screen...');
     try {
-      await claimScreen(screenId, attachSlug);
-      navigate(`/c/${attachSlug}`);
+      const screen = await fetchScreen(screenId);
+      if (screen.claimedSlug) {
+        goToController(screen.claimedSlug);
+        return;
+      }
+
+      setStatus('Starting a room...');
+      const lobby = await createLobby();
+      try {
+        await claimScreen(screenId, lobby.slug);
+        goToController(lobby.slug);
+      } catch (err) {
+        const latest = await fetchScreen(screenId).catch(() => null);
+        if (latest?.claimedSlug) {
+          goToController(latest.claimedSlug);
+          return;
+        }
+        throw err;
+      }
     } catch (err) {
-      setError(claimFailMessage(err));
-    } finally {
+      setError(err instanceof Error && err.message ? err.message : 'This screen code expired — rescan the TV');
+      setStatus('Could not connect this screen');
       setBusy(false);
     }
-  };
+  }
 
-  const onCreate = async () => {
+  const hostRemote = async () => {
     setBusy(true);
     setError(null);
+    setStatus('Starting remote room...');
     try {
+      const screen = await fetchScreen(screenId);
+      if (screen.claimedSlug) {
+        goToController(screen.claimedSlug, true);
+        return;
+      }
       const lobby = await createLobby();
       await claimScreen(screenId, lobby.slug);
-      navigate(`/c/${lobby.slug}`);
+      goToController(lobby.slug, true);
     } catch (err) {
-      setError(claimFailMessage(err));
-    } finally {
+      setError(err instanceof Error && err.message ? err.message : 'Remote room could not be started');
       setBusy(false);
+      setStatus('Remote Couch');
     }
   };
 
-  const onJoin = async (event: React.FormEvent) => {
+  const joinRemote = async (event: FormEvent) => {
     event.preventDefault();
     const slug = joinCode.trim().toUpperCase();
     if (!slug) return;
     setBusy(true);
     setError(null);
+    setStatus('Joining remote room...');
     try {
       await claimScreen(screenId, slug);
-      navigate(`/c/${slug}`);
+      goToController(slug);
     } catch (err) {
-      setError(claimFailMessage(err));
-    } finally {
+      setError(err instanceof Error && err.message ? err.message : 'Room could not be joined');
       setBusy(false);
+      setStatus('Remote Couch');
     }
   };
+
+  if (!phone) {
+    return (
+      <main className="pair-shell">
+        <section className="pair-card">
+          <h1 className="pair-title">This link is for phones</h1>
+          <p className="pair-sub">Use this device as a screen instead: open couch.gg here, then scan its QR code with a phone.</p>
+          <button className="primary-btn wide" onClick={() => navigate('/')}>
+            Open screen mode
+          </button>
+        </section>
+      </main>
+    );
+  }
+
+  if (mode === 'local') {
+    return (
+      <main className="pair-shell">
+        <section className="pair-card">
+          <h1 className="pair-title">{status}</h1>
+          <p className="pair-sub">Keep this page open. Your controller will appear automatically.</p>
+          {error ? <p className="error-line">{error}</p> : null}
+        </section>
+      </main>
+    );
+  }
 
   return (
     <main className="pair-shell">
       <section className="pair-card">
-        {!isPhone() ? <p className="muted">Tip: open this link on your phone.</p> : null}
-        <h1 className="pair-title">Connect this screen</h1>
+        <div className="brand-row small">
+          <span className="brand-mark">c</span>
+          <span>couch.gg</span>
+        </div>
+        <h1 className="pair-title">{status}</h1>
+        <p className="pair-sub">Use this phone as the controller for the screen you just scanned.</p>
 
-        {attachSlug ? (
-          <div className="pair-attach">
-            <p>Attach this TV to your room {attachSlug}</p>
-            <button className="primary-btn wide" onClick={onAttach} disabled={busy}>
-              {busy ? 'Verbinde...' : `Attach to ${attachSlug}`}
+        {step === 'choose' ? (
+          <div className="pair-actions">
+            <button className="primary-btn wide" onClick={hostRemote} disabled={busy}>
+              <Share2 size={18} /> {busy ? 'Starting...' : 'Host Game'}
+            </button>
+            <button className="ghost-btn wide" onClick={() => setStep('join')} disabled={busy}>
+              Join Game
             </button>
           </div>
-        ) : null}
-
-        <h2 className="pair-sub">{attachSlug ? 'or start fresh' : 'Start a session'}</h2>
-        <button className="primary-btn wide" onClick={onCreate} disabled={busy}>
-          <Play size={18} /> {busy ? 'Erstelle...' : 'Create a room'}
-        </button>
-        <form className="pair-join-form" onSubmit={onJoin}>
-          <input
-            value={joinCode}
-            onChange={(event) => setJoinCode(event.target.value)}
-            placeholder="Room code"
-            aria-label="Room code"
-          />
-          <button type="submit" disabled={busy}>
-            Join
-          </button>
-        </form>
+        ) : (
+          <form className="pair-join-form remote" onSubmit={joinRemote}>
+            <label className="control-label">
+              <span>Enter Room Number</span>
+              <input
+                value={joinCode}
+                onChange={(event) => setJoinCode(event.target.value.toUpperCase())}
+                placeholder="ABC123"
+                aria-label="Room number"
+                autoFocus
+                inputMode="text"
+              />
+            </label>
+            <div className="pair-actions">
+              <button className="primary-btn wide" type="submit" disabled={busy || !joinCode.trim()}>
+                {busy ? 'Joining...' : 'Join Game'}
+              </button>
+              <button className="ghost-btn wide" type="button" onClick={() => setStep('choose')} disabled={busy}>
+                Back
+              </button>
+            </div>
+          </form>
+        )}
         {error ? <p className="error-line">{error}</p> : null}
       </section>
     </main>

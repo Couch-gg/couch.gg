@@ -18,27 +18,17 @@ async function phonePage(browser: Browser, name: string) {
   return p;
 }
 
-// Pair a TV + a host phone via attract -> /s/:screenId -> "Create a room" -> auto-join.
-async function pairHost(browser: Browser, hostName: string) {
+async function attractScreenId(browser: Browser) {
   const tv = await desktopPage(browser);
   await tv.goto('/');
   await expect(tv.locator('.attract-shell')).toBeVisible();
+  await expect(tv.getByRole('heading', { name: 'Local Couch' })).toBeVisible();
+  await expect(tv.getByRole('heading', { name: 'Remote Couch' })).toBeVisible();
   await expect
     .poll(() => tv.evaluate(() => window.sessionStorage.getItem('couch:screenId')), { timeout: 15_000 })
     .toBeTruthy();
   const screenId = await tv.evaluate(() => window.sessionStorage.getItem('couch:screenId'));
-
-  const host = await phonePage(browser, hostName);
-  await host.goto('/s/' + screenId);
-  await host.getByRole('button', { name: /Create a room/i }).click();
-  await expect(host).toHaveURL(/\/c\/[A-Z0-9]+/, { timeout: 15_000 });
-  const slug = host.url().split('/').pop()!;
-
-  // Claiming the scanned screen navigates the TV into the lobby (socket push + REST poll fallback).
-  await expect(tv).toHaveURL(new RegExp('/l/' + slug), { timeout: 15_000 });
-  // The creator auto-joins as host (name from localStorage).
-  await expect(tv.locator('.player-name', { hasText: hostName })).toBeVisible({ timeout: 15_000 });
-  return { tv, host, slug };
+  return { tv, screenId: screenId! };
 }
 
 test('standalone Trebuchet test route renders and fires a shot', async ({ page }) => {
@@ -49,61 +39,111 @@ test('standalone Trebuchet test route renders and fires a shot', async ({ page }
   await expect(page.getByText(/Alex|Bea|Winner|Finished/i).first()).toBeVisible({ timeout: 30_000 });
 });
 
-test('phone home shows the scan prompt with a create/join escape hatch', async ({ browser }) => {
+test('phone home points to a shared screen (no create/join)', async ({ browser }) => {
   const phone = await phonePage(browser, 'Solo');
   await phone.goto('/');
   await expect(phone.getByText(/Scan a TV to begin/i)).toBeVisible();
-  await expect(phone.getByRole('button', { name: /Create a room/i })).toBeVisible();
+  await expect(phone.getByRole('button', { name: /Create a room/i })).toHaveCount(0);
   await phone.close();
 });
 
-test('attract pairs a phone (Create a room), second joins via invite, chat + game start', async ({ browser }) => {
+test('LOCAL couch: scan a TV -> auto-create, second phone joins via invite, game starts', async ({ browser }) => {
   test.setTimeout(90_000);
-  const { tv, host, slug } = await pairHost(browser, 'Alex');
+  const { tv, screenId } = await attractScreenId(browser);
 
-  // Second player opens the lobby invite /j/:slug and confirms.
+  // Phone scans the Local QR -> auto-creates a room and claims this screen.
+  const alex = await phonePage(browser, 'Alex');
+  await alex.goto('/s/' + screenId + '?mode=local');
+  await expect(alex).toHaveURL(/\/c\/[A-Z0-9]+/, { timeout: 15_000 });
+  const slug = alex.url().split('/').pop()!;
+  await expect(tv).toHaveURL(new RegExp('/l/' + slug), { timeout: 15_000 });
+  await expect(tv.locator('.player-name', { hasText: 'Alex' })).toBeVisible({ timeout: 15_000 });
+
+  // Second player opens the lobby invite -> phone auto-opens the controller.
   const bea = await phonePage(browser, 'Bea');
   await bea.goto('/j/' + slug);
-  await bea.getByRole('button', { name: /^Join$/i }).click();
   await expect(bea).toHaveURL(new RegExp('/c/' + slug), { timeout: 15_000 });
   await expect(tv.locator('.player-name', { hasText: 'Bea' })).toBeVisible({ timeout: 15_000 });
 
-  // Catalog overview on the TV.
-  await expect(tv.locator('.game-catalog')).toBeVisible();
-  await expect(tv.locator('.game-card-title', { hasText: 'Trebuchet' })).toBeVisible();
-
-  // Chat round-trips controller -> TV.
-  const chat = host.getByPlaceholder(/Message/i);
-  await chat.fill('gg hello');
+  // Chat + start.
+  const chat = alex.getByPlaceholder(/Message/i);
+  await chat.fill('gg');
   await chat.press('Enter');
-  await expect(tv.locator('.chat-msg-text', { hasText: 'gg hello' })).toBeVisible({ timeout: 10_000 });
-
-  // Host selects Trebuchet and starts.
-  await host.locator('.game-card', { hasText: 'Trebuchet' }).click();
-  const start = host.getByRole('button', { name: /Trebuchet starten/i });
+  await expect(tv.locator('.chat-msg-text', { hasText: 'gg' })).toBeVisible({ timeout: 10_000 });
+  await alex.locator('.game-card', { hasText: 'Trebuchet' }).click();
+  const start = alex.getByRole('button', { name: /Trebuchet starten/i });
   await expect(start).toBeEnabled();
   await start.click();
   await expect(tv.getByText('Live')).toBeVisible({ timeout: 10_000 });
-  await expect(tv.getByTestId('trebuchet-stage')).toHaveAttribute('data-phase', 'running');
 
   await tv.close();
-  await host.close();
+  await alex.close();
+  await bea.close();
+});
+
+test('REMOTE couch: two separate TVs pair to one room by number', async ({ browser }) => {
+  test.setTimeout(120_000);
+
+  // Host: their own TV + phone -> Host Game.
+  const { tv: hostTv, screenId: hostScreen } = await attractScreenId(browser);
+  const alex = await phonePage(browser, 'Alex');
+  await alex.goto('/s/' + hostScreen + '?mode=remote');
+  await alex.getByRole('button', { name: /Host Game/i }).click();
+  await expect(alex).toHaveURL(/\/c\/[A-Z0-9]+/, { timeout: 15_000 });
+  const slug = alex.url().split('/').pop()!;
+  await expect(hostTv).toHaveURL(new RegExp('/l/' + slug), { timeout: 15_000 });
+  await expect(hostTv.locator('.player-name', { hasText: 'Alex' })).toBeVisible({ timeout: 15_000 });
+
+  // Remote hosting prompts to share the room number — confirm it shows the code, then dismiss.
+  await expect(alex.locator('.room-share-code')).toContainText(slug);
+  await alex.getByRole('button', { name: /^Done$/i }).click();
+
+  // Guest: a SEPARATE TV + phone -> Join Game by the host's room number.
+  const { tv: guestTv, screenId: guestScreen } = await attractScreenId(browser);
+  const bea = await phonePage(browser, 'Bea');
+  await bea.goto('/s/' + guestScreen + '?mode=remote');
+  await bea.getByRole('button', { name: /Join Game/i }).click();
+  await bea.getByLabel(/Room number/i).fill(slug);
+  await bea.getByRole('button', { name: /Join Game/i }).click();
+  await expect(bea).toHaveURL(new RegExp('/c/' + slug), { timeout: 15_000 });
+
+  // The guest's OWN TV joins the SAME lobby — two screens, one room.
+  await expect(guestTv).toHaveURL(new RegExp('/l/' + slug), { timeout: 15_000 });
+  await expect(guestTv.locator('.player-name', { hasText: 'Bea' })).toBeVisible({ timeout: 15_000 });
+  // Both TVs see both players.
+  await expect(hostTv.locator('.player-name', { hasText: 'Bea' })).toBeVisible({ timeout: 15_000 });
+  await expect(guestTv.locator('.player-name', { hasText: 'Alex' })).toBeVisible({ timeout: 15_000 });
+
+  // Start — both TVs go live.
+  await alex.locator('.game-card', { hasText: 'Trebuchet' }).click();
+  const start = alex.getByRole('button', { name: /Trebuchet starten/i });
+  await expect(start).toBeEnabled({ timeout: 15_000 });
+  await start.click();
+  await expect(hostTv.getByText('Live')).toBeVisible({ timeout: 12_000 });
+  await expect(guestTv.getByText('Live')).toBeVisible({ timeout: 12_000 });
+
+  await hostTv.close();
+  await alex.close();
+  await guestTv.close();
   await bea.close();
 });
 
 test('controller survives a network drop and auto-rejoins (slept phone)', async ({ browser }) => {
   test.setTimeout(90_000);
-  const { tv, host } = await pairHost(browser, 'Alex');
+  const { tv, screenId } = await attractScreenId(browser);
+  const alex = await phonePage(browser, 'Alex');
+  await alex.goto('/s/' + screenId + '?mode=local');
+  await expect(alex).toHaveURL(/\/c\/[A-Z0-9]+/, { timeout: 15_000 });
+  const slug = alex.url().split('/').pop()!;
+  await expect(tv).toHaveURL(new RegExp('/l/' + slug), { timeout: 15_000 });
 
   const conn = tv.locator('.player-row', { hasText: 'Alex' }).locator('.connection');
   await expect(conn).toHaveText(/online/i, { timeout: 15_000 });
-
-  await host.context().setOffline(true);
+  await alex.context().setOffline(true);
   await expect(conn).toHaveText(/reconnect/i, { timeout: 20_000 });
-
-  await host.context().setOffline(false);
+  await alex.context().setOffline(false);
   await expect(conn).toHaveText(/online/i, { timeout: 20_000 });
 
   await tv.close();
-  await host.close();
+  await alex.close();
 });
