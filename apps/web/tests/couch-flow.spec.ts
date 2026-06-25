@@ -30,7 +30,9 @@ test('desktop attract pairs a phone, lobby chat + game start work', async ({ bro
   });
   await tv.goto('/');
   await expect(tv.locator('.attract-shell')).toBeVisible();
-  // The QR encodes /s/:screenId; the id is persisted to sessionStorage once registration lands.
+  await expect(tv.getByRole('heading', { name: 'Local Couch' })).toBeVisible();
+  await expect(tv.getByRole('heading', { name: 'Remote Couch' })).toBeVisible();
+  // The QRs encode /s/:screenId with local/remote mode; the id is persisted once registration lands.
   await expect
     .poll(() => tv.evaluate(() => window.sessionStorage.getItem('couch:screenId')), { timeout: 15_000 })
     .toBeTruthy();
@@ -45,19 +47,19 @@ test('desktop attract pairs a phone, lobby chat + game start work', async ({ bro
     userAgent:
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
   });
-  await laptop.goto('/s/' + screenId);
+  await laptop.goto('/s/' + screenId + '?mode=local');
   await expect(laptop.getByText(/This link is for phones/i)).toBeVisible();
   await expect(laptop.getByRole('button', { name: /Create a room/i })).toHaveCount(0);
   await laptop.close();
 
-  // 3) Phone "scans" the QR (opens /s/:screenId) and auto-creates a room.
+  // 3) Phone scans Local Couch and auto-creates a room.
   const phoneOne = await browser.newPage({
     viewport: { width: 390, height: 844 },
     isMobile: true,
     hasTouch: true
   });
   await phoneOne.addInitScript(() => window.localStorage.setItem('couch:name', 'Alex'));
-  await phoneOne.goto('/s/' + screenId);
+  await phoneOne.goto('/s/' + screenId + '?mode=local');
   await expect(phoneOne).toHaveURL(/\/c\/[A-Z0-9]+/, { timeout: 15_000 });
   const slug = phoneOne.url().split('/').pop()!;
 
@@ -107,6 +109,67 @@ test('desktop attract pairs a phone, lobby chat + game start work', async ({ bro
   await tv.close();
   await phoneOne.close();
   await phoneTwo.close();
+});
+
+test('remote couch pairs each player screen by room number', async ({ browser }) => {
+  const hostTv = await browser.newPage({
+    viewport: { width: 1440, height: 960 },
+    isMobile: false,
+    hasTouch: false,
+    userAgent:
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+  });
+  await hostTv.goto('/');
+  await expect(hostTv.getByRole('heading', { name: 'Remote Couch' })).toBeVisible();
+  await expect
+    .poll(() => hostTv.evaluate(() => window.sessionStorage.getItem('couch:screenId')), { timeout: 15_000 })
+    .toBeTruthy();
+  const hostScreenId = await hostTv.evaluate(() => window.sessionStorage.getItem('couch:screenId'));
+
+  const hostPhone = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  await hostPhone.addInitScript(() => window.localStorage.setItem('couch:name', 'Alex'));
+  await hostPhone.goto('/s/' + hostScreenId + '?mode=remote');
+  await expect(hostPhone.getByRole('button', { name: /Host Game/i })).toBeVisible();
+  await expect(hostPhone.getByRole('button', { name: /Join Game/i })).toBeVisible();
+  await hostPhone.getByRole('button', { name: /Host Game/i }).click();
+  await expect(hostPhone).toHaveURL(/\/c\/[A-Z0-9]+/, { timeout: 15_000 });
+  const slug = hostPhone.url().split('/').pop()!;
+  await expect(hostPhone.getByRole('dialog', { name: /Share Room Number/i })).toBeVisible({ timeout: 15_000 });
+  await expect(hostPhone.getByLabel(/Remote room code/i)).toHaveText(slug);
+  await expect(hostTv).toHaveURL(new RegExp('/l/' + slug), { timeout: 15_000 });
+  await expect(hostTv.locator('.player-name', { hasText: 'Alex' })).toBeVisible();
+  await hostPhone.getByRole('button', { name: /Done/i }).click();
+
+  const guestTv = await browser.newPage({
+    viewport: { width: 1280, height: 820 },
+    isMobile: false,
+    hasTouch: false,
+    userAgent:
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+  });
+  await guestTv.goto('/');
+  await expect(guestTv.getByRole('heading', { name: 'Remote Couch' })).toBeVisible();
+  await expect
+    .poll(() => guestTv.evaluate(() => window.sessionStorage.getItem('couch:screenId')), { timeout: 15_000 })
+    .toBeTruthy();
+  const guestScreenId = await guestTv.evaluate(() => window.sessionStorage.getItem('couch:screenId'));
+
+  const guestPhone = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  await guestPhone.addInitScript(() => window.localStorage.setItem('couch:name', 'Bea'));
+  await guestPhone.goto('/s/' + guestScreenId + '?mode=remote');
+  await guestPhone.getByRole('button', { name: /Join Game/i }).click();
+  await expect(guestPhone.getByLabel(/Room number/i)).toBeVisible();
+  await guestPhone.getByLabel(/Room number/i).fill(slug);
+  await guestPhone.getByRole('button', { name: /Join Game/i }).click();
+  await expect(guestPhone).toHaveURL(new RegExp('/c/' + slug), { timeout: 15_000 });
+  await expect(guestTv).toHaveURL(new RegExp('/l/' + slug), { timeout: 15_000 });
+  await expect(guestTv.locator('.player-name', { hasText: 'Bea' })).toBeVisible({ timeout: 15_000 });
+  await expect(hostTv.locator('.player-name', { hasText: 'Bea' })).toBeVisible({ timeout: 15_000 });
+
+  await hostTv.close();
+  await hostPhone.close();
+  await guestTv.close();
+  await guestPhone.close();
 });
 
 test('invite link opens the mobile controller automatically', async ({ browser }) => {

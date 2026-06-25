@@ -10,7 +10,7 @@ import {
   Play,
   Share2
 } from 'lucide-react';
-import { useCallback, useEffect, useRef, useState, type PointerEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type MutableRefObject, type PointerEvent } from 'react';
 import type { Socket } from 'socket.io-client';
 import type { GameManifest, JoinLobbyResponse, Lobby, Player } from '@couch/types';
 import {
@@ -40,6 +40,7 @@ interface SfxModule {
 }
 
 let sfxPromise: Promise<SfxModule | null> | null = null;
+const REMOTE_SHARE_KEY_PREFIX = 'couch:share-room:';
 
 function loadSfx(): Promise<SfxModule | null> {
   if (sfxPromise) return sfxPromise;
@@ -73,8 +74,18 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   const [lastEvent, setLastEvent] = useState<TrebuchetEvent | null>(null);
   const [socket, setSocket] = useState<Socket | null>(null);
   const [copied, setCopied] = useState(false);
+  const shareKey = `${REMOTE_SHARE_KEY_PREFIX}${slug}`;
+  const [shareRoomOpen, setShareRoomOpen] = useState(() => {
+    try {
+      return window.sessionStorage.getItem(shareKey) === '1';
+    } catch {
+      return false;
+    }
+  });
+  const [shareCopied, setShareCopied] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
   const copiedTimerRef = useRef<number | null>(null);
+  const shareTimerRef = useRef<number | null>(null);
   const chargeStartRef = useRef<number | null>(null);
   const chargeTimerRef = useRef<number | null>(null);
   const lastChargeSendRef = useRef(0);
@@ -152,6 +163,10 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
       if (copiedTimerRef.current != null) {
         window.clearTimeout(copiedTimerRef.current);
         copiedTimerRef.current = null;
+      }
+      if (shareTimerRef.current != null) {
+        window.clearTimeout(shareTimerRef.current);
+        shareTimerRef.current = null;
       }
     };
   }, []);
@@ -242,21 +257,51 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     }
   };
 
-  const copyInvite = async () => {
-    const url = `${window.location.origin}/j/${slug}`;
+  const flashCopied = (setter: (value: boolean) => void, timerRef: MutableRefObject<number | null>) => {
+    setter(true);
+    if (timerRef.current != null) {
+      window.clearTimeout(timerRef.current);
+    }
+    timerRef.current = window.setTimeout(() => {
+      setter(false);
+      timerRef.current = null;
+    }, 1500);
+  };
+
+  const copyRoomNumber = async () => {
     try {
-      await navigator.clipboard?.writeText(url);
-      setCopied(true);
-      if (copiedTimerRef.current != null) {
-        window.clearTimeout(copiedTimerRef.current);
-      }
-      copiedTimerRef.current = window.setTimeout(() => {
-        setCopied(false);
-        copiedTimerRef.current = null;
-      }, 1500);
+      await navigator.clipboard?.writeText(slug);
+      flashCopied(setCopied, copiedTimerRef);
     } catch {
       // Clipboard may be unavailable (insecure context / no permission); ignore.
     }
+  };
+
+  const shareRoomNumber = async () => {
+    try {
+      if (navigator.share) {
+        await navigator.share({ title: 'Couch.gg Remote Couch', text: slug });
+      } else {
+        await navigator.clipboard?.writeText(slug);
+      }
+      flashCopied(setShareCopied, shareTimerRef);
+    } catch {
+      try {
+        await navigator.clipboard?.writeText(slug);
+        flashCopied(setShareCopied, shareTimerRef);
+      } catch {
+        // Sharing is a convenience; the visible room number remains usable.
+      }
+    }
+  };
+
+  const dismissRoomShare = () => {
+    try {
+      window.sessionStorage.removeItem(shareKey);
+    } catch {
+      // Session storage may be unavailable; the modal can still close for this render.
+    }
+    setShareRoomOpen(false);
   };
 
   const sendPreview = async (control: 'trebuchet.aim' | 'trebuchet.charge', value: unknown) => {
@@ -544,14 +589,14 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
               ))}
             </div>
 
-            <button className="text-btn" type="button" onClick={copyInvite}>
+            <button className="text-btn" type="button" onClick={copyRoomNumber}>
               {copied ? (
                 <>
                   <Check size={16} /> Copied!
                 </>
               ) : (
                 <>
-                  <Share2 size={16} /> Invite
+                  <Share2 size={16} /> Room number
                 </>
               )}
             </button>
@@ -727,6 +772,26 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
           <LogOut size={16} /> Leave
         </button>
       </section>
+      {shareRoomOpen ? (
+        <div className="room-share-backdrop" role="dialog" aria-modal="true" aria-labelledby="room-share-title">
+          <section className="room-share-modal">
+            <div className="brand-row small">
+              <span className="brand-mark">c</span>
+              <span>Remote Couch</span>
+            </div>
+            <h2 id="room-share-title">Share Room Number</h2>
+            <p>Send this room number to the other players. They scan Remote Couch on their own screen, tap Join Game, and enter it.</p>
+            <div className="room-share-code" aria-label="Remote room code">{slug}</div>
+            <button className="primary-btn wide" type="button" onClick={shareRoomNumber}>
+              {shareCopied ? <Check size={18} /> : <Share2 size={18} />}
+              {shareCopied ? 'Copied!' : 'Share Room Number'}
+            </button>
+            <button className="ghost-btn wide" type="button" onClick={dismissRoomShare}>
+              Done
+            </button>
+          </section>
+        </div>
+      ) : null}
     </main>
   );
 }
