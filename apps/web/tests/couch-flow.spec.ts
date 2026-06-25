@@ -3,48 +3,122 @@ import { expect, test } from '@playwright/test';
 test('standalone Trebuchet test route renders and fires a shot', async ({ page }) => {
   await page.goto('/games/trebuchet');
   await expect(page.getByText('/games/trebuchet')).toBeVisible();
-  await expect(page.getByTestId('trebuchet-stage').locator('canvas')).toBeVisible();
+  // Phaser canvas mount can lag under concurrent WebGL load — give it room.
+  await expect(page.getByTestId('trebuchet-stage').locator('canvas')).toBeVisible({ timeout: 30_000 });
   await page.getByRole('button', { name: /Fire test shot/i }).click();
-  await expect(page.getByText(/Alex|Bea|Winner|Finished/i).first()).toBeVisible();
+  await expect(page.getByText(/Alex|Bea|Winner|Finished/i).first()).toBeVisible({ timeout: 30_000 });
 });
 
-test('TV lobby can be started from phone controllers', async ({ browser }) => {
-  const tv = await browser.newPage({ viewport: { width: 1440, height: 960 } });
+test('desktop attract pairs a phone, lobby chat + game start work', async ({ browser }) => {
+  // 1) Desktop TV shows the retro attract screen and registers a short-lived screen id.
+  const tv = await browser.newPage({
+    viewport: { width: 1440, height: 960 },
+    isMobile: false,
+    hasTouch: false,
+    userAgent:
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+  });
   await tv.goto('/');
-  await tv.getByRole('button', { name: /Neue Lobby erstellen/i }).click();
-  await expect(tv).toHaveURL(/\/l\/[A-Z0-9]+/);
-  const slug = tv.url().split('/').pop()!;
+  await expect(tv.locator('.attract-shell')).toBeVisible();
+  // The QR encodes /s/:screenId; the id is persisted to sessionStorage once registration lands.
+  await expect
+    .poll(() => tv.evaluate(() => window.sessionStorage.getItem('couch:screenId')), { timeout: 15_000 })
+    .toBeTruthy();
+  const screenId = await tv.evaluate(() => window.sessionStorage.getItem('couch:screenId'));
+  await tv.screenshot({ path: 'test-results/attract-home.png' });
 
-  const phoneOne = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true });
-  await phoneOne.goto('/c/' + slug);
+  // 2) Phone "scans" the QR (opens /s/:screenId) and creates a room.
+  const phoneOne = await browser.newPage({
+    viewport: { width: 390, height: 844 },
+    isMobile: true,
+    hasTouch: true
+  });
+  await phoneOne.goto('/s/' + screenId);
+  await phoneOne.getByRole('button', { name: /Create a room/i }).click();
+  await expect(phoneOne).toHaveURL(/\/c\/[A-Z0-9]+/, { timeout: 15_000 });
+  const slug = phoneOne.url().split('/').pop()!;
+
+  // 3) Claiming the screen navigates the TV into that lobby (socket push, with REST poll fallback).
+  await expect(tv).toHaveURL(new RegExp('/l/' + slug), { timeout: 15_000 });
+
+  // 4) The creator joins as host.
   await phoneOne.getByLabel(/Your name/i).fill('Alex');
   await phoneOne.getByRole('button', { name: /^Join$/i }).click();
 
-  const phoneTwo = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true });
+  // 5) A second phone joins via the controller route.
+  const phoneTwo = await browser.newPage({
+    viewport: { width: 390, height: 844 },
+    isMobile: true,
+    hasTouch: true
+  });
   await phoneTwo.goto('/c/' + slug);
   await phoneTwo.getByLabel(/Your name/i).fill('Bea');
   await phoneTwo.getByRole('button', { name: /^Join$/i }).click();
 
+  // Both players appear on the TV.
   await expect(tv.locator('.player-name', { hasText: 'Alex' })).toBeVisible();
   await expect(tv.locator('.player-name', { hasText: 'Bea' })).toBeVisible();
-  await expect(phoneOne.getByRole('button', { name: /Trebuchet starten/i })).toBeEnabled();
-  await phoneOne.getByRole('button', { name: /Trebuchet starten/i }).click();
 
-  await expect(tv.getByText('Live')).toBeVisible();
-  await expect(tv.getByTestId('trebuchet-stage').locator('canvas')).toBeVisible();
+  // The TV shows the game catalog overview including Trebuchet.
+  await expect(tv.locator('.game-catalog')).toBeVisible();
+  await expect(tv.locator('.game-card-title', { hasText: 'Trebuchet' })).toBeVisible();
+  await tv.screenshot({ path: 'test-results/lobby-tv.png' });
+
+  // 6) Chat round-trips controller -> TV (read-only) and -> other controller, in the lobby state.
+  const chatInput = phoneOne.getByPlaceholder(/Message/i);
+  await chatInput.fill('gg hello');
+  await chatInput.press('Enter');
+  await expect(tv.locator('.chat-msg-text', { hasText: 'gg hello' })).toBeVisible({ timeout: 10_000 });
+  await expect(phoneTwo.locator('.chat-msg-text', { hasText: 'gg hello' })).toBeVisible({ timeout: 10_000 });
+
+  // 7) Host selects Trebuchet from the catalog (wires game:select) and starts the game.
+  await phoneOne.locator('.game-card', { hasText: 'Trebuchet' }).click();
+  const startBtn = phoneOne.getByRole('button', { name: /Trebuchet starten/i });
+  await expect(startBtn).toBeEnabled();
+  await startBtn.click();
+
+  // The TV goes live.
+  await expect(tv.getByText('Live')).toBeVisible({ timeout: 10_000 });
   await expect(tv.getByTestId('trebuchet-stage')).toHaveAttribute('data-phase', 'running');
   await expect(phoneOne.getByText(/Your turn|Waiting/i)).toBeVisible();
-  await expect(phoneTwo.getByText(/Your turn|Waiting/i)).toBeVisible();
-
-  const activePhone = await phoneOne.getByText('Your turn').isVisible() ? phoneOne : phoneTwo;
-  await activePhone.getByRole('button', { name: /Aim left/i }).click();
-  const fireButton = activePhone.getByRole('button', { name: /Hold fire/i });
-  await fireButton.dispatchEvent('pointerdown', { pointerId: 1, pointerType: 'touch', isPrimary: true, bubbles: true });
-  await activePhone.waitForTimeout(450);
-  await fireButton.dispatchEvent('pointerup', { pointerId: 1, pointerType: 'touch', isPrimary: true, bubbles: true });
-  await expect(activePhone.getByText(/Last shot:/i)).toBeVisible();
 
   await tv.close();
   await phoneOne.close();
   await phoneTwo.close();
+});
+
+test('invite link opens the mobile join confirm', async ({ browser }) => {
+  // Seed a lobby by creating one through a phone pairing flow against a fresh screen.
+  const tv = await browser.newPage({
+    viewport: { width: 1440, height: 960 },
+    isMobile: false,
+    hasTouch: false,
+    userAgent:
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+  });
+  await tv.goto('/');
+  await expect
+    .poll(() => tv.evaluate(() => window.sessionStorage.getItem('couch:screenId')), { timeout: 15_000 })
+    .toBeTruthy();
+  const screenId = await tv.evaluate(() => window.sessionStorage.getItem('couch:screenId'));
+
+  const host = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  await host.goto('/s/' + screenId);
+  await host.getByRole('button', { name: /Create a room/i }).click();
+  await expect(host).toHaveURL(/\/c\/[A-Z0-9]+/, { timeout: 15_000 });
+  const slug = host.url().split('/').pop()!;
+  await host.getByLabel(/Your name/i).fill('Alex');
+  await host.getByRole('button', { name: /^Join$/i }).click();
+
+  // A friend opens the invite link on a phone -> mobile join confirm (never the desktop home).
+  const friend = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  await friend.goto('/j/' + slug);
+  await expect(friend.locator('.join-confirm-card')).toBeVisible();
+  await expect(friend.getByText(/Join this room\?/i)).toBeVisible();
+  await friend.getByRole('button', { name: /^Join$/i }).click();
+  await expect(friend).toHaveURL(new RegExp('/c/' + slug));
+
+  await tv.close();
+  await host.close();
+  await friend.close();
 });

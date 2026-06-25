@@ -1,9 +1,11 @@
-import { Copy, Plus, RotateCcw, Smartphone, Volume2, VolumeX } from 'lucide-react';
+import { Copy, MessageSquare, Plus, RotateCcw, Smartphone, Volume2, VolumeX } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import type { GameManifest, Lobby } from '@couch/types';
 import type { TrebuchetEvent, TrebuchetSnapshot } from '@couch/trebuchet';
 import { createLobby, fetchGames, fetchLobby } from '../api.js';
 import { createSocket, emitAck } from '../socket.js';
+import { ChatPanel } from '../components/ChatPanel.js';
+import { GameCatalog } from '../components/GameCatalog.js';
 import { PlayerRoster } from '../components/PlayerRoster.js';
 import { QrPanel } from '../components/QrPanel.js';
 import { TrebuchetStage, type TrebuchetControlEvent } from '../components/TrebuchetStage.js';
@@ -109,7 +111,7 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
     });
   };
 
-  const controllerUrl = useMemo(() => `${window.location.origin}/c/${slug}`, [slug]);
+  const inviteUrl = useMemo(() => `${window.location.origin}/j/${slug}`, [slug]);
   const eventSnapshot = lastEvent && 'snapshot' in lastEvent ? (lastEvent.snapshot as TrebuchetSnapshot) : undefined;
   const snapshot = (lobby?.gameSession?.snapshot as TrebuchetSnapshot | undefined) ?? eventSnapshot;
   const currentGame = games.find((game) => game.id === lobby?.currentGameId);
@@ -151,7 +153,7 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
           >
             {muted ? <VolumeX size={18} /> : <Volume2 size={18} />}
           </button>
-          <button className="icon-btn" onClick={() => void navigator.clipboard?.writeText(controllerUrl)} title="Controller-Link kopieren">
+          <button className="icon-btn" onClick={() => void navigator.clipboard?.writeText(inviteUrl)} title="Einladungslink kopieren">
             <Copy size={18} />
           </button>
           <button className="icon-btn" onClick={createAnother} title="Neue Lobby">
@@ -162,13 +164,20 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
 
       <section className="tv-grid">
         <aside className="side-rail">
-          <QrPanel value={controllerUrl} />
+          <QrPanel value={inviteUrl} label="Scan to join" />
           <div className="rail-section">
             <div className="rail-title">
               <Smartphone size={16} />
               <span>Players {lobby?.players.length ?? 0}/4</span>
             </div>
             <PlayerRoster players={lobby?.players ?? []} hostPlayerId={lobby?.hostPlayerId ?? null} />
+          </div>
+          <div className="rail-section">
+            <div className="rail-title">
+              <MessageSquare size={16} />
+              <span>Chat</span>
+            </div>
+            <ChatPanel messages={lobby?.chat ?? []} readOnly />
           </div>
           <div className="rail-section">
             <div className="rail-title">
@@ -191,12 +200,11 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
               {lobby?.state === 'playing' ? 'Live' : lobby?.players.length ? 'Ready' : 'Waiting'}
             </span>
           </div>
-          <TrebuchetStage snapshot={snapshot ?? null} event={lastEvent} controlEvent={lastControlEvent} />
-          {lobby?.state !== 'playing' ? (
-            <div className="screen-hint">
-              Scan the code, join with two phones, then the host starts Trebuchet from their controller.
-            </div>
-          ) : null}
+          {lobby?.state === 'playing' ? (
+            <TrebuchetStage snapshot={snapshot ?? null} event={lastEvent} controlEvent={lastControlEvent} />
+          ) : (
+            <GameCatalog games={games} currentGameId={lobby?.currentGameId ?? null} selectable={false} />
+          )}
         </section>
       </section>
     </main>

@@ -1,5 +1,6 @@
 import type {
   ActivityMessage,
+  ChatMessage,
   GameId,
   GameSession,
   JoinLobbyResponse,
@@ -38,6 +39,7 @@ export interface SerializedLobbyRecord {
   state: Lobby['state'];
   players: InternalPlayer[];
   activity: ActivityMessage[];
+  chat?: ChatMessage[]; // optional for backward compatibility with records persisted before chat existed
   gameSession: GameSession<TrebuchetSnapshot> | null;
 }
 
@@ -52,6 +54,7 @@ export interface LobbyRecord {
   state: Lobby['state'];
   players: Map<PlayerId, InternalPlayer>;
   activity: ActivityMessage[];
+  chat: ChatMessage[];
   gameSession: GameSession<TrebuchetSnapshot> | null;
   engine: TrebuchetEngine | null;
 }
@@ -82,6 +85,7 @@ export class LobbyStore {
       state: 'waiting',
       players: new Map(),
       activity: [],
+      chat: [],
       gameSession: null,
       engine: null
     };
@@ -113,6 +117,7 @@ export class LobbyStore {
       state: lobby.state,
       players: [...lobby.players.values()].map((player) => this.publicPlayer(lobby, player)),
       activity: lobby.activity.slice(-8),
+      chat: lobby.chat.slice(-50),
       gameSession: lobby.gameSession
     };
   }
@@ -170,6 +175,7 @@ export class LobbyStore {
     const lobby = this.getLobby(slug);
     this.assertHost(lobby, playerToken);
     getGameManifest(gameId);
+    if (getGameManifest(gameId).comingSoon) throw new LobbyError('Dieses Spiel ist noch nicht spielbar', 409);
     if (lobby.state !== 'waiting') throw new LobbyError('Spielauswahl ist nur in der Lobby möglich');
     lobby.currentGameId = gameId;
     this.addActivity(lobby, `Spiel gewählt: ${getGameManifest(gameId).title}`);
@@ -181,6 +187,7 @@ export class LobbyStore {
     this.assertHost(lobby, playerToken);
     if (lobby.state === 'playing') throw new LobbyError('Spiel läuft bereits');
     const manifest = getGameManifest(lobby.currentGameId);
+    if (manifest.comingSoon) throw new LobbyError('Dieses Spiel ist noch nicht spielbar', 409);
     if (lobby.players.size < manifest.minPlayers) {
       throw new LobbyError(`Mindestens ${manifest.minPlayers} Spieler nötig`, 409);
     }
@@ -228,6 +235,24 @@ export class LobbyStore {
     const event = lobby.engine?.skipTurn() ?? null;
     if (event) this.updateGameSession(lobby, event.snapshot);
     return event;
+  }
+
+  postChat(slug: string, playerToken: string, text: unknown): ChatMessage {
+    const lobby = this.getLobby(slug);
+    const player = this.playerByToken(lobby, playerToken);
+    const clean = sanitizeChatText(text);
+    if (!clean) throw new LobbyError('Nachricht ist leer');
+    const message: ChatMessage = {
+      id: createId('msg'),
+      at: new Date().toISOString(),
+      playerId: player.id,
+      name: player.name,
+      colorIdx: player.colorIdx,
+      text: clean
+    };
+    lobby.chat.push(message);
+    lobby.chat = lobby.chat.slice(-50);
+    return message;
   }
 
   markDisconnected(slug: string, playerId: PlayerId, at = Date.now()): Lobby | null {
@@ -328,6 +353,14 @@ export class LobbyStore {
   }
 }
 
+export function sanitizeChatText(raw: unknown): string {
+  return String(raw ?? '')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 240);
+}
+
 export function serializeLobbyRecord(lobby: LobbyRecord): SerializedLobbyRecord {
   return {
     id: lobby.id,
@@ -340,6 +373,7 @@ export function serializeLobbyRecord(lobby: LobbyRecord): SerializedLobbyRecord 
     state: lobby.state,
     players: [...lobby.players.values()].map((player) => ({ ...player })),
     activity: lobby.activity.slice(),
+    chat: lobby.chat.slice(),
     gameSession: lobby.gameSession
       ? {
           ...lobby.gameSession,
@@ -362,6 +396,7 @@ export function deserializeLobbyRecord(serialized: SerializedLobbyRecord): Lobby
     state: serialized.state,
     players: new Map(serialized.players.map((player) => [player.id, { ...player }])),
     activity: serialized.activity.slice(),
+    chat: serialized.chat ?? [],
     gameSession: serialized.gameSession
       ? {
           ...serialized.gameSession,
