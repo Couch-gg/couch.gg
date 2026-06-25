@@ -42,6 +42,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   const [lastEvent, setLastEvent] = useState<TrebuchetEvent | null>(null);
   const [socket, setSocket] = useState<Socket | null>(null);
   const [copied, setCopied] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
   const copiedTimerRef = useRef<number | null>(null);
   const chargeStartRef = useRef<number | null>(null);
   const chargeTimerRef = useRef<number | null>(null);
@@ -62,6 +63,39 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     setSocket(nextSocket);
     nextSocket.on('lobby:snapshot', (next: Lobby) => setLobby(next));
     nextSocket.on('game:event', (event: TrebuchetEvent) => setLastEvent(event));
+
+    // Re-register this controller on every (re)connect. A phone that locks or sleeps
+    // drops its socket; Socket.IO reconnects on wake and this re-emits controller:join,
+    // putting us back into the lobby room and flipping us from "reconnecting" to
+    // connected. Within the server's grace window we keep the same slot, host status
+    // and turn — including mid-game (the server's token-reconnect path has no
+    // game-in-progress block; only brand-new players are turned away during play).
+    const rejoinIfPossible = () => {
+      setReconnecting(false);
+      const token = window.localStorage.getItem(tokenKey(slug));
+      if (!token) return; // first-time visitors join via the form below
+      const storedName = window.localStorage.getItem('couch:name') || 'Player';
+      void emitAck<JoinLobbyResponse & { ok: true; games: GameManifest[] }>(nextSocket, 'controller:join', {
+        slug,
+        name: storedName,
+        playerToken: token
+      })
+        .then((joined) => {
+          setPlayer(joined.player);
+          setLobby(joined.lobby);
+          setGames(joined.games);
+          setPlayerToken(joined.playerToken);
+          window.localStorage.setItem(tokenKey(slug), joined.playerToken);
+          window.localStorage.setItem('couch:activeSlug', slug);
+        })
+        .catch(() => {
+          // Room may be gone after a very long absence; leave the UI as-is.
+        });
+    };
+
+    nextSocket.on('connect', rejoinIfPossible);
+    nextSocket.on('disconnect', () => setReconnecting(true));
+
     return () => {
       nextSocket.disconnect();
       setSocket(null);
@@ -103,13 +137,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     }
   };
 
-  useEffect(() => {
-    if (socket && playerToken && !player) {
-      void join();
-    }
-    // One reconnect attempt on mount.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [socket]);
+  // (Returning users auto-join + reconnect via the socket effect's 'connect' listener above.)
 
   useEffect(() => {
     if (!player) return;
@@ -410,6 +438,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   return (
     <main className="controller-shell">
       <section className="controller-card tall">
+        {reconnecting ? <div className="reconnect-pill">Reconnecting…</div> : null}
         <div className="controller-top">
           <div>
             <span className="micro-label">Room {slug}</span>

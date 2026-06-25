@@ -122,3 +122,48 @@ test('invite link opens the mobile join confirm', async ({ browser }) => {
   await host.close();
   await friend.close();
 });
+
+test('controller survives a network drop and auto-rejoins (slept phone)', async ({ browser }) => {
+  test.setTimeout(90_000);
+  const tv = await browser.newPage({
+    viewport: { width: 1440, height: 960 },
+    isMobile: false,
+    hasTouch: false,
+    userAgent:
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+  });
+  await tv.goto('/');
+  await expect
+    .poll(() => tv.evaluate(() => window.sessionStorage.getItem('couch:screenId')), { timeout: 15_000 })
+    .toBeTruthy();
+  const screenId = await tv.evaluate(() => window.sessionStorage.getItem('couch:screenId'));
+
+  const host = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  await host.goto('/s/' + screenId);
+  await host.getByRole('button', { name: /Create a room/i }).click();
+  await expect(host).toHaveURL(/\/c\/[A-Z0-9]+/, { timeout: 15_000 });
+  const slug = host.url().split('/').pop()!;
+  await host.getByLabel(/Your name/i).fill('Alex');
+  await host.getByRole('button', { name: /^Join$/i }).click();
+
+  const alexConnection = tv.locator('.player-row', { hasText: 'Alex' }).locator('.connection');
+  await expect(alexConnection).toHaveText(/online/i, { timeout: 15_000 });
+
+  // Phone goes to sleep / loses network — the socket drops.
+  await host.context().setOffline(true);
+  await expect(host.locator('.reconnect-pill')).toBeVisible({ timeout: 20_000 });
+  await expect(alexConnection).toHaveText(/reconnect/i, { timeout: 20_000 });
+
+  // Phone wakes — the controller auto-rejoins with no manual action, within the grace window.
+  await host.context().setOffline(false);
+  await expect(host.locator('.reconnect-pill')).toBeHidden({ timeout: 20_000 });
+  await expect(alexConnection).toHaveText(/online/i, { timeout: 20_000 });
+
+  // And it is fully functional again: a chat from the phone reaches the TV.
+  await host.getByPlaceholder(/Message/i).fill('back online');
+  await host.getByPlaceholder(/Message/i).press('Enter');
+  await expect(tv.locator('.chat-msg-text', { hasText: 'back online' })).toBeVisible({ timeout: 10_000 });
+
+  await tv.close();
+  await host.close();
+});

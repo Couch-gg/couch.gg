@@ -1722,3 +1722,32 @@ button:disabled {
   flex: 1;
   min-height: 0;
 }
+
+/* Controller reconnect banner: shown while a slept/dropped phone re-establishes its socket. */
+.reconnect-pill {
+  align-self: center;
+  margin: 2px 0 6px;
+  padding: 6px 14px;
+  border-radius: 999px;
+  background: rgba(241, 207, 106, 0.16);
+  border: 1px solid rgba(241, 207, 106, 0.42);
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .reconnect-pill {
+    animation: reconnect-pulse 1.4s ease-in-out infinite;
+  }
+}
+
+@keyframes reconnect-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}

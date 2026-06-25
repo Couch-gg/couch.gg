@@ -88,7 +88,11 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   const server = http.createServer(app);
   const socketOptions: Partial<ServerOptions> = {
     cors: { origin: clientOrigin },
-    path: socketPath
+    path: socketPath,
+    // Detect a dropped controller (locked/slept phone) within ~10s instead of the
+    // ~45s engine.io default, so the lobby reflects "reconnecting" promptly.
+    pingInterval: 5000,
+    pingTimeout: 5000
   };
   if (options.websocketOnly) socketOptions.transports = ['websocket'];
   const io = new Server(server, socketOptions);

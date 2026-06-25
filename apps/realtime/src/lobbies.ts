@@ -21,7 +21,7 @@ import {
 import { TrebuchetEngine, type TrebuchetEvent, type TrebuchetSnapshot } from '@couch/trebuchet';
 
 export const LOBBY_TTL_MS = 4 * 60 * 60 * 1000;
-export const RECONNECT_GRACE_MS = 30_000;
+export const RECONNECT_GRACE_MS = 10 * 60 * 1000;
 
 export interface InternalPlayer extends Player {
   token: PlayerToken;
