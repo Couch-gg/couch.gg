@@ -1160,6 +1160,7 @@ button:disabled {
   min-height: 100vh;
   min-height: 100dvh;
   padding: clamp(24px, 5vw, 72px);
+  padding-bottom: clamp(140px, 20vh, 220px);
   gap: clamp(20px, 3vw, 36px);
   text-align: center;
 }
