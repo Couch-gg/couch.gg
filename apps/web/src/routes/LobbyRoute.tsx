@@ -1,5 +1,5 @@
 import { Copy, MessageSquare, Plus, RotateCcw, Smartphone, Volume2, VolumeX } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { GameManifest, Lobby } from '@couch/types';
 import type { TrebuchetEvent, TrebuchetSnapshot } from '@couch/trebuchet';
 import { createLobby, fetchGames, fetchLobby } from '../api.js';
@@ -47,6 +47,16 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
   const [error, setError] = useState<string | null>(null);
   const [muted, setMuted] = useState(false);
 
+  // A shot can reach this screen via the socket (same instance, instant) or via the
+  // polled/snapshot lobby state (cross-instance, ≤750ms). Dedupe by monotonic seq so
+  // it animates exactly once regardless of which path wins the race.
+  const lastSeenSeqRef = useRef(0);
+  const applyGameEvent = useCallback((seq: number, event: TrebuchetEvent) => {
+    if (!seq || seq <= lastSeenSeqRef.current) return;
+    lastSeenSeqRef.current = seq;
+    setLastEvent(event);
+  }, []);
+
   useEffect(() => {
     let active = true;
     const socket = createSocket();
@@ -63,7 +73,7 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
       .catch((err) => active && setError(err instanceof Error ? err.message : 'Lobby konnte nicht geladen werden'));
 
     socket.on('lobby:snapshot', (next: Lobby) => setLobby(next));
-    socket.on('game:event', (event: TrebuchetEvent) => setLastEvent(event));
+    socket.on('game:event', (p: { seq: number; event: TrebuchetEvent }) => applyGameEvent(p.seq, p.event));
     socket.on('game:control', (control: TrebuchetControlEvent) => setLastControlEvent(control));
 
     const refreshTimer = window.setInterval(() => {
@@ -79,7 +89,17 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
       window.clearInterval(refreshTimer);
       socket.disconnect();
     };
-  }, [slug]);
+  }, [slug, applyGameEvent]);
+
+  // Replay the latest event carried inside the polled/snapshot lobby state. This is the
+  // cross-instance path: when the opponent fired on a different serverless instance the
+  // socket broadcast never reached us, but the lobby snapshot (persisted + polled) does.
+  // The seq-based dedup makes this safe to run on every lobby update.
+  useEffect(() => {
+    if (lobby?.lastEvent) {
+      applyGameEvent(lobby.lastEvent.seq, lobby.lastEvent.event as TrebuchetEvent);
+    }
+  }, [lobby?.lastEvent?.seq, applyGameEvent]);
 
   // Load the shared audio engine, seed the mute toggle from its persisted state, and select the
   // pre-game "menu" music bed. Gameplay music ('game') is owned by the Phaser scene's create(), so

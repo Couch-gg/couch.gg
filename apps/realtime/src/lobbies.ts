@@ -1,6 +1,7 @@
 import type {
   ActivityMessage,
   ChatMessage,
+  GameEventEnvelope,
   GameId,
   GameSession,
   JoinLobbyResponse,
@@ -41,6 +42,7 @@ export interface SerializedLobbyRecord {
   activity: ActivityMessage[];
   chat?: ChatMessage[]; // optional for backward compatibility with records persisted before chat existed
   gameSession: GameSession<TrebuchetSnapshot> | null;
+  lastEvent?: GameEventEnvelope | null; // optional for backward compatibility with records persisted before lastEvent existed
 }
 
 export interface LobbyRecord {
@@ -56,6 +58,7 @@ export interface LobbyRecord {
   activity: ActivityMessage[];
   chat: ChatMessage[];
   gameSession: GameSession<TrebuchetSnapshot> | null;
+  lastEvent: GameEventEnvelope | null;
   engine: TrebuchetEngine | null;
 }
 
@@ -87,6 +90,7 @@ export class LobbyStore {
       activity: [],
       chat: [],
       gameSession: null,
+      lastEvent: null,
       engine: null
     };
     this.addActivity(lobby, 'Lobby erstellt');
@@ -118,7 +122,8 @@ export class LobbyStore {
       players: [...lobby.players.values()].map((player) => this.publicPlayer(lobby, player)),
       activity: lobby.activity.slice(-8),
       chat: lobby.chat.slice(-50),
-      gameSession: lobby.gameSession
+      gameSession: lobby.gameSession,
+      lastEvent: lobby.lastEvent
     };
   }
 
@@ -235,6 +240,17 @@ export class LobbyStore {
     const event = lobby.engine?.skipTurn() ?? null;
     if (event) this.updateGameSession(lobby, event.snapshot);
     return event;
+  }
+
+  // Stamp the latest game event onto the lobby state with a monotonic seq so it
+  // rides along the persisted+polled snapshot (reaching clients on other serverless
+  // instances, where Socket.IO broadcasts don't cross). Only ever the newest event
+  // is kept — it's overwritten each shot/turn.
+  recordGameEvent(slug: string, event: TrebuchetEvent): number {
+    const lobby = this.getLobby(slug);
+    const seq = (lobby.lastEvent?.seq ?? 0) + 1;
+    lobby.lastEvent = { seq, at: new Date().toISOString(), event };
+    return seq;
   }
 
   postChat(slug: string, playerToken: string, text: unknown): ChatMessage {
@@ -379,7 +395,8 @@ export function serializeLobbyRecord(lobby: LobbyRecord): SerializedLobbyRecord 
           ...lobby.gameSession,
           snapshot: cloneSnapshot(lobby.gameSession.snapshot)
         }
-      : null
+      : null,
+    lastEvent: lobby.lastEvent
   };
 }
 
@@ -403,6 +420,7 @@ export function deserializeLobbyRecord(serialized: SerializedLobbyRecord): Lobby
           snapshot: cloneSnapshot(serialized.gameSession.snapshot)
         }
       : null,
+    lastEvent: serialized.lastEvent ?? null,
     engine: snapshot && serialized.state === 'playing' ? TrebuchetEngine.fromSnapshot(snapshot) : null
   };
 }
