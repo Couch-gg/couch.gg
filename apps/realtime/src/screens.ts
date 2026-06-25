@@ -39,6 +39,19 @@ export class ScreenRegistry {
     return this.register(now);
   }
 
+  // Insert/replace a record loaded from shared persistence (e.g. another serverless
+  // instance). Drops records already past their deadline so we never resurrect a
+  // dead screen; otherwise stores and returns it.
+  hydrate(record: ScreenRecord, now = Date.now()): ScreenRecord | null {
+    const deadline = record.claimedAt != null ? record.claimedAt + SCREEN_CLAIM_GRACE_MS : record.expiresAt;
+    if (deadline <= now) {
+      this.screens.delete(record.id);
+      return null;
+    }
+    this.screens.set(record.id, record);
+    return record;
+  }
+
   get(id: string, now = Date.now()): ScreenRecord | null {
     const record = this.screens.get(id);
     if (!record) return null;
