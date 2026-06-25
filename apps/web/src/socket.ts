@@ -6,8 +6,11 @@ export function createSocket(): Socket {
     path: REALTIME_SOCKET_PATH,
     transports: ['websocket'],
     reconnection: true,
-    reconnectionAttempts: 8,
-    reconnectionDelay: 400
+    // Keep trying indefinitely: a phone can be asleep for minutes and must
+    // reconnect whenever it wakes, not give up after a handful of attempts.
+    reconnectionAttempts: Infinity,
+    reconnectionDelay: 400,
+    reconnectionDelayMax: 5000
   });
 }
 
