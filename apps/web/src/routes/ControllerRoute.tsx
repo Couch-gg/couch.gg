@@ -1,4 +1,5 @@
 import {
+  Check,
   ChevronLeft,
   ChevronRight,
   Crosshair,
@@ -6,7 +7,8 @@ import {
   Flame,
   Gamepad2,
   LogOut,
-  Play
+  Play,
+  Share2
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState, type PointerEvent } from 'react';
 import type { Socket } from 'socket.io-client';
@@ -20,7 +22,9 @@ import {
   type TrebuchetEvent,
   type TrebuchetSnapshot
 } from '@couch/trebuchet';
-import { fetchLobby } from '../api.js';
+import { GameCatalog } from '../components/GameCatalog.js';
+import { ChatPanel } from '../components/ChatPanel.js';
+import { fetchLobby, sendChat } from '../api.js';
 import { createSocket, emitAck } from '../socket.js';
 
 export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (to: string) => void }) {
@@ -37,6 +41,8 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   const [error, setError] = useState<string | null>(null);
   const [lastEvent, setLastEvent] = useState<TrebuchetEvent | null>(null);
   const [socket, setSocket] = useState<Socket | null>(null);
+  const [copied, setCopied] = useState(false);
+  const copiedTimerRef = useRef<number | null>(null);
   const chargeStartRef = useRef<number | null>(null);
   const chargeTimerRef = useRef<number | null>(null);
   const lastChargeSendRef = useRef(0);
@@ -66,6 +72,10 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     return () => {
       stopChargeTimer();
       stopAimRepeat();
+      if (copiedTimerRef.current != null) {
+        window.clearTimeout(copiedTimerRef.current);
+        copiedTimerRef.current = null;
+      }
     };
   }, []);
 
@@ -86,6 +96,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
       setGames(joined.games);
       setPlayerToken(joined.playerToken);
       window.localStorage.setItem(tokenKey(slug), joined.playerToken);
+      window.localStorage.setItem('couch:activeSlug', slug);
       window.localStorage.setItem('couch:name', joined.player.name);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Join fehlgeschlagen');
@@ -127,6 +138,45 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   const start = async () => {
     if (!socket) return;
     await emitAck(socket, 'game:start', { slug, playerToken });
+  };
+
+  const selectGame = async (gameId: string) => {
+    if (!socket) return;
+    try {
+      await emitAck(socket, 'game:select', { slug, playerToken, gameId });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Spielauswahl fehlgeschlagen');
+    }
+  };
+
+  const sendChatMessage = async (text: string) => {
+    if (!socket) return;
+    try {
+      await emitAck(socket, 'chat:send', { slug, playerToken, text });
+    } catch {
+      try {
+        await sendChat(slug, playerToken, text);
+      } catch {
+        /* surface nothing; best-effort */
+      }
+    }
+  };
+
+  const copyInvite = async () => {
+    const url = `${window.location.origin}/j/${slug}`;
+    try {
+      await navigator.clipboard?.writeText(url);
+      setCopied(true);
+      if (copiedTimerRef.current != null) {
+        window.clearTimeout(copiedTimerRef.current);
+      }
+      copiedTimerRef.current = window.setTimeout(() => {
+        setCopied(false);
+        copiedTimerRef.current = null;
+      }, 1500);
+    } catch {
+      // Clipboard may be unavailable (insecure context / no permission); ignore.
+    }
   };
 
   const sendPreview = async (control: 'trebuchet.aim' | 'trebuchet.charge', value: unknown) => {
@@ -375,23 +425,37 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
                 <span key={row.id}>{row.name}{row.isHost ? ' · Host' : ''}</span>
               ))}
             </div>
+
+            <button className="text-btn" type="button" onClick={copyInvite}>
+              {copied ? (
+                <>
+                  <Check size={16} /> Copied!
+                </>
+              ) : (
+                <>
+                  <Share2 size={16} /> Invite
+                </>
+              )}
+            </button>
+
+            <GameCatalog
+              games={games}
+              currentGameId={lobby?.currentGameId ?? null}
+              selectable={isHost}
+              onSelect={selectGame}
+            />
+
             {isHost ? (
-              <>
-                <label className="control-label">
-                  Spiel
-                  <select defaultValue="trebuchet" disabled={games.length <= 1}>
-                    {(games.length ? games : [{ id: 'trebuchet', title: 'Trebuchet' } as GameManifest]).map((game) => (
-                      <option key={game.id} value={game.id}>{game.title}</option>
-                    ))}
-                  </select>
-                </label>
-                <button className="primary-btn wide" disabled={!canStart} onClick={start}>
-                  <Play size={18} /> Trebuchet starten
-                </button>
-              </>
+              <button className="primary-btn wide" disabled={!canStart} onClick={start}>
+                <Play size={18} /> Trebuchet starten
+              </button>
             ) : (
               <p className="muted">Warte auf den Host. Dein Handy bleibt gekoppelt.</p>
             )}
+
+            <div className="controller-chat">
+              <ChatPanel messages={lobby?.chat ?? []} onSend={sendChatMessage} />
+            </div>
           </div>
         ) : (
           <div className="trebuchet-controls">
@@ -524,6 +588,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
           className="text-btn"
           onClick={() => {
             window.localStorage.removeItem(tokenKey(slug));
+            window.localStorage.removeItem('couch:activeSlug');
             navigate('/');
           }}
         >

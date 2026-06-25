@@ -4,14 +4,16 @@ import cors from 'cors';
 import express from 'express';
 import { Server, type ServerOptions } from 'socket.io';
 import { GAME_MANIFESTS } from '@couch/game-runtime';
-import type { ControllerEvent, GameId, PlayerId } from '@couch/types';
+import type { ControllerEvent, GameId, PlayerId, ScreenId } from '@couch/types';
 import { LobbyError, LobbyStore, RECONNECT_GRACE_MS, type LobbyRecord } from './lobbies.js';
 import { createProductionLobbyPersistence } from './persistence.js';
+import { ScreenRegistry } from './screens.js';
 
 interface SocketContext {
-  role: 'screen' | 'controller';
+  role: 'screen' | 'controller' | 'screen-pairing';
   slug: string;
   playerId?: PlayerId;
+  screenId?: ScreenId;
 }
 
 export interface RealtimeServerOptions {
@@ -33,6 +35,7 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   const apiPrefix = normalizeApiPrefix(options.apiPrefix ?? process.env.API_PREFIX ?? '/api');
   const socketPath = options.socketPath ?? process.env.SOCKET_PATH ?? '/socket.io';
   const store = new LobbyStore();
+  const screens = new ScreenRegistry();
   const persistence = createProductionLobbyPersistence();
   const turnTimers = new Map<string, NodeJS.Timeout>();
 
@@ -188,6 +191,59 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
       }
     });
 
+    socket.on('screen:register', (payload: { screenId?: string }, ack?: (value: unknown) => void) => {
+      try {
+        const record = screens.registerOrReuse(payload?.screenId);
+        ctx = { role: 'screen-pairing', slug: '', screenId: record.id };
+        socket.join(screenRoom(record.id));
+        ack?.({ ok: true, screen: screens.toPublic(record) });
+        if (record.claimedSlug) socket.emit('screen:claimed', { screenId: record.id, slug: record.claimedSlug });
+      } catch (err) {
+        ack?.(socketError(err));
+      }
+    });
+
+    socket.on('screen:claim', async (payload: { screenId?: string; slug?: string }, ack?: (value: unknown) => void) => {
+      try {
+        const slug = String(payload?.slug ?? '').toUpperCase();
+        await hydrateLobby(slug);
+        store.getLobby(slug);
+        const record = screens.claim(String(payload?.screenId ?? ''), slug);
+        ack?.({ ok: true, screen: screens.toPublic(record) });
+        io.to(screenRoom(record.id)).emit('screen:claimed', { screenId: record.id, slug });
+      } catch (err) {
+        ack?.(socketError(err));
+      }
+    });
+
+    socket.on('screen:claim-status', (payload: { screenId?: string }, ack?: (value: unknown) => void) => {
+      try {
+        const record = screens.get(String(payload?.screenId ?? ''));
+        ack?.({
+          ok: true,
+          screen: record
+            ? { ...screens.toPublic(record), expired: false }
+            : { id: String(payload?.screenId ?? ''), expiresAt: new Date().toISOString(), claimedSlug: null, expired: true }
+        });
+      } catch (err) {
+        ack?.(socketError(err));
+      }
+    });
+
+    socket.on('chat:send', async (payload: { slug?: string; playerToken?: string; text?: unknown }, ack?: (value: unknown) => void) => {
+      try {
+        const slug = String(payload?.slug ?? '').toUpperCase();
+        await hydrateLobby(slug);
+        const message = store.postChat(slug, String(payload?.playerToken ?? ''), payload?.text);
+        await saveLobby(slug);
+        ack?.({ ok: true, message });
+        io.to(room(slug)).emit('chat:message', message);
+        emitLobby(slug);
+      } catch (err) {
+        ack?.(socketError(err));
+      }
+    });
+
     socket.on('disconnect', () => {
       if (!ctx || ctx.role !== 'controller' || !ctx.playerId) return;
       void (async () => {
@@ -213,7 +269,50 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
     });
   });
 
-  setInterval(() => store.pruneExpired(), 60_000).unref?.();
+  app.post(`${apiPrefix}/screens`, (_req, res) => {
+    try {
+      const record = screens.register();
+      res.status(201).json({ screen: screens.toPublic(record) });
+    } catch (err) {
+      sendHttpError(res, err);
+    }
+  });
+
+  app.get(`${apiPrefix}/screens/:id`, (req, res) => {
+    const record = screens.get(req.params.id);
+    if (record) res.json({ screen: { ...screens.toPublic(record), expired: false } });
+    else res.json({ screen: { id: req.params.id, expiresAt: new Date().toISOString(), claimedSlug: null, expired: true } });
+  });
+
+  app.post(`${apiPrefix}/screens/:id/claim`, async (req, res) => {
+    try {
+      const slug = String(req.body?.slug ?? '').toUpperCase();
+      await hydrateLobby(slug);
+      store.getLobby(slug);
+      const record = screens.claim(req.params.id, slug);
+      io.to(screenRoom(req.params.id)).emit('screen:claimed', { screenId: req.params.id, slug });
+      res.status(200).json({ screen: screens.toPublic(record) });
+    } catch (err) {
+      sendHttpError(res, err);
+    }
+  });
+
+  app.post(`${apiPrefix}/lobbies/:slug/chat`, async (req, res) => {
+    try {
+      await hydrateLobby(req.params.slug);
+      const message = store.postChat(req.params.slug, req.body?.playerToken, req.body?.text);
+      await saveLobby(req.params.slug);
+      io.to(room(req.params.slug)).emit('chat:message', message);
+      res.status(201).json({ message });
+    } catch (err) {
+      sendHttpError(res, err);
+    }
+  });
+
+  setInterval(() => {
+    store.pruneExpired();
+    screens.pruneExpired();
+  }, 60_000).unref?.();
 
   function emitLobby(slug: string): void {
     try {
@@ -302,6 +401,10 @@ export function startRealtimeServer(options: RealtimeServerOptions = {}): http.S
 
 function room(slug: string): string {
   return `lobby:${slug}`;
+}
+
+function screenRoom(id: string): string {
+  return 'screen:' + id;
 }
 
 function socketError(err: unknown): { ok: false; error: string; status: number } {

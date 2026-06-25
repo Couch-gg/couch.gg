@@ -16,10 +16,87 @@ export const TREBUCHET_MANIFEST: GameManifest = {
   },
   aspectRatio: '16:9',
   estimatedDurationMinutes: 8,
-  status: 'internal'
+  status: 'internal',
+  thumbnail: {
+    kind: 'css',
+    gradient: 'linear-gradient(160deg, #2a1b3d 0%, #5a2c42 60%, #e8554d 135%)',
+    icon: 'Castle',
+    accent: '#f1cf6a'
+  }
 };
 
-export const GAME_MANIFESTS = [TREBUCHET_MANIFEST] satisfies GameManifest[];
+export const TANK_DUEL_MANIFEST: GameManifest = {
+  id: 'tank-duel',
+  title: 'Tank Duel',
+  description: 'Lob shells across a destructible battlefield and out-aim your rivals in a 2-4 player artillery showdown.',
+  minPlayers: 2,
+  maxPlayers: 4,
+  controllerLayout: {
+    kind: 'generic-buttons',
+    controls: []
+  },
+  aspectRatio: '16:9',
+  estimatedDurationMinutes: 6,
+  status: 'internal',
+  comingSoon: true,
+  thumbnail: {
+    kind: 'css',
+    gradient: 'linear-gradient(160deg, #0f2a2e 0%, #14524f 70%, #62d5d5 140%)',
+    icon: 'Crosshair',
+    accent: '#62d5d5'
+  }
+};
+
+export const QUIZ_RUSH_MANIFEST: GameManifest = {
+  id: 'quiz-rush',
+  title: 'Quiz Rush',
+  description: 'Race the buzzer in a fast trivia sprint for 2-8 players. Be quick, be right, take the lead.',
+  minPlayers: 2,
+  maxPlayers: 8,
+  controllerLayout: {
+    kind: 'generic-buttons',
+    controls: []
+  },
+  aspectRatio: '16:9',
+  estimatedDurationMinutes: 10,
+  status: 'internal',
+  comingSoon: true,
+  thumbnail: {
+    kind: 'css',
+    gradient: 'linear-gradient(160deg, #241640 0%, #4a2d7a 70%, #d47cff 140%)',
+    icon: 'Brain',
+    accent: '#d47cff'
+  }
+};
+
+export const KART_CHAOS_MANIFEST: GameManifest = {
+  id: 'kart-chaos',
+  title: 'Kart Chaos',
+  description: 'Drift, bump, and boost through chaotic circuits in a 2-4 player couch kart scramble.',
+  minPlayers: 2,
+  maxPlayers: 4,
+  controllerLayout: {
+    kind: 'generic-buttons',
+    controls: []
+  },
+  aspectRatio: '16:9',
+  estimatedDurationMinutes: 5,
+  status: 'internal',
+  comingSoon: true,
+  thumbnail: {
+    kind: 'css',
+    gradient: 'linear-gradient(160deg, #3a1f10 0%, #8a4a1f 70%, #ff935c 140%)',
+    icon: 'Car',
+    accent: '#ff935c'
+  }
+};
+
+export const GAME_MANIFESTS = [
+  TREBUCHET_MANIFEST,
+  TANK_DUEL_MANIFEST,
+  QUIZ_RUSH_MANIFEST,
+  KART_CHAOS_MANIFEST
+] satisfies GameManifest[];
 
 export function getGameManifest(id: GameId): GameManifest {
   const manifest = GAME_MANIFESTS.find((game) => game.id === id);
@@ -31,6 +108,11 @@ export function getGameManifest(id: GameId): GameManifest {
 
 export function getDefaultGameId(): GameId {
   return 'trebuchet';
+}
+
+export function isPlayableGame(id: GameId): boolean {
+  const manifest = GAME_MANIFESTS.find((game) => game.id === id);
+  return Boolean(manifest) && !manifest!.comingSoon;
 }
 
 export function sanitizePlayerName(raw: unknown): string {

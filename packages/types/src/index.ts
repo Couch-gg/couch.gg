@@ -3,7 +3,8 @@ export type LobbyId = string;
 export type LobbySlug = string;
 export type PlayerToken = string;
 export type DeviceId = string;
-export type GameId = 'trebuchet';
+export type GameId = string;
+export type ScreenId = string;
 
 export type LobbyState = 'waiting' | 'playing' | 'ended';
 export type GameSessionState = 'ready' | 'running' | 'finished';
@@ -54,6 +55,7 @@ export interface Lobby {
   state: LobbyState;
   players: Player[];
   activity: ActivityMessage[];
+  chat: ChatMessage[];
   gameSession: GameSession | null;
 }
 
@@ -67,6 +69,13 @@ export interface GameSession<TSnapshot = unknown> {
   snapshot: TSnapshot;
 }
 
+export interface GameThumbnail {
+  kind: 'css';
+  gradient: string;
+  icon: string;
+  accent?: string;
+}
+
 export interface GameManifest {
   id: GameId;
   title: string;
@@ -77,6 +86,8 @@ export interface GameManifest {
   aspectRatio: '16:9' | '4:3';
   estimatedDurationMinutes: number;
   status: 'internal' | 'submitted' | 'published';
+  thumbnail: GameThumbnail;
+  comingSoon?: boolean;
 }
 
 export interface ControllerEvent<TValue = unknown> {
@@ -93,6 +104,15 @@ export interface ActivityMessage {
   text: string;
 }
 
+export interface ChatMessage {
+  id: string;
+  at: string;                  // ISO timestamp
+  playerId: PlayerId | null;   // null = system message
+  name: string;                // denormalized sender display name
+  colorIdx: number;            // sender color index, for bubble tint
+  text: string;
+}
+
 export interface CreateLobbyResponse {
   lobby: Lobby;
 }
@@ -105,4 +125,26 @@ export interface JoinLobbyResponse {
 
 export interface PublicConfig {
   realtimeUrl: string;
+}
+
+export interface ScreenRecordPublic {
+  id: ScreenId;
+  expiresAt: string;               // ISO
+  claimedSlug: LobbySlug | null;
+}
+
+export interface RegisterScreenResponse {
+  screen: ScreenRecordPublic;
+}
+
+export interface ScreenStatusResponse {
+  screen: ScreenRecordPublic & { expired: boolean };
+}
+
+export interface ClaimScreenResponse {
+  screen: ScreenRecordPublic;
+}
+
+export interface PostChatResponse {
+  message: ChatMessage;
 }

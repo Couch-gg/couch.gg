@@ -7,6 +7,9 @@ export default defineConfig({
   timeout: 60_000,
   expect: { timeout: 10_000 },
   fullyParallel: true,
+  // The suite boots multiple Phaser/WebGL canvases; cap workers so concurrent GL
+  // contexts don't starve each other and flake on canvas-mount timing.
+  workers: 3,
   reporter: [['list'], ['html', { open: 'never', outputFolder: 'playwright-report' }]],
   use: {
     baseURL: liveBaseURL ?? 'http://127.0.0.1:5173',
