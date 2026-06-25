@@ -1187,9 +1187,9 @@ button:disabled {
 .attract-qr-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(220px, 300px));
-  justify-content: center;
-  gap: clamp(16px, 3vw, 34px);
-  width: min(100%, 700px);
+  justify-content: space-between;
+  gap: clamp(64px, 14vw, 320px);
+  width: min(100%, 1680px);
 }
 
 .attract-choice {
@@ -1227,6 +1227,9 @@ button:disabled {
 @media (max-width: 760px) {
   .attract-qr-grid {
     grid-template-columns: minmax(220px, 320px);
+    justify-content: center;
+    gap: 20px;
+    width: min(100%, 360px);
   }
 
   .attract-overlay {
