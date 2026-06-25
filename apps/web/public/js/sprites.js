@@ -216,9 +216,11 @@ function padRows(grid, w) {
   return grid.map((r) => (r.length >= w ? r.slice(0, w) : r + ' '.repeat(w - r.length)));
 }
 
-function bakeTrebuchet(scene, idx) {
+// Shared wood/iron/team palette for every trebuchet texture (poses AND the rig
+// pieces below) so the static frame, arm and counterweight all read as one
+// machine. Factored out of bakeTrebuchet so bakeTrebuchetRig reuses it verbatim.
+function trebPalette(idx) {
   const team = TEAM_COLORS[idx];
-
   // Wood ramp (warm browns) — shared across teams. 2-3 shade wood for legible volume.
   const pal = {
     D: 0x4a2f1a, // dark wood (shadow side / outlines)
@@ -236,10 +238,132 @@ function bakeTrebuchet(scene, idx) {
   pal.f = shade(team, -0.35); // banner shade
   pal.C = shade(team, 0.12); // counterweight face (team, slightly lit)
   pal.c = shade(team, -0.4); // counterweight shade (darker team)
+  return pal;
+}
 
+function bakeTrebuchet(scene, idx) {
+  const pal = trebPalette(idx);
   bakeGrid(scene, `treb_${idx}_idle`, padRows(TREB_IDLE, 26), pal);
   bakeGrid(scene, `treb_${idx}_swing`, padRows(TREB_SWING, 26), pal);
   bakeGrid(scene, `treb_${idx}_release`, padRows(TREB_RELEASE, 26), pal);
+}
+
+// ---------------------------------------------------------------------------------------------
+// TREBUCHET RIG — the SAME machine split into three textures so the game can
+// physically ROTATE the throwing arm about its pivot rather than swapping poses:
+//   treb_<c>_frame   — STATIC parts only (A-frame, base, wheels, banner). Same
+//                      26x26 footprint + origin (bottom-center) as the pose
+//                      sprites, so it drops in over the idle look 1:1. The iron
+//                      pivot pin (the `M` highlight) sits at grid col 17, row 10
+//                      — i.e. (+4, -16) from the bottom-center origin. That cell
+//                      is the rotation pivot the game mounts the arm at.
+//   treb_<c>_arm     — the throwing arm + sling, authored HORIZONTALLY pointing
+//                      along +x (long sling end to the RIGHT, short counterweight
+//                      stub to the LEFT). The grid is sized + the canvas baked so
+//                      the arm's pivot cell lands at the texture's geometric
+//                      center, letting the game mount it with setOrigin(0.5,0.5)
+//                      and rotate `angle` to swing it.
+//   treb_<c>_weight  — the counterweight box as its own little sprite, hung off
+//                      the short end of the arm.
+// The original treb_<c>_idle/swing/release keys are still baked (above) so the
+// attract scene + any pose-swap fallback keep working.
+// ---------------------------------------------------------------------------------------------
+
+// FRAME (26x26) — A-frame + base + wheels + banner, NO arm/counterweight/sling.
+// Derived from TREB_IDLE by erasing the moving pixels; the A-frame apex `KMK`
+// keeps the iron pivot pin `M` at col 17, row 10 (the arm's mount point).
+const TREB_FRAME = [
+  '..........................',
+  '.Ff.......................',
+  '.FF.......................',
+  '.Ff.......................',
+  '.FF.......................',
+  '.p........................',
+  '.p........................',
+  '.p........................',
+  '.p........................',
+  '.p........................',
+  '.p..............KMK.......',
+  '.p.............DKD........',
+  '.p............DWKWD.......',
+  '.p...........DW.K.WD......',
+  '.p..........DW..K..WD.....',
+  '.p.........DW...K...WD....',
+  '..........DW....K....WD...',
+  '.........DW.....K.....WD..',
+  '.....DDDDW......K......WDD',
+  '....DLWWWWWWWWWWWWWWWWWWWWL',
+  '....DWWWWWWWWWWWWWWWWWWWWWD',
+  '....DLLLLLLLLLLLLLLLLLLLLD',
+  '....D..DD..........DD...D.',
+  '...DD..WW..........WW...DD',
+  '..DW...WW..........WW...WD',
+  '..D....DD..........DD....D',
+];
+
+// ARM (25x7 authored; re-centered to 41x7 at bake) — authored HORIZONTAL,
+// pointing +x. Long throwing/sling end to the RIGHT (ends in tan sling ropes
+// `R`); short iron counterweight stub to the LEFT. Spine row = 3. Pivot cell =
+// (col 5, row 3): the iron pin where the arm joins the A-frame. The grid is
+// intentionally symmetric in HEIGHT about row 3 and centerPivotColumn pads it so
+// col 5 becomes the horizontal center — so the texture center == the pivot, and
+// the game rotates it with setOrigin(0.5, 0.5).
+const TREB_ARM = [
+  '.........................',
+  '.....KK..................',
+  'KKKKKKWWWWWWWWWWWWWWWWLR..',
+  'KKKKKKWWWWWWWWWWWWWWWWLRR.',
+  'KKKKKKWWWWWWWWWWWWWWWWLR..',
+  '.....KK..................',
+  '.........................',
+];
+
+// COUNTERWEIGHT (5x6) — heavy team-colored box with a dark iron band, hung off
+// the arm's short end. Small standalone sprite mounted by the game.
+const TREB_WEIGHT = [
+  'CCCCC',
+  'CiiiC',
+  'CCCCC',
+  'cCCCc',
+  'ccccc',
+  '.ccc.',
+];
+
+// Re-center a grid horizontally so a chosen pivot column becomes the exact
+// middle column of the (re-padded) grid. Returns { grid, w, h } where the
+// canvas center pixel == the pivot. Rows are first normalized to a single width
+// (so the canvas is rectangular and bakeGrid sizes it consistently), then the
+// short side is padded with transparent columns; the result keeps NEAREST-crisp
+// 1px cells.
+function centerPivotColumn(grid, pivotCol) {
+  const h = grid.length;
+  // Normalize every row to the widest width so the grid is rectangular before
+  // we pad for centering (guards against an unevenly-authored source grid).
+  const w0 = grid.reduce((m, r) => Math.max(m, r.length), 0);
+  const norm = grid.map((r) => (r.length >= w0 ? r.slice(0, w0) : r + ' '.repeat(w0 - r.length)));
+  const left = pivotCol;            // cells to the left of the pivot column
+  const right = w0 - 1 - pivotCol;  // cells to the right of the pivot column
+  const pad = Math.abs(left - right);
+  const padStr = ' '.repeat(pad);
+  const out = norm.map((row) => (left < right ? padStr + row : row + padStr));
+  return { grid: out, w: out[0].length, h };
+}
+
+function bakeTrebuchetRig(scene, idx) {
+  const pal = trebPalette(idx);
+
+  // Static frame — identical footprint/origin to the pose sprites.
+  bakeGrid(scene, `treb_${idx}_frame`, padRows(TREB_FRAME, 26), pal);
+
+  // Arm — re-pad so the pivot column (5) sits at the texture's horizontal
+  // center. The grid is already vertically symmetric about the spine row, so
+  // the resulting canvas center == the arm pivot; the game mounts it with
+  // setOrigin(0.5, 0.5) and rotates `angle` to swing the arm.
+  const centered = centerPivotColumn(TREB_ARM, 5);
+  bakeGrid(scene, `treb_${idx}_arm`, centered.grid, pal);
+
+  // Counterweight box.
+  bakeGrid(scene, `treb_${idx}_weight`, TREB_WEIGHT, pal);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -566,9 +690,11 @@ function bakeFxRing(scene) {
 // Public entry point — bake everything onto the given scene's texture manager.
 // ---------------------------------------------------------------------------------------------
 export function bakeTextures(scene) {
-  // Trebuchets: 4 team colors x 3 frames.
+  // Trebuchets: 4 team colors x 3 pose frames, plus the rigged frame/arm/weight
+  // textures the game rotates for the physical swing.
   for (let i = 0; i < TEAM_COLORS.length; i++) {
     bakeTrebuchet(scene, i);
+    bakeTrebuchetRig(scene, i);
   }
 
   // Rock.

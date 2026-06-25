@@ -454,12 +454,38 @@ export class Game extends Phaser.Scene {
   }
 
   // -- trebuchets ---------------------------------------------------------
+  // Rig geometry (see sprites.js TREB_FRAME/TREB_ARM):
+  //   - The static frame is 26x26, origin bottom-center; the iron pivot pin sits
+  //     at grid (col 17, row 10) => (+4, -16) from that origin (RIGHT-facing).
+  //   - The arm texture is baked with its pivot at the texture center, so it
+  //     mounts with setOrigin(0.5,0.5) and rotates about `angle`.
+  // Arm angles (degrees, RIGHT-facing; +angle = clockwise, screen-y down):
+  //   REST    168° — long sling end cocked low to the rear (sling tip ~ grid
+  //                  row 13, matching the idle art's loaded sling), counterweight
+  //                  raised up on the short end. Reads as the idle "primed" pose.
+  //   RELEASE -70° — long sling end whipped high over the front, CW dropped to
+  //                  the rear-bottom. A ~238° over-the-top throw arc.
+  // Left-facing rigs mirror X (frame.flipX, arm.flipX) and negate the angle.
+  static get TREB_PIVOT_DX() { return 4; }
+  static get TREB_PIVOT_DY() { return -16; }
+  static get TREB_ARM_REST() { return 168; }
+  static get TREB_ARM_RELEASE() { return -70; }
+
   _addTrebuchet(p) {
     const c = p.colorIdx | 0;
-    const sprite = this.add.image(0, 0, 'treb_' + c + '_idle');
+    const faceLeft = p.x > WORLD_W / 2;
+
+    // Prefer the rigged frame so the arm can physically rotate; fall back to the
+    // single idle pose sprite if the rig bake is unavailable (defensive — a bake
+    // failure must never break the game).
+    const hasRig = this.textures.exists('treb_' + c + '_frame') &&
+      this.textures.exists('treb_' + c + '_arm') &&
+      this.textures.exists('treb_' + c + '_weight');
+
+    const sprite = this.add.image(0, 0, hasRig ? ('treb_' + c + '_frame') : ('treb_' + c + '_idle'));
     sprite.setOrigin(0.5, 1); // bottom-center
-    // Face map center.
-    sprite.flipX = p.x > WORLD_W / 2;
+    sprite.flipX = faceLeft;  // face map center
+    sprite.setPosition(0, 0);
 
     const label = this.add.text(0, 0, (p.name || TEAM_NAMES[c] || 'P'), {
       fontFamily: '"Press Start 2P", monospace',
@@ -467,23 +493,64 @@ export class Game extends Phaser.Scene {
       color: '#ffffff'
     });
     label.setOrigin(0.5, 1);
-    label.setResolution(2);
+    label.setResolution(3);
 
     const hpBg = this.add.graphics();
     const hpFill = this.add.graphics();
 
-    const container = this.add.container(p.x, p.y, [sprite, hpBg, hpFill, label]);
-    // children are positioned relative to container.
-    sprite.setPosition(0, 0);
+    // Build the rig children (arm + counterweight) when textures exist. They are
+    // added to the container BEFORE the HP bar/label so they draw behind those.
+    let arm = null;
+    let weight = null;
+    const pivotDx = (faceLeft ? -1 : 1) * Game.TREB_PIVOT_DX;
+    const pivotDy = Game.TREB_PIVOT_DY;
+    const restAngle = (faceLeft ? -1 : 1) * Game.TREB_ARM_REST;
+    if (hasRig) {
+      arm = this.add.image(pivotDx, pivotDy, 'treb_' + c + '_arm');
+      arm.setOrigin(0.5, 0.5);   // texture center == arm pivot
+      arm.flipX = faceLeft;      // mirror the arm for left-facing rigs
+      arm.setAngle(restAngle);   // cocked rest pose (matches idle)
 
-    const t = { container, sprite, label, hpBg, hpFill, p, colorIdx: c, dead: false };
+      weight = this.add.image(0, 0, 'treb_' + c + '_weight');
+      weight.setOrigin(0.5, 0.5);
+      // Hang the counterweight off the arm's SHORT (counterweight) end; placed
+      // by _layoutWeight from the current arm angle so it tracks the swing.
+    }
+
+    const children = [sprite];
+    if (arm) children.push(arm);
+    if (weight) children.push(weight);
+    children.push(hpBg, hpFill, label);
+    const container = this.add.container(p.x, p.y, children);
+
+    const t = {
+      container, sprite, label, hpBg, hpFill, p, colorIdx: c, dead: false,
+      // Rig refs (null when falling back to the pose sprite).
+      frame: hasRig ? sprite : null,
+      arm, weight, hasRig, faceLeft,
+      pivotDx, pivotDy, restAngle,
+    };
     container.setDepth(30);
     this._trebs.set(p.id, t);
+    if (t.arm) this._layoutWeight(t, t.arm.angle); // seat the CW at rest
     this._layoutTreb(t);
     this._drawHp(t);
     // Start payload carries full hp; guard anyway in case a rematch payload differs.
     if (p.hp <= 0) this._killTreb(t, false);
     return t;
+  }
+
+  // Seat the counterweight box at the SHORT (counterweight) end of the arm for a
+  // given arm angle. The short end is ~5px from the pivot on the opposite side
+  // of the long sling arm, so it sits along (angle + 180°). Called as the arm
+  // tweens so the weight visibly rides the swing (down on release).
+  _layoutWeight(t, armAngleDeg) {
+    if (!t || !t.weight) return;
+    const a = (armAngleDeg + 180) * Math.PI / 180; // counterweight side
+    const stub = 6; // px from pivot to the counterweight box center
+    const wx = t.pivotDx + Math.cos(a) * stub;
+    const wy = t.pivotDy + Math.sin(a) * stub;
+    t.weight.setPosition(wx, wy);
   }
 
   _layoutTreb(t) {
@@ -560,14 +627,18 @@ export class Game extends Phaser.Scene {
 
   // -- HUD ----------------------------------------------------------------
   _buildHud() {
+    // Bumped one step for legibility at the internal 480x270 resolution: the
+    // "big" HUD text is now 10px and the "small" readouts 8px. Every HUD text
+    // object also renders at 3x resolution (setResolution(3)) so the pixel font
+    // stays crisp after the FIT upscale to the canvas.
     const fontBig = {
       fontFamily: '"Press Start 2P", monospace',
-      fontSize: '8px',
+      fontSize: '10px',
       color: '#ffffff'
     };
     const fontSmall = {
       fontFamily: '"Press Start 2P", monospace',
-      fontSize: '6px',
+      fontSize: '8px',
       color: '#ffffff'
     };
 
@@ -576,28 +647,34 @@ export class Game extends Phaser.Scene {
     this.windArrow.setDepth(80);
     this.windText = this.add.text(WORLD_W / 2, 20, '', fontSmall);
     this.windText.setOrigin(0.5, 0);
+    this.windText.setResolution(3);
     this.windText.setDepth(80);
 
     // Turn banner (top-left).
     this.turnBanner = this.add.text(4, 4, '', fontBig);
+    this.turnBanner.setResolution(3);
     this.turnBanner.setDepth(80);
 
     // Countdown (top-right).
     this.countText = this.add.text(WORLD_W - 4, 4, '', fontBig);
     this.countText.setOrigin(1, 0);
+    this.countText.setResolution(3);
     this.countText.setDepth(80);
 
     // Aim readout (bottom-left). Leaves room to the right for the charge meter.
-    this.aimText = this.add.text(4, WORLD_H - 12, '', fontSmall);
+    this.aimText = this.add.text(4, WORLD_H - 13, '', fontSmall);
+    this.aimText.setResolution(3);
     this.aimText.setDepth(80);
 
     // Controls hint (bottom-left, above the readout) — in-canvas since ui.js
-    // has no in-game hint string to edit.
-    this.hintText = this.add.text(4, WORLD_H - 21, '◄► AIM   HOLD = POWER', {
+    // has no in-game hint string to edit. Nudged up 2px so the taller 8px
+    // readout below it doesn't crowd the bottom edge.
+    this.hintText = this.add.text(4, WORLD_H - 23, '◄► AIM   HOLD = POWER', {
       fontFamily: '"Press Start 2P", monospace',
-      fontSize: '6px',
+      fontSize: '8px',
       color: '#9a9aa8'
     });
+    this.hintText.setResolution(3);
     this.hintText.setDepth(80);
 
     // Thin vertical charge meter next to the readout (7.3). Drawn each frame
@@ -616,10 +693,11 @@ export class Game extends Phaser.Scene {
     this.fireBtnBg.setDepth(80);
     this.fireBtnText = this.add.text(WORLD_W - 30, WORLD_H - 12, 'FIRE', {
       fontFamily: '"Press Start 2P", monospace',
-      fontSize: '7px',
+      fontSize: '8px',
       color: '#1a0a0a'
     });
     this.fireBtnText.setOrigin(0.5, 0.5);
+    this.fireBtnText.setResolution(3);
     this.fireBtnText.setDepth(81);
     this._drawFireBtn();
     this._drawChargeMeter();
@@ -1152,7 +1230,10 @@ export class Game extends Phaser.Scene {
         speed: { min: 2, max: 10 },
         scale: { start: 1, end: 0 },
         alpha: { start: 0.8, end: 0 },
-        lifespan: 360,
+        // Widened to match the slow-mo flight (Part A) so the arc reads as one
+        // continuous streak at the slower playback speed instead of a dashed
+        // line of short-lived puffs.
+        lifespan: 620,
         frequency: 18,
         blendMode: 'ADD',
         follow: this.rock,
@@ -1168,7 +1249,8 @@ export class Game extends Phaser.Scene {
         // Stop emitting, let live particles fade, then destroy shortly after.
         this._trailEmitter.stop();
         const em = this._trailEmitter;
-        this.time.delayedCall(420, () => { try { em.destroy(); } catch (e) {} });
+        // Let the now-longer-lived (lifespan 620) particles fade before destroy.
+        this.time.delayedCall(680, () => { try { em.destroy(); } catch (e) {} });
       } catch (e) {
         try { this._trailEmitter.destroy(); } catch (e2) {}
       }
@@ -1342,39 +1424,137 @@ export class Game extends Phaser.Scene {
     this._whistled = false;
     this._crumbledThisShot = false;
 
-    // Fire sequence (7.4): idle -> swing (90 ms) -> release (held ~360 ms) ->
-    // idle. The projectile + whoosh start AT the swing->release boundary, so we
-    // delay the trajectory animation by 90 ms.
+    // Fire sequence: a SLOW, weighty wind-up (SWING_MS) ending in the release,
+    // then a long held/settle (RELEASE_HOLD_MS). The projectile + 'fire' SFX
+    // launch AT the release moment so the rock leaves the sling exactly as the
+    // arm whips over, never before. These were 90/360; raised so the throw reads.
     const shooter = this._trebs.get(m.shooterId);
-    const SWING_MS = 90;
-    const RELEASE_HOLD_MS = 360;
+    const SWING_MS = 260;
+    const RELEASE_HOLD_MS = 600;
 
-    if (shooter && !shooter.dead) {
-      const c = shooter.colorIdx;
-      // Frame 1: swing immediately.
-      shooter.sprite.setTexture('treb_' + c + '_swing');
-      // Frame 2: release at the swing->release boundary.
-      this.time.delayedCall(SWING_MS, () => {
-        if (shooter.sprite && !shooter.dead) {
-          shooter.sprite.setTexture('treb_' + c + '_release');
-        }
-      });
-      // Back to idle after the release is held.
-      this.time.delayedCall(SWING_MS + RELEASE_HOLD_MS, () => {
-        if (shooter.sprite && !shooter.dead) {
-          shooter.sprite.setTexture('treb_' + c + '_idle');
-        }
-      });
-    }
-
-    // Launch the projectile + 'fire' SFX at the swing->release boundary.
-    this.time.delayedCall(SWING_MS, () => {
+    // Shared "the arm just released the stone" handler — runs once, at the
+    // release instant, for BOTH the rigged tween path and the texture fallback.
+    let launched = false;
+    const launch = () => {
+      if (launched) return;
+      launched = true;
       try { SFX.play('fire'); } catch (e) { /* ignore */ }
+      // Machine kick: a small camera shake on release (skipped under reduced
+      // motion). Light enough not to fight the heavier impact shake later.
+      if (!this._reducedMotion) {
+        try { this.cameras.main.shake(120, 0.004); } catch (e) { /* ignore */ }
+      }
       // Optional dust puff at the trebuchet on release.
       if (shooter && !shooter.dead) {
         this._debrisPuff(shooter.container.x, shooter.container.y - 2);
       }
       this._animateProjectile(traj, () => this._resolveImpact(m, shotEpoch));
+    };
+
+    const canRig = shooter && !shooter.dead && shooter.hasRig &&
+      shooter.arm && shooter.weight;
+
+    if (canRig) {
+      this._animateThrowRig(shooter, SWING_MS, RELEASE_HOLD_MS, launch);
+    } else if (shooter && !shooter.dead) {
+      // Fallback: the original idle -> swing -> release -> idle pose swaps,
+      // re-timed to the new (slower) SWING_MS / RELEASE_HOLD_MS so a bake
+      // failure still gives a slowed, readable shot.
+      const c = shooter.colorIdx;
+      shooter.sprite.setTexture('treb_' + c + '_swing');
+      this.time.delayedCall(SWING_MS, () => {
+        if (shooter.sprite && !shooter.dead) {
+          shooter.sprite.setTexture('treb_' + c + '_release');
+        }
+        launch();
+      });
+      this.time.delayedCall(SWING_MS + RELEASE_HOLD_MS, () => {
+        if (shooter.sprite && !shooter.dead) {
+          shooter.sprite.setTexture('treb_' + c + '_idle');
+        }
+      });
+    } else {
+      // Shooter gone/dead — still launch the rock on the same schedule so the
+      // shot resolves normally.
+      this.time.delayedCall(SWING_MS, launch);
+    }
+  }
+
+  // Physically swing the rigged arm: a weighty wind-up (counterweight drops and
+  // accelerates the arm, whip at the end), the release at the wind-up's end
+  // (fires `onRelease`), then an overshoot + settle back to rest plus a small
+  // machine recoil. Purely cosmetic — it never gates the sim, only when the rock
+  // visually leaves the sling.
+  _animateThrowRig(t, swingMs, holdMs, onRelease) {
+    const arm = t.arm;
+    const rest = t.restAngle;
+    const release = (t.faceLeft ? -1 : 1) * Game.TREB_ARM_RELEASE;
+    const homeX = t.container.x;
+
+    // Keep the counterweight glued to the arm's short end every frame.
+    const trackWeight = () => this._layoutWeight(t, arm.angle);
+
+    // Counterweight leads the arm slightly (mass first): a tiny early drop on the
+    // weight's own offset before the arm tween, giving the swing a "the weight
+    // yanks the arm" read. ~50ms head start.
+    if (!this._reducedMotion) {
+      this.tweens.add({
+        targets: arm,
+        // overshoot a hair past rest (cock back) before the throw — Back.easeIn
+        // gives that anticipatory dip, then the whip.
+        angle: release,
+        duration: swingMs,
+        delay: 50,
+        ease: 'Cubic.easeIn',
+        onUpdate: trackWeight,
+        onComplete: () => {
+          trackWeight();
+          onRelease();
+          this._settleThrowRig(t, rest, holdMs, homeX);
+        },
+      });
+      // Machine recoil: nudge the whole rig back (away from the shot) a hair as
+      // the counterweight slams down, then ease home during the settle.
+      const recoilDir = t.faceLeft ? 1 : -1; // shove opposite the throw
+      this.tweens.add({
+        targets: t.container,
+        x: homeX + recoilDir * 2,
+        duration: swingMs,
+        delay: 50,
+        ease: 'Cubic.easeIn',
+      });
+    } else {
+      // Reduced motion: snap arm to release, fire, snap back — no tween motion.
+      arm.setAngle(release);
+      trackWeight();
+      onRelease();
+      this.time.delayedCall(holdMs, () => {
+        if (arm && !t.dead) { arm.setAngle(rest); trackWeight(); }
+        t.container.x = homeX;
+      });
+    }
+  }
+
+  // Overshoot + settle the arm back toward its cocked rest pose, and ease the
+  // recoiled rig back home. Bounce/Back gives a satisfying mechanical rebound.
+  _settleThrowRig(t, rest, holdMs, homeX) {
+    const arm = t.arm;
+    if (!arm || t.dead) return;
+    const trackWeight = () => this._layoutWeight(t, arm.angle);
+    // Let the released pose linger, then swing back with a small overshoot.
+    this.tweens.add({
+      targets: arm,
+      angle: rest,
+      duration: Math.max(120, holdMs),
+      ease: 'Back.easeOut',
+      onUpdate: trackWeight,
+      onComplete: trackWeight,
+    });
+    this.tweens.add({
+      targets: t.container,
+      x: homeX,
+      duration: Math.max(120, holdMs),
+      ease: 'Back.easeOut',
     });
   }
 
@@ -1393,9 +1573,15 @@ export class Game extends Phaser.Scene {
     // Faint warm particle trail follows the rock (cleared on impact).
     this._startProjectileTrail();
 
-    // Each sample represents 1/60 s of flight. Step through time-based.
-    const sampleDt = 1 / 60; // seconds per sample
+    // Cosmetic slow-motion: stretch the visual flight so the arc reads as a
+    // weighty trebuchet lob WITHOUT touching the sim. Each trajectory sample is
+    // 1/60 s of *simulated* flight; multiplying by SLOMO makes one sample take
+    // longer to play back, so the rock still passes through EXACTLY the same
+    // sampled points (same landing spot) — only slower. Everything below derives
+    // from sampleDt, so the whole flight scales uniformly.
+    const SLOMO = 2.2;
     let elapsed = 0;
+    const sampleDt = (1 / 60) * SLOMO; // seconds of real time per sample
     const totalT = (traj.length - 1) * sampleDt;
     const startTime = this.time.now;
     let prevY = traj[0][1]; // track y to detect the apex (start of the fall)
@@ -1428,7 +1614,9 @@ export class Game extends Phaser.Scene {
       }
       prevY = y;
       this.rock.setPosition(x, y);
-      this.rock.rotation += 0.35;
+      // Spin scaled down by SLOMO so the rock's tumble rate matches the slowed
+      // flight (≈0.16 rad/frame at SLOMO 2.2) rather than spinning frantically.
+      this.rock.rotation += 0.35 / SLOMO;
     };
     this._projUpdate = tick;
     this.events.on('update', tick);
@@ -1612,7 +1800,7 @@ export class Game extends Phaser.Scene {
       });
       txt.setOrigin(0.5, 1);
       txt.setDepth(92);
-      txt.setResolution(2);
+      txt.setResolution(3);
       if (big) {
         // Brief white flash on a big hit.
         txt.setTintFill(0xffffff);
@@ -1670,6 +1858,7 @@ export class Game extends Phaser.Scene {
       strokeThickness: 3
     });
     t.setOrigin(0.5, 0.5);
+    t.setResolution(3);
     t.setDepth(90);
     this.tweens.add({
       targets: t,
