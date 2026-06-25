@@ -56,11 +56,15 @@ function bakeGrid(scene, key, grid, pal) {
     colors[ch] = typeof v === 'number' ? hex(v) : v;
   }
 
+  // 2x bake: the world runs at 2x its old internal resolution, so every baked
+  // texture is doubled — each source grid pixel becomes a 2x2 block on a
+  // (w*2 x h*2) canvas. KEYS and grid DATA are unchanged; only the baked pixel
+  // scale doubles. NEAREST filtering (set in registerCanvas) keeps it crisp.
   const canvas = document.createElement('canvas');
-  canvas.width = w;
-  canvas.height = h;
+  canvas.width = w * 2;
+  canvas.height = h * 2;
   const ctx = canvas.getContext('2d');
-  ctx.clearRect(0, 0, w, h);
+  ctx.clearRect(0, 0, w * 2, h * 2);
 
   for (let y = 0; y < h; y++) {
     const row = grid[y];
@@ -70,7 +74,7 @@ function bakeGrid(scene, key, grid, pal) {
       const col = colors[ch];
       if (!col) continue; // undefined char -> treat as transparent
       ctx.fillStyle = col;
-      ctx.fillRect(x, y, 1, 1);
+      ctx.fillRect(x * 2, y * 2, 2, 2);
     }
   }
 
@@ -402,14 +406,19 @@ const EX = {
 
 // Draw a filled "pixel disc" of radius r centered at (cx, cy) on the given ctx with a color.
 // Uses a per-pixel test so edges stay chunky/retro rather than antialiased.
+//
+// 2x bake: every input (cx, cy, r) is authored in the old 32px explosion space;
+// we scale it to the 64px canvas here (positions + radius x2, drawn as 2x2
+// blocks) so the explosion stays the right on-screen size in the 2x world.
 function fillDisc(ctx, cx, cy, r, color) {
   if (r <= 0) return;
+  cx *= 2; cy *= 2; r *= 2;
   ctx.fillStyle = color;
   const r2 = r * r;
   const x0 = Math.max(0, Math.floor(cx - r));
-  const x1 = Math.min(31, Math.ceil(cx + r));
+  const x1 = Math.min(63, Math.ceil(cx + r));
   const y0 = Math.max(0, Math.floor(cy - r));
-  const y1 = Math.min(31, Math.ceil(cy + r));
+  const y1 = Math.min(63, Math.ceil(cy + r));
   for (let y = y0; y <= y1; y++) {
     for (let x = x0; x <= x1; x++) {
       const dx = x + 0.5 - cx;
@@ -419,16 +428,17 @@ function fillDisc(ctx, cx, cy, r, color) {
   }
 }
 
-// Draw an annulus (ring) between rInner and rOuter.
+// Draw an annulus (ring) between rInner and rOuter. Scaled x2 (see fillDisc).
 function fillRing(ctx, cx, cy, rInner, rOuter, color) {
   if (rOuter <= 0) return;
+  cx *= 2; cy *= 2; rInner *= 2; rOuter *= 2;
   ctx.fillStyle = color;
   const ro2 = rOuter * rOuter;
   const ri2 = rInner > 0 ? rInner * rInner : -1;
   const x0 = Math.max(0, Math.floor(cx - rOuter));
-  const x1 = Math.min(31, Math.ceil(cx + rOuter));
+  const x1 = Math.min(63, Math.ceil(cx + rOuter));
   const y0 = Math.max(0, Math.floor(cy - rOuter));
-  const y1 = Math.min(31, Math.ceil(cy + rOuter));
+  const y1 = Math.min(63, Math.ceil(cy + rOuter));
   for (let y = y0; y <= y1; y++) {
     for (let x = x0; x <= x1; x++) {
       const dx = x + 0.5 - cx;
@@ -440,17 +450,21 @@ function fillRing(ctx, cx, cy, rInner, rOuter, color) {
 }
 
 // Sprinkle a few detached "ember" / "smoke puff" pixels for a hand-made retro feel.
-// Deterministic positions so frames look consistent run to run.
+// Deterministic positions so frames look consistent run to run. Scaled x2: each
+// speckle becomes a 2x2 block at the doubled position (see fillDisc).
 function speckle(ctx, cx, cy, points, color) {
   ctx.fillStyle = color;
   for (let i = 0; i < points.length; i += 2) {
-    const x = Math.round(cx + points[i]);
-    const y = Math.round(cy + points[i + 1]);
-    if (x >= 0 && x < 32 && y >= 0 && y < 32) ctx.fillRect(x, y, 1, 1);
+    const x = Math.round(cx + points[i]) * 2;
+    const y = Math.round(cy + points[i + 1]) * 2;
+    if (x >= 0 && x < 64 && y >= 0 && y < 64) ctx.fillRect(x, y, 2, 2);
   }
 }
 
 function bakeExplosion(scene) {
+  // Center authored in the old 32px space; fill helpers scale x2 to the 64px
+  // canvas. Keeping the authored center/radii unchanged makes the 2x bake a pure
+  // scale of the original explosion art.
   const cx = 16;
   const cy = 16;
 
@@ -492,20 +506,21 @@ function bakeExplosion(scene) {
       fillRing(ctx, cx, cy, 11, 14, EX.smokeD);
       fillRing(ctx, cx, cy, 6, 11, EX.smoke);
       fillDisc(ctx, cx, cy, 6, EX.smokeL);
-      // punch a couple of holes so it looks ragged / breaking up
-      ctx.clearRect(13, 9, 3, 2);
-      ctx.clearRect(17, 18, 2, 3);
-      ctx.clearRect(9, 16, 2, 2);
+      // punch a couple of holes so it looks ragged / breaking up (coords x2 for
+      // the 64px canvas).
+      ctx.clearRect(26, 18, 6, 4);
+      ctx.clearRect(34, 36, 4, 6);
+      ctx.clearRect(18, 32, 4, 4);
       speckle(ctx, cx, cy, [17, -4, -16, 4, 5, -17, -6, 16, 14, 13, -14, -13], EX.smokeD);
     },
   ];
 
   for (let i = 0; i < frames.length; i++) {
     const canvas = document.createElement('canvas');
-    canvas.width = 32;
-    canvas.height = 32;
+    canvas.width = 64;
+    canvas.height = 64;
     const ctx = canvas.getContext('2d');
-    ctx.clearRect(0, 0, 32, 32);
+    ctx.clearRect(0, 0, 64, 64);
     frames[i](ctx);
     registerCanvas(scene, `boom_${i}`, canvas);
   }
@@ -658,19 +673,22 @@ const FX_TRAIL_PAL = {
 // fx_ring (16x16) — hollow shockwave ring: 1px-thick white circle outline, transparent center.
 // Drawn procedurally so the circle is mathematically exact.
 function bakeFxRing(scene) {
-  const SIZE = 16;
+  // 2x bake: 16px ring -> 32px canvas (center + radii x2) so the shockwave ring
+  // stays the right on-screen size in the 2x world. A 2px-thick outline keeps
+  // the same relative thickness as the original 1px ring.
+  const SIZE = 32;
   const canvas = document.createElement('canvas');
   canvas.width = SIZE;
   canvas.height = SIZE;
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0, 0, SIZE, SIZE);
 
-  // Draw a 1px-thick circle outline. For each pixel, check if it falls within the
-  // 1px ring at radius 7 (outer edge at 7.5, inner edge at 6.5 from center 7.5,7.5).
-  const cx = 7.5;
-  const cy = 7.5;
-  const rOuter = 7.5;
-  const rInner = 6.5;
+  // Draw a 2px-thick circle outline. For each pixel, check if it falls within the
+  // ring at radius 15 (outer edge at 15, inner edge at 13 from center 15.5,15.5).
+  const cx = 15.5;
+  const cy = 15.5;
+  const rOuter = 15;
+  const rInner = 13;
   ctx.fillStyle = '#ffffff';
   for (let y = 0; y < SIZE; y++) {
     for (let x = 0; x < SIZE; x++) {

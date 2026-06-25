@@ -16,7 +16,7 @@ import { bakeTextures } from '../sprites.js';
 
 // Ground/hill geometry, kept consistent with the game's look (grass over dirt).
 const GROUND_Y = Math.round(WORLD_H * 0.78);   // baseline ground surface
-const HILL_RISE = 18;                           // how high the left/right hills sit above the baseline
+const HILL_RISE = 36;                           // how high the left/right hills sit above the baseline (2x world)
 const GRASS_COLOR = 0x5dc961;
 const GRASS_DARK = 0x3f9444;
 const DIRT_COLOR = 0x6b4a2b;
@@ -101,18 +101,18 @@ export class Attract extends Phaser.Scene {
     g.fillStyle(DIRT_DARK, 1);
     for (let x = 0; x < WORLD_W; x++) {
       const y = surfaceY(x);
-      g.fillRect(x, y + 5, 1, 2);
+      g.fillRect(x, y + 10, 1, 4);
     }
-    // Grass cap: a 3px grass strip riding the surface, with a 1px dark edge.
+    // Grass cap: a 6px grass strip riding the surface, with a 2px dark edge.
     g.fillStyle(GRASS_DARK, 1);
     for (let x = 0; x < WORLD_W; x++) {
       const y = surfaceY(x);
-      g.fillRect(x, y + 2, 1, 1);
+      g.fillRect(x, y + 4, 1, 2);
     }
     g.fillStyle(GRASS_COLOR, 1);
     for (let x = 0; x < WORLD_W; x++) {
       const y = surfaceY(x);
-      g.fillRect(x, y, 1, 2);
+      g.fillRect(x, y, 1, 4);
     }
   }
 
@@ -131,12 +131,12 @@ export class Attract extends Phaser.Scene {
       const key = 'cloud_' + (i % 3);
       if (!this._hasTexture(key)) continue;
       const x = rng() * WORLD_W;
-      const y = 16 + rng() * 70;
+      const y = 32 + rng() * 140;
       const c = this.add.image(x, y, key);
       c.setDepth(1);
       c.setAlpha(0.5);
-      // Slow drift; even calmer under reduced motion.
-      c._spd = (this._reduced ? 1.5 : 3) + rng() * (this._reduced ? 2 : 5);
+      // Slow drift; even calmer under reduced motion. Speeds x2 for the 2x world.
+      c._spd = (this._reduced ? 3 : 6) + rng() * (this._reduced ? 4 : 10);
       this._clouds.push(c);
     }
   }
@@ -147,7 +147,8 @@ export class Attract extends Phaser.Scene {
     for (let i = 0; i < count; i++) {
       const x = Math.floor(rng() * WORLD_W);
       const y = Math.floor(rng() * (WORLD_H * 0.5));
-      const s = this.add.rectangle(x, y, 1, 1, 0xffffff, 0.6 + rng() * 0.4);
+      // 2x2 star dot (doubled from 1px for the 2x world).
+      const s = this.add.rectangle(x, y, 2, 2, 0xffffff, 0.6 + rng() * 0.4);
       s.setDepth(1);
       s._phase = rng() * Math.PI * 2;
       s._spd = 1.5 + rng() * 2;
@@ -170,7 +171,7 @@ export class Attract extends Phaser.Scene {
   // Build one trebuchet at x, planted on the hill surface. `faceLeft` flips the
   // RIGHT-authored sprite so it points toward the center of the map.
   _makeTrebuchet(teamIdx, x, faceLeft) {
-    const y = this._surfaceY(x) + 1; // base sits just on the grass
+    const y = this._surfaceY(x) + 2; // base sits just on the grass (2x world)
     const idleKey = 'treb_' + teamIdx + '_idle';
     let sprite = null;
     if (this._hasTexture(idleKey)) {
@@ -180,8 +181,8 @@ export class Attract extends Phaser.Scene {
       sprite.setDepth(10);
     } else {
       // Degrade: a small colored block stands in for a missing trebuchet so the
-      // loop still has a visible "fort" to fire from.
-      sprite = this.add.rectangle(x, y - 8, 14, 16, TEAM_COLORS[teamIdx] || 0xffffff);
+      // loop still has a visible "fort" to fire from (sized x2 for the 2x world).
+      sprite = this.add.rectangle(x, y - 16, 28, 32, TEAM_COLORS[teamIdx] || 0xffffff);
       sprite.setOrigin(0.5, 1);
       sprite.setDepth(10);
     }
@@ -234,7 +235,7 @@ export class Attract extends Phaser.Scene {
       const homeX = treb.x;
       this.tweens.add({
         targets: treb.sprite,
-        x: homeX + dir * 2,
+        x: homeX + dir * 4,
         duration: 90,
         yoyo: true,
         ease: 'Quad.easeOut',
@@ -245,11 +246,11 @@ export class Attract extends Phaser.Scene {
 
   // Spawn a rock and tween it along a parabolic arc from shooter to target.
   _launchRock(shooter, target) {
-    const startX = shooter.x + (shooter.faceLeft ? -8 : 8);
-    const startY = shooter.y - 16; // roughly the throwing-arm height
+    const startX = shooter.x + (shooter.faceLeft ? -16 : 16);
+    const startY = shooter.y - 32; // roughly the throwing-arm height (2x world)
     const endX = target.x;
-    const endY = target.y - 10;    // land around the target's base/body
-    const apexY = Math.min(startY, endY) - (70 + Math.random() * 30);
+    const endY = target.y - 20;    // land around the target's base/body (2x world)
+    const apexY = Math.min(startY, endY) - (140 + Math.random() * 60);
     const duration = 1100 + Math.random() * 250;
 
     let rock = null;
@@ -257,7 +258,7 @@ export class Attract extends Phaser.Scene {
       rock = this.add.image(startX, startY, 'rock');
       rock.setDepth(40);
     } else {
-      rock = this.add.rectangle(startX, startY, 4, 4, 0x9b9b9b);
+      rock = this.add.rectangle(startX, startY, 8, 8, 0x9b9b9b);
       rock.setDepth(40);
     }
 
@@ -296,31 +297,32 @@ export class Attract extends Phaser.Scene {
     this._explode(x, y);
     if (this._reduced) return; // calm mode: explosion only, no heavy bursts/shake
 
+    // Particle speeds (px/s) and gravity (px/s^2) x2 for the 2x world.
     this._burst('fx_spark', x, y, {
-      speed: { min: 30, max: 100 },
+      speed: { min: 60, max: 200 },
       scale: { start: 1, end: 0 },
       alpha: { start: 1, end: 0 },
       lifespan: { min: 200, max: 460 },
       quantity: 12,
       blendMode: 'ADD',
-      gravityY: 60
+      gravityY: 120
     });
     this._burst('fx_ember', x, y, {
-      speed: { min: 20, max: 80 },
+      speed: { min: 40, max: 160 },
       scale: { start: 1, end: 0 },
       alpha: { start: 1, end: 0 },
       lifespan: { min: 260, max: 600 },
       quantity: 8,
       blendMode: 'ADD',
-      gravityY: 90
+      gravityY: 180
     });
-    this._burst('fx_smoke', x, y - 2, {
-      speed: { min: 6, max: 26 },
+    this._burst('fx_smoke', x, y - 4, {
+      speed: { min: 12, max: 52 },
       scale: { start: 0.6, end: 1.6 },
       alpha: { start: 0.55, end: 0 },
       lifespan: { min: 420, max: 800 },
       quantity: 6,
-      gravityY: -22
+      gravityY: -44
     });
 
     // A gentle camera shake for impact punch (skipped under reduced motion).

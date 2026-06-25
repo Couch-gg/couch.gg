@@ -26,7 +26,8 @@ export class Boot extends Phaser.Scene {
     for (let i = 0; i < 40; i++) {
       const x = Math.floor(rng() * WORLD_W);
       const y = Math.floor(rng() * (WORLD_H * 0.55));
-      const s = this.add.rectangle(x, y, 1, 1, 0xffffff, 0.6 + rng() * 0.4);
+      // 2x2 star dot (doubled from 1px for the 2x world).
+      const s = this.add.rectangle(x, y, 2, 2, 0xffffff, 0.6 + rng() * 0.4);
       s.setDepth(1);
       s._phase = rng() * Math.PI * 2;
       s._spd = 1.5 + rng() * 2;
@@ -58,11 +59,11 @@ export class Boot extends Phaser.Scene {
     for (let i = 0; i < 4; i++) {
       const key = 'cloud_' + (i % 3);
       const x = rng() * WORLD_W;
-      const y = 20 + rng() * 80;
+      const y = 40 + rng() * 160;
       const c = this.add.image(x, y, key);
       c.setDepth(1);
       c.setAlpha(0.55);
-      c._spd = 3 + rng() * 5;
+      c._spd = 6 + rng() * 10;
       this._clouds.push(c);
     }
   }

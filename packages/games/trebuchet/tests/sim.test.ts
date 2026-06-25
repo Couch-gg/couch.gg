@@ -164,8 +164,9 @@ test('placePlayers: deterministic for same seed', () => {
 // --- simulateShot ------------------------------------------------------------
 // V2 SIEGE: flat shots are gone. Valid elevations are 50..85 (right) and
 // 95..130 (left); the sim clamps invalid angles to the nearest valid bound.
-test('50 deg / power 100 / no wind travels > 380px horizontally', () => {
-  // Spec 7.1: a full-power 50deg shot from flat ground travels > 380px.
+test('50 deg / power 100 / no wind travels > 760px horizontally', () => {
+  // Spec 7.1: a full-power 50deg shot from flat ground travels > 760px (the old
+  // >380px guarantee, doubled for the 2x coordinate space).
   const surface = 200;
   const h = flatHeights(surface);
   const players = [];
@@ -187,7 +188,7 @@ test('50 deg / power 100 / no wind travels > 380px horizontally', () => {
     const d = Math.abs(px - launchX);
     if (d > maxDx) maxDx = d;
   }
-  assert.ok(maxDx > 380, `expected >380px horizontal travel, got ${maxDx.toFixed(1)}`);
+  assert.ok(maxDx > 760, `expected >760px horizontal travel, got ${maxDx.toFixed(1)}`);
 });
 
 test('trajectory starts at the muzzle and has multiple samples', () => {
@@ -615,9 +616,9 @@ test('buildCastles is deterministic for the same inputs', () => {
   const a = buildCastles(h, positions);
   const b = buildCastles(h, positions);
   assert.deepEqual(a, b, 'identical castles for identical inputs');
-  // Sanity: two castles, each with two 3-wide towers (16 tall) + 2 merlons.
+  // Sanity: two castles, each with two 6-wide towers (32 tall) + 2 merlons.
   assert.equal(a.length, 2, 'one castle per player');
-  const expectedBlocks = 2 * (3 * CASTLE_TOWER_H) + 2; // two towers + two merlons
+  const expectedBlocks = 2 * (6 * CASTLE_TOWER_H) + 2; // two towers + two merlons
   assert.equal(a[0].blocks.length, expectedBlocks, 'block count per castle');
   assert.equal(a[0].id, 'p0', 'castle id taken from position id');
 });
@@ -627,7 +628,7 @@ test('buildCastles places towers on the pad edges at the right offsets', () => {
   const h = flatHeights(surface);
   const castles = buildCastles(h, [{ x: 240, y: surface, id: 'p' }]);
   const cols = new Set(castles[0].blocks.map((b) => b.x));
-  for (const dx of [-11, -10, -9, 9, 10, 11]) {
+  for (const dx of [-23, -22, -21, -20, -19, -18, 18, 19, 20, 21, 22, 23]) {
     assert.ok(cols.has(240 + dx), `tower column at 240${dx >= 0 ? '+' : ''}${dx}`);
   }
   // Stone rises ABOVE the surface (smaller y), never below it.
@@ -638,7 +639,7 @@ test('buildCastles places towers on the pad edges at the right offsets', () => {
 });
 
 test('side shot into a tower terminates on the wall and shields the player', () => {
-  // Owner stands at x=300; their left tower sits at x=289..291. A descending shot
+  // Owner stands at x=300; their left tower sits at x=277..282. A descending shot
   // aimed to land on that tower must terminate on the wall (a castle hit) rather
   // than continuing down to the player/terrain below — the wall intercepts it.
   const surface = 220;
@@ -648,7 +649,7 @@ test('side shot into a tower terminates on the wall and shields the player', () 
   const castles = buildCastles(h, [{ x: ownerX, y: surface, id: 'p' }]);
 
   // Find an angle/power whose bare-terrain impact lands on the left-tower columns
-  // (289..291). Fire from the left so the round descends onto the near tower.
+  // (277..282). Fire from the left so the round descends onto the near tower.
   const launchX = ownerX - 70;
   let shot = null;
   for (let power = 30; power <= 100 && !shot; power += 2) {
@@ -657,7 +658,7 @@ test('side shot into a tower terminates on the wall and shields the player', () 
         shooterId: 's', x: launchX, y: surface, angle: ang, power,
         wind: 0, heights: h, players: [],
       });
-      if (probe.impact && probe.impact.x >= 289 && probe.impact.x <= 291) {
+      if (probe.impact && probe.impact.x >= 277 && probe.impact.x <= 282) {
         shot = { ang, power };
       }
     }
@@ -676,7 +677,7 @@ test('side shot into a tower terminates on the wall and shields the player', () 
   });
   assert.ok(bare.impact && walled.impact, 'both shots impact');
   assert.ok(
-    walled.impact.y < bare.impact.y - 2,
+    walled.impact.y < bare.impact.y - 4,
     `wall stops the round higher up (walled y ${walled.impact.y} < bare y ${bare.impact.y})`
   );
   // The wall is hit -> resolving castle damage records a loss for the owner.
@@ -743,12 +744,12 @@ test('floating blocks collapse after a crater bite under a tower', () => {
   const blocks = castles[0].blocks;
   const totalBefore = blocks.filter((b) => !b.destroyed).length;
 
-  // Carve a deep crater straight down under the LEFT tower column (x=240-10=230)
-  // WITHOUT a blast impact on the blocks themselves — we want collapse, not
-  // direct blast, to be the cause of destruction. Lower the terrain far below the
-  // tower base so the whole tower is left floating.
-  for (let x = 225; x <= 235; x++) {
-    if (x >= 0 && x < WORLD_W) h[x] = surface + 30; // ground drops 30px under the tower
+  // Carve a deep crater straight down under the LEFT tower (cols 240-23..240-18 =
+  // 217..222) WITHOUT a blast impact on the blocks themselves — we want collapse,
+  // not direct blast, to be the cause of destruction. Lower the terrain far below
+  // the tower base so the whole tower is left floating (2x world: drop 60px).
+  for (let x = 212; x <= 227; x++) {
+    if (x >= 0 && x < WORLD_W) h[x] = surface + 60; // ground drops 60px under the tower
   }
 
   // resolveCastleDamage with NO blast impact (null) -> only the collapse phase
@@ -758,18 +759,18 @@ test('floating blocks collapse after a crater bite under a tower', () => {
   const lost = castleHits[0].blocks.length;
   assert.ok(lost > 0, 'collapse destroyed at least one block');
 
-  // Every left-tower block (cols 229..231) should have collapsed (unsupported,
+  // Every left-tower block (cols 217..222) should have collapsed (unsupported,
   // terrain dropped well below their bottom edge).
-  const leftCols = new Set([229, 230, 231]);
+  const leftCols = new Set([217, 218, 219, 220, 221, 222]);
   for (let bi = 0; bi < blocks.length; bi++) {
     const b = blocks[bi];
     if (leftCols.has(b.x)) {
       assert.ok(b.destroyed, `left-tower block at (${b.x},${b.y}) should have collapsed`);
     }
   }
-  // Right-tower blocks (cols 249..251) sit on intact ground -> still standing.
+  // Right-tower blocks (cols 258..263) sit on intact ground -> still standing.
   for (const b of blocks) {
-    if (b.x >= 249 && b.x <= 251) {
+    if (b.x >= 258 && b.x <= 263) {
       assert.ok(!b.destroyed, `right-tower block at (${b.x},${b.y}) should still stand`);
     }
   }

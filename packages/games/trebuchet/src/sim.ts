@@ -273,14 +273,14 @@ export function placePlayers(heights, n, seed) {
  * castle state stays identical everywhere.
  *
  * For player i at positions[i] = { x, y } (and optionally { id }): two flanking
- * towers on the pad edges. Each tower is 3 stone columns wide (1px cells),
+ * towers on the pad edges. Each tower is 6 stone columns wide (1px cells),
  * rising CASTLE_TOWER_H px from the terrain surface, topped with 1-px
- * crenellations (merlons on the two outer columns of each tower). Left tower
- * columns sit at x-11, x-10, x-9; right tower at x+9, x+10, x+11.
+ * crenellations (merlons on the outer column of each tower). Left tower columns
+ * sit at x-23..x-18; right tower at x+18..x+23.
  *
  * ANCHORING (bug fix): each tower column is anchored to THAT column's own
  * terrain surface — its bottom block's top edge is round(heights[col]) - 1.
- * The tower columns (offsets ±9..11) lie OUTSIDE the ±6 pad placePlayers
+ * The tower columns (offsets ±18..23) lie OUTSIDE the ±6 pad placePlayers
  * flattens, so on sloped terrain the column ground differs from the pad-center
  * surface. Anchoring per-column keeps every bottom block resting on its own
  * ground, so the floating-collapse phase never falsely undermines a freshly
@@ -304,8 +304,8 @@ export function buildCastles(heights, positions) {
   // Column offsets for the two towers, outer -> inner per tower. Order matters:
   // it fixes the block index layout forever.
   const towerOffsets = [
-    [-11, -10, -9], // left tower (left col is the outer/merlon col)
-    [9, 10, 11],    // right tower (right col is the outer/merlon col)
+    [-23, -22, -21, -20, -19, -18], // left tower (left col is the outer/merlon col)
+    [18, 19, 20, 21, 22, 23],       // right tower (right col is the outer/merlon col)
   ];
 
   for (let i = 0; i < positions.length; i++) {
@@ -622,7 +622,7 @@ export function settlePlayers(heights, players) {
  *      is destroyed.
  *   2. Collapse: after the crater, any intact block left floating collapses — a
  *      block is floating when its column's terrain surface has dropped below the
- *      block's bottom edge (`block.y + 1`) by more than 2 px AND there is no
+ *      block's bottom edge (`block.y + 1`) by more than 4 px AND there is no
  *      intact block directly beneath it (same column, immediately below). The
  *      pass cascades bottom-up so a collapsing lower block can unsupport the
  *      blocks above it within the same call.
@@ -688,7 +688,7 @@ export function resolveCastleDamage(castles, impact, heights) {
 
     // --- Phase 2: floating-block collapse after the crater bite. ---
     // A block floats when its column terrain dropped below its bottom edge by
-    // > 2 px AND nothing intact directly supports it from below. We process each
+    // > 4 px AND nothing intact directly supports it from below. We process each
     // column bottom-up (largest y last in screen space = lowest block first) so
     // a collapse cascades to the blocks resting on top of it in one pass.
     if (hasHeights) {
@@ -723,8 +723,9 @@ export function resolveCastleDamage(castles, impact, heights) {
           const b = blocks[bi];
           if (!b || b.destroyed) continue;
           const bottomEdge = b.y + 1; // cell occupies [y, y+1); bottom edge = y+1
-          // Terrain surface dropped below the block bottom by more than 2 px?
-          if (surface <= bottomEdge + 2) continue; // still supported by ground
+          // Terrain surface dropped below the block bottom by more than 4 px?
+          // (pixel slack scaled with the 2x world)
+          if (surface <= bottomEdge + 4) continue; // still supported by ground
           // Intact block directly beneath? (a cell whose top edge == this bottom
           // edge, i.e. block at y = bottomEdge, same column, not destroyed).
           let supported = false;
