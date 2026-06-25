@@ -57,6 +57,13 @@ export interface Lobby {
   activity: ActivityMessage[];
   chat: ChatMessage[];
   gameSession: GameSession | null;
+  lastEvent: GameEventEnvelope | null;
+}
+
+export interface GameEventEnvelope {
+  seq: number;       // monotonic per lobby; clients replay only seq > last-seen
+  at: string;        // ISO
+  event: unknown;    // the TrebuchetEvent (client casts)
 }
 
 export interface GameSession<TSnapshot = unknown> {

@@ -108,6 +108,17 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   // reference (effects can re-run when their other deps — like `player` — change).
   const handledEventRef = useRef<TrebuchetEvent | null>(null);
 
+  // A shot reaches this controller via the socket (same instance, instant) or via the
+  // polled/snapshot lobby state (cross-instance, ≤750ms). Dedupe by monotonic seq so the
+  // hit-vibration/sound effect (which keys off setLastEvent) fires exactly once — and so
+  // a remote opponent's shot still buzzes us even when its broadcast never crossed instances.
+  const lastSeenSeqRef = useRef(0);
+  const applyGameEvent = useCallback((seq: number, event: TrebuchetEvent) => {
+    if (!seq || seq <= lastSeenSeqRef.current) return;
+    lastSeenSeqRef.current = seq;
+    setLastEvent(event);
+  }, []);
+
   // --- Hold-to-repeat aim state -------------------------------------------
   const aimRepeatRef = useRef<number | null>(null);
   const aimHoldStartRef = useRef(0);
@@ -122,7 +133,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     const nextSocket = createSocket();
     setSocket(nextSocket);
     nextSocket.on('lobby:snapshot', (next: Lobby) => setLobby(next));
-    nextSocket.on('game:event', (event: TrebuchetEvent) => setLastEvent(event));
+    nextSocket.on('game:event', (p: { seq: number; event: TrebuchetEvent }) => applyGameEvent(p.seq, p.event));
 
     // Re-register this controller on every (re)connect. A phone that locks or sleeps
     // drops its socket; Socket.IO reconnects on wake and this re-emits controller:join,
@@ -160,7 +171,17 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
       nextSocket.disconnect();
       setSocket(null);
     };
-  }, [slug]);
+  }, [slug, applyGameEvent]);
+
+  // Replay the latest event carried inside the polled/snapshot lobby state — the
+  // cross-instance path. When the opponent fired on a different serverless instance the
+  // socket broadcast never reached us, but the polled lobby snapshot does. The seq-based
+  // dedup makes this safe to run on every lobby update (and feeds the hit-vibration effect).
+  useEffect(() => {
+    if (lobby?.lastEvent) {
+      applyGameEvent(lobby.lastEvent.seq, lobby.lastEvent.event as TrebuchetEvent);
+    }
+  }, [lobby?.lastEvent?.seq, applyGameEvent]);
 
   useEffect(() => {
     // Warm the shared audio engine so input handlers have it ready; respects global mute.

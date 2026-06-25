@@ -456,20 +456,23 @@ export class Game extends Phaser.Scene {
   // -- trebuchets ---------------------------------------------------------
   // Rig geometry (see sprites.js TREB_FRAME/TREB_ARM):
   //   - The static frame is 26x26 in grid data but baked at 2x (52x52 px),
-  //     origin bottom-center; the iron pivot pin sits at grid (col 17, row 10)
-  //     => (+8, -32) from that origin in the 2x-baked pixels (RIGHT-facing).
+  //     origin bottom-center; the iron pivot pin (the bright `M` at the A-frame
+  //     apex) sits at grid (col 13, row 6) => (+1, -39) from that origin in the
+  //     2x-baked pixels (RIGHT-facing). The apex is near the top-center so the
+  //     throwing arm can sweep symmetrically over the top of the frame.
   //   - The arm texture is baked with its pivot at the texture center, so it
-  //     mounts with setOrigin(0.5,0.5) and rotates about `angle`.
+  //     mounts with setOrigin(0.5,0.5) and rotates about `angle`. Its LONG
+  //     throwing/sling end (~44px baked) far outreaches its SHORT counterweight
+  //     stub (~8px baked) — classic trebuchet asymmetry.
   // Arm angles (degrees, RIGHT-facing; +angle = clockwise, screen-y down) are
   // UNCHANGED by the 2x scale (only pixel offsets/distances double):
-  //   REST    168° — long sling end cocked low to the rear (sling tip ~ grid
-  //                  row 13, matching the idle art's loaded sling), counterweight
-  //                  raised up on the short end. Reads as the idle "primed" pose.
+  //   REST    168° — long sling end cocked low to the rear, counterweight
+  //                  raised up on the short end. Reads as the "primed" pose.
   //   RELEASE -70° — long sling end whipped high over the front, CW dropped to
   //                  the rear-bottom. A ~238° over-the-top throw arc.
   // Left-facing rigs mirror X (frame.flipX, arm.flipX) and negate the angle.
-  static get TREB_PIVOT_DX() { return 8; }
-  static get TREB_PIVOT_DY() { return -32; }
+  static get TREB_PIVOT_DX() { return 1; }
+  static get TREB_PIVOT_DY() { return -39; }
   static get TREB_ARM_REST() { return 168; }
   static get TREB_ARM_RELEASE() { return -70; }
 
@@ -549,7 +552,10 @@ export class Game extends Phaser.Scene {
   _layoutWeight(t, armAngleDeg) {
     if (!t || !t.weight) return;
     const a = (armAngleDeg + 180) * Math.PI / 180; // counterweight side
-    const stub = 12; // px from pivot to the counterweight box center (2x world)
+    const stub = 14; // px from pivot to the counterweight box center (2x world).
+    // The arm's short stub reaches ~8px; the box is 16px wide, so a 14px center
+    // hangs its inner edge right at the stub end — the heavy box reads as the
+    // counterweight slung off the short arm.
     const wx = t.pivotDx + Math.cos(a) * stub;
     const wy = t.pivotDy + Math.sin(a) * stub;
     t.weight.setPosition(wx, wy);

@@ -4,6 +4,7 @@ import cors from 'cors';
 import express from 'express';
 import { Server, type ServerOptions } from 'socket.io';
 import { GAME_MANIFESTS } from '@couch/game-runtime';
+import type { TrebuchetEvent } from '@couch/trebuchet';
 import type { ControllerEvent, GameId, PlayerId, ScreenId } from '@couch/types';
 import { LobbyError, LobbyStore, RECONNECT_GRACE_MS, type LobbyRecord } from './lobbies.js';
 import { createProductionLobbyPersistence } from './persistence.js';
@@ -162,10 +163,8 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
         const slug = String(payload?.slug ?? '').toUpperCase();
         await hydrateLobby(slug);
         const event = store.startGame(slug, String(payload?.playerToken ?? ''));
-        await saveLobby(slug);
         ack?.({ ok: true, event });
-        io.to(room(slug)).emit('game:event', event);
-        emitLobby(slug);
+        await dispatchGameEvent(slug, event);
         armTurnTimer(slug);
       } catch (err) {
         ack?.(socketError(err));
@@ -199,9 +198,7 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
           io.to(room(slug)).emit('game:control', controlPreview);
         }
         if (event) {
-          await saveLobby(slug);
-          io.to(room(slug)).emit('game:event', event);
-          emitLobby(slug);
+          await dispatchGameEvent(slug, event);
           armTurnTimer(slug);
         }
       } catch (err) {
@@ -340,6 +337,18 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
     }
   }
 
+  // Centralized game-event broadcast: stamp a monotonic seq onto the lobby state,
+  // persist it (so it reaches clients on other serverless instances via their poll),
+  // and emit the seq'd envelope over the socket (instant for same-instance clients).
+  // The client dedupes by seq, so a shot animates exactly once whether it arrives
+  // via the socket or the polled snapshot.
+  async function dispatchGameEvent(slug: string, event: TrebuchetEvent): Promise<void> {
+    const seq = store.recordGameEvent(slug, event);
+    await saveLobby(slug);
+    io.to(room(slug)).emit('game:event', { seq, event });
+    emitLobby(slug);
+  }
+
   async function autoStartIfFull(slug: string): Promise<void> {
     try {
       const lobby = store.publicLobby(slug);
@@ -349,9 +358,7 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
       const host = [...store.getLobby(slug).players.values()].find((player) => player.id === lobby.hostPlayerId);
       if (!host) return;
       const event = store.startGame(slug, host.token);
-      await saveLobby(slug);
-      io.to(room(slug)).emit('game:event', event);
-      emitLobby(slug);
+      await dispatchGameEvent(slug, event);
       armTurnTimer(slug);
     } catch {
       // Manual start remains available.
@@ -372,9 +379,7 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
         await hydrateLobby(slug);
         const event = store.skipTurn(slug);
         if (event) {
-          await saveLobby(slug);
-          io.to(room(slug)).emit('game:event', event);
-          emitLobby(slug);
+          await dispatchGameEvent(slug, event);
           armTurnTimer(slug);
         }
       })();
