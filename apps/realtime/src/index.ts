@@ -206,9 +206,11 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
       }
     });
 
-    socket.on('screen:register', (payload: { screenId?: string }, ack?: (value: unknown) => void) => {
+    socket.on('screen:register', async (payload: { screenId?: string }, ack?: (value: unknown) => void) => {
       try {
+        if (payload?.screenId) await hydrateScreen(payload.screenId);
         const record = screens.registerOrReuse(payload?.screenId);
+        await saveScreen(record.id);
         ctx = { role: 'screen-pairing', slug: '', screenId: record.id };
         socket.join(screenRoom(record.id));
         ack?.({ ok: true, screen: screens.toPublic(record) });
@@ -223,7 +225,10 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
         const slug = String(payload?.slug ?? '').toUpperCase();
         await hydrateLobby(slug);
         store.getLobby(slug);
-        const record = screens.claim(String(payload?.screenId ?? ''), slug);
+        const screenId = String(payload?.screenId ?? '');
+        await hydrateScreen(screenId);
+        const record = screens.claim(screenId, slug);
+        await saveScreen(record.id);
         ack?.({ ok: true, screen: screens.toPublic(record) });
         io.to(screenRoom(record.id)).emit('screen:claimed', { screenId: record.id, slug });
       } catch (err) {
@@ -231,9 +236,11 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
       }
     });
 
-    socket.on('screen:claim-status', (payload: { screenId?: string }, ack?: (value: unknown) => void) => {
+    socket.on('screen:claim-status', async (payload: { screenId?: string }, ack?: (value: unknown) => void) => {
       try {
-        const record = screens.get(String(payload?.screenId ?? ''));
+        const screenId = String(payload?.screenId ?? '');
+        await hydrateScreen(screenId);
+        const record = screens.get(screenId);
         ack?.({
           ok: true,
           screen: record
@@ -284,16 +291,18 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
     });
   });
 
-  app.post(`${apiPrefix}/screens`, (_req, res) => {
+  app.post(`${apiPrefix}/screens`, async (_req, res) => {
     try {
       const record = screens.register();
+      await saveScreen(record.id);
       res.status(201).json({ screen: screens.toPublic(record) });
     } catch (err) {
       sendHttpError(res, err);
     }
   });
 
-  app.get(`${apiPrefix}/screens/:id`, (req, res) => {
+  app.get(`${apiPrefix}/screens/:id`, async (req, res) => {
+    await hydrateScreen(req.params.id);
     const record = screens.get(req.params.id);
     if (record) res.json({ screen: { ...screens.toPublic(record), expired: false } });
     else res.json({ screen: { id: req.params.id, expiresAt: new Date().toISOString(), claimedSlug: null, expired: true } });
@@ -304,7 +313,9 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
       const slug = String(req.body?.slug ?? '').toUpperCase();
       await hydrateLobby(slug);
       store.getLobby(slug);
+      await hydrateScreen(req.params.id);
       const record = screens.claim(req.params.id, slug);
+      await saveScreen(req.params.id);
       io.to(screenRoom(req.params.id)).emit('screen:claimed', { screenId: req.params.id, slug });
       res.status(200).json({ screen: screens.toPublic(record) });
     } catch (err) {
@@ -408,6 +419,19 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   async function deleteLobby(slug: string): Promise<void> {
     if (!persistence.enabled) return;
     await persistence.delete(slug);
+  }
+
+  async function hydrateScreen(id: string): Promise<void> {
+    if (!persistence.enabled || !id) return;
+    const rec = await persistence.loadScreen(id);
+    if (rec) screens.hydrate(rec);
+    else screens.screens.delete(id);
+  }
+
+  async function saveScreen(id: string): Promise<void> {
+    if (!persistence.enabled) return;
+    const rec = screens.get(id);
+    if (rec) await persistence.saveScreen(rec);
   }
 
   return { app, io, server, store };

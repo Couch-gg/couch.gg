@@ -6,12 +6,21 @@ import {
   type LobbyRecord,
   type SerializedLobbyRecord
 } from './lobbies.js';
+import { SCREEN_CLAIM_GRACE_MS, type ScreenRecord } from './screens.js';
 
 export interface LobbyPersistence {
   enabled: boolean;
   delete(slug: string): Promise<void>;
   load(slug: string): Promise<LobbyRecord | null>;
   save(lobby: LobbyRecord): Promise<void>;
+  loadScreen(id: string): Promise<ScreenRecord | null>;
+  saveScreen(record: ScreenRecord): Promise<void>;
+  deleteScreen(id: string): Promise<void>;
+}
+
+// A claimed screen lives until claimedAt + grace; an unclaimed one until expiresAt.
+function screenDeadline(record: ScreenRecord): number {
+  return record.claimedAt != null ? record.claimedAt + SCREEN_CLAIM_GRACE_MS : record.expiresAt;
 }
 
 export function createLobbyPersistence(redisUrl = process.env.REDIS_URL): LobbyPersistence {
@@ -31,7 +40,12 @@ const disabledPersistence: LobbyPersistence = {
   async load() {
     return null;
   },
-  async save() {}
+  async save() {},
+  async loadScreen() {
+    return null;
+  },
+  async saveScreen() {},
+  async deleteScreen() {}
 };
 
 class RedisLobbyPersistence implements LobbyPersistence {
@@ -64,6 +78,30 @@ class RedisLobbyPersistence implements LobbyPersistence {
     await client.del(key(slug));
   }
 
+  async loadScreen(id: string): Promise<ScreenRecord | null> {
+    const client = await this.client();
+    const raw = await client.get(screenKey(id));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as ScreenRecord;
+    if (screenDeadline(parsed) <= Date.now()) {
+      await this.deleteScreen(id);
+      return null;
+    }
+    return parsed;
+  }
+
+  async saveScreen(record: ScreenRecord): Promise<void> {
+    const client = await this.client();
+    await client.set(screenKey(record.id), JSON.stringify(record), {
+      PXAT: screenDeadline(record)
+    });
+  }
+
+  async deleteScreen(id: string): Promise<void> {
+    const client = await this.client();
+    await client.del(screenKey(id));
+  }
+
   private async client(): Promise<RedisClientType> {
     if (!this.clientPromise) {
       const client = createClient({ url: this.redisUrl });
@@ -80,6 +118,12 @@ interface QueueSnapshotMessage {
   kind: 'snapshot';
   at: number;
   lobby: SerializedLobbyRecord;
+}
+
+interface QueueScreenMessage {
+  kind: 'screen';
+  at: number;
+  record: ScreenRecord;
 }
 
 class QueueLobbyPersistence implements LobbyPersistence {
@@ -143,10 +187,70 @@ class QueueLobbyPersistence implements LobbyPersistence {
     });
     await this.save(expired);
   }
+
+  async loadScreen(id: string): Promise<ScreenRecord | null> {
+    let latest: QueueScreenMessage | null = null;
+    const consumerGroup = `loader_${id}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+
+    for (let batch = 0; batch < 50; batch++) {
+      const result = await this.queue.receive<QueueScreenMessage>(
+        screenTopic(id),
+        consumerGroup,
+        (message) => {
+          if (message.kind === 'screen') latest = message;
+        },
+        { limit: 10, visibilityTimeoutSeconds: 30 }
+      );
+      if (!result.ok) break;
+    }
+
+    const message = latest as QueueScreenMessage | null;
+    if (!message) return null;
+    if (screenDeadline(message.record) <= Date.now()) return null;
+    return message.record;
+  }
+
+  async saveScreen(record: ScreenRecord): Promise<void> {
+    await this.queue.send<QueueScreenMessage>(
+      screenTopic(record.id),
+      {
+        kind: 'screen',
+        at: Date.now(),
+        record
+      },
+      {
+        retentionSeconds: screenRetentionSeconds(record),
+        idempotencyKey: `${record.id}-${Date.now()}-${Math.random().toString(36).slice(2)}`
+      }
+    );
+  }
+
+  async deleteScreen(id: string): Promise<void> {
+    await this.saveScreen({
+      id,
+      createdAt: Date.now(),
+      expiresAt: Date.now() - 1,
+      claimedSlug: null,
+      claimedAt: null
+    });
+  }
 }
 
 function key(slug: string): string {
   return `couch:lobby:${slug.toUpperCase()}`;
+}
+
+function screenKey(id: string): string {
+  return `couch:screen:${id}`;
+}
+
+function screenTopic(id: string): string {
+  return `couch_screen_${id}`;
+}
+
+function screenRetentionSeconds(record: ScreenRecord): number {
+  const seconds = Math.ceil((screenDeadline(record) - Date.now()) / 1000);
+  return Math.min(604800, Math.max(60, seconds));
 }
 
 function topic(slug: string): string {
