@@ -129,7 +129,17 @@ export function createRoomName(slug: string): string {
 
 export function randomSlug(length = 6): string {
   const alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+  const cryptoRef = globalThis.crypto;
   let out = '';
+  if (cryptoRef?.getRandomValues) {
+    // Use the OS CSPRNG (like createId). Math.random() can emit the SAME sequence
+    // across snapshot-restored serverless instances, which produced duplicate room
+    // codes; getRandomValues is seeded from the OS and immune to that.
+    const bytes = new Uint8Array(length);
+    cryptoRef.getRandomValues(bytes);
+    for (let i = 0; i < length; i++) out += alphabet[bytes[i] % alphabet.length];
+    return out;
+  }
   for (let i = 0; i < length; i++) {
     out += alphabet[Math.floor(Math.random() * alphabet.length)];
   }
