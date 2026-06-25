@@ -20,8 +20,10 @@ import {
   POWER_MAX,
   POWER_MIN,
   TEAM_COLORS,
+  WORLD_W,
   type TrebuchetEvent,
-  type TrebuchetSnapshot
+  type TrebuchetSnapshot,
+  type TrebuchetUnit
 } from '@couch/trebuchet';
 import { GameCatalog } from '../components/GameCatalog.js';
 import { ChatPanel } from '../components/ChatPanel.js';
@@ -41,6 +43,7 @@ interface SfxModule {
 
 let sfxPromise: Promise<SfxModule | null> | null = null;
 const REMOTE_SHARE_KEY_PREFIX = 'couch:share-room:';
+const DEFAULT_AIM_ELEVATION = 72;
 
 function loadSfx(): Promise<SfxModule | null> {
   if (sfxPromise) return sfxPromise;
@@ -89,6 +92,8 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   const chargeStartRef = useRef<number | null>(null);
   const chargeTimerRef = useRef<number | null>(null);
   const lastChargeSendRef = useRef(0);
+  const rememberedAnglesRef = useRef<Record<string, number>>({});
+  const lastTurnAimKeyRef = useRef<string | null>(null);
 
   // Retro button sounds. Loaded once on mount into a ref (not state) so input
   // handlers can fire it synchronously without triggering re-renders; null until
@@ -229,6 +234,18 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   const currentTurn = snapshot?.turn;
   const myTurn = Boolean(player && currentTurn === player.id);
   const canStart = Boolean(isHost && lobby && lobby.players.length >= 2 && lobby.state !== 'playing');
+  const myUnit = player ? snapshot?.units.find((unit) => unit.id === player.id) : undefined;
+
+  useEffect(() => {
+    if (!player || !myTurn || !snapshot || !myUnit) return;
+    const turnKey = [snapshot.seed, snapshot.turn, snapshot.turnEndsAt ?? 0].join(':');
+    if (lastTurnAimKeyRef.current === turnKey) return;
+    lastTurnAimKeyRef.current = turnKey;
+    const nextAngle = rememberedAnglesRef.current[player.id] ?? defaultAimForUnit(myUnit);
+    angleRef.current = nextAngle;
+    setAngle(nextAngle);
+    setPower(POWER_MIN);
+  }, [myTurn, myUnit, player, snapshot]);
 
   const start = async () => {
     if (!socket) return;
@@ -304,7 +321,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     setShareRoomOpen(false);
   };
 
-  const sendPreview = async (control: 'trebuchet.aim' | 'trebuchet.charge', value: unknown) => {
+  const sendPreview = useCallback(async (control: 'trebuchet.aim' | 'trebuchet.charge', value: unknown) => {
     if (!socket || !myTurn) return;
     try {
       await emitAck(socket, 'controller:event', {
@@ -321,7 +338,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     } catch {
       // Preview events are best-effort; final fire remains acknowledged below.
     }
-  };
+  }, [myTurn, player?.id, playerToken, slug, socket]);
 
   // Apply a raw angle (already snapped) and broadcast the aim preview.
   const applyAngle = useCallback(
@@ -329,12 +346,10 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
       if (nextAngle === angleRef.current) return;
       sfxRef.current?.play('aim');
       setAngle(nextAngle);
+      if (player?.id) rememberedAnglesRef.current[player.id] = nextAngle;
       void sendPreview('trebuchet.aim', { angle: nextAngle, direction, step: aimStep });
     },
-    // sendPreview closes over myTurn/socket; we intentionally keep deps lean and
-    // read fresh values via refs/state inside the callback at call time.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [aimStep]
+    [aimStep, player?.id, sendPreview]
   );
 
   // Step the arc by `direction` button-presses worth of `aimStep`.
@@ -803,6 +818,10 @@ function tokenKey(slug: string): string {
 function turnName(snapshot: TrebuchetSnapshot | undefined, playerId: string | null | undefined): string {
   if (!snapshot || !playerId) return 'Game over';
   return snapshot.units.find((unit) => unit.id === playerId)?.name ?? 'Player';
+}
+
+function defaultAimForUnit(unit: Pick<TrebuchetUnit, 'x'>): number {
+  return unit.x > WORLD_W / 2 ? 180 - DEFAULT_AIM_ELEVATION : DEFAULT_AIM_ELEVATION;
 }
 
 // Guarded haptics: no-op when the device/browser does not support vibration.

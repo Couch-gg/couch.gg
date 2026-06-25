@@ -95,6 +95,8 @@ export function TrebuchetStage({ snapshot, event, controlEvent = null, compact =
       const WORLD_W = constantsModule.WORLD_W as number;
       const WORLD_H = constantsModule.WORLD_H as number;
       let lastStartKey: string | null = null;
+      let lastSnapshotRevision: string | null = null;
+      let healedSnapshotRevision: string | null = null;
       let lastEvent: StageProps['event'] = null;
       let lastControlEvent: TrebuchetControlEvent | null = null;
 
@@ -129,15 +131,33 @@ export function TrebuchetStage({ snapshot, event, controlEvent = null, compact =
         sync(nextSnapshot, nextEvent, nextControlEvent) {
           if (nextSnapshot) {
             const key = startKey(nextSnapshot);
+            const revision = snapshotRevision(nextSnapshot);
+            const eventSnapshot = snapshotFromEvent(nextEvent);
+            const eventRevision = eventSnapshot ? snapshotRevision(eventSnapshot) : null;
             if (!lastStartKey || nextEvent?.type === 'start' || key !== lastStartKey) {
               lastStartKey = key;
+              lastSnapshotRevision = revision;
+              healedSnapshotRevision = null;
+              net.emit('start', toOriginalStart(nextSnapshot));
+            } else if (revision !== lastSnapshotRevision && revision !== eventRevision) {
+              lastSnapshotRevision = revision;
+              healedSnapshotRevision = revision;
               net.emit('start', toOriginalStart(nextSnapshot));
             }
           }
 
           if (nextEvent && nextEvent !== lastEvent) {
             lastEvent = nextEvent;
-            if (nextEvent.type !== 'start') emitOriginalEvent(net, nextEvent);
+            const eventSnapshot = snapshotFromEvent(nextEvent);
+            const eventRevision = eventSnapshot ? snapshotRevision(eventSnapshot) : null;
+            if (eventRevision && eventRevision === healedSnapshotRevision) {
+              healedSnapshotRevision = null;
+              lastSnapshotRevision = eventRevision;
+            } else {
+              healedSnapshotRevision = null;
+              if (eventRevision) lastSnapshotRevision = eventRevision;
+              if (nextEvent.type !== 'start') emitOriginalEvent(net, nextEvent);
+            }
           }
 
           if (nextControlEvent && nextControlEvent !== lastControlEvent) {
@@ -181,6 +201,8 @@ export function TrebuchetStage({ snapshot, event, controlEvent = null, compact =
       ref={containerRef}
       data-testid="trebuchet-stage"
       data-phase={snapshot?.phase ?? 'empty'}
+      data-turn={snapshot?.turn ?? ''}
+      data-snapshot-rev={snapshot ? snapshotRevision(snapshot) : ''}
     />
   );
 }
@@ -260,4 +282,44 @@ function emitOriginalEvent(net: OriginalNet, event: StageProps['event']): void {
 
 function startKey(snapshot: TrebuchetSnapshot): string {
   return [snapshot.seed, snapshot.order.join(','), snapshot.units.map((unit) => unit.id).join(',')].join(':');
+}
+
+function snapshotFromEvent(event: StageProps['event']): TrebuchetSnapshot | null {
+  if (!event) return null;
+  if (event.type === 'snapshot' || event.type === 'start') return event.snapshot;
+  if (event.type === 'shot') return event.snapshot ?? null;
+  if (event.type === 'turn') return event.snapshot ?? null;
+  return null;
+}
+
+function snapshotRevision(snapshot: TrebuchetSnapshot): string {
+  return JSON.stringify({
+    phase: snapshot.phase,
+    turn: snapshot.turn,
+    wind: snapshot.wind,
+    turnEndsAt: snapshot.turnEndsAt ?? 0,
+    winner: snapshot.winner ?? null,
+    draw: Boolean(snapshot.draw),
+    units: snapshot.units.map((unit) => [
+      unit.id,
+      Math.round(unit.x),
+      Math.round(unit.y),
+      unit.hp,
+      unit.alive
+    ]),
+    heights: checksumNumbers(snapshot.heights),
+    castles: snapshot.castles.map((castle) => [
+      castle.id,
+      castle.blocks.reduce((count, block) => count + (block.destroyed ? 1 : 0), 0)
+    ])
+  });
+}
+
+function checksumNumbers(values: number[]): number {
+  let hash = 2166136261;
+  for (const value of values) {
+    hash ^= Math.round(value) & 0xff;
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
 }

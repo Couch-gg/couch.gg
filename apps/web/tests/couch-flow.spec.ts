@@ -1,4 +1,15 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
+
+async function holdAndReleaseFire(page: Page) {
+  const fireButton = page.getByRole('button', { name: /Hold to charge and fire/i });
+  await expect(fireButton).toBeEnabled({ timeout: 15_000 });
+  const box = await fireButton.boundingBox();
+  expect(box).not.toBeNull();
+  await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
+  await page.mouse.down();
+  await page.waitForTimeout(450);
+  await page.mouse.up();
+}
 
 test('standalone Trebuchet test route renders and fires a shot', async ({ page }) => {
   await page.goto('/games/trebuchet');
@@ -165,6 +176,34 @@ test('remote couch pairs each player screen by room number', async ({ browser })
   await expect(guestTv).toHaveURL(new RegExp('/l/' + slug), { timeout: 15_000 });
   await expect(guestTv.locator('.player-name', { hasText: 'Bea' })).toBeVisible({ timeout: 15_000 });
   await expect(hostTv.locator('.player-name', { hasText: 'Bea' })).toBeVisible({ timeout: 15_000 });
+
+  await hostPhone.locator('.game-card', { hasText: 'Trebuchet' }).click();
+  const startBtn = hostPhone.getByRole('button', { name: /Trebuchet starten/i });
+  await expect(startBtn).toBeEnabled();
+  await startBtn.click();
+
+  const hostStage = hostTv.getByTestId('trebuchet-stage');
+  const guestStage = guestTv.getByTestId('trebuchet-stage');
+  await expect(hostStage).toHaveAttribute('data-phase', 'running', { timeout: 20_000 });
+  await expect(guestStage).toHaveAttribute('data-phase', 'running', { timeout: 20_000 });
+  await expect(hostPhone.locator('.turn-state')).toBeVisible({ timeout: 20_000 });
+  await expect(guestPhone.locator('.turn-state')).toBeVisible({ timeout: 20_000 });
+
+  const beforeRevision = await hostStage.getAttribute('data-snapshot-rev');
+  expect(beforeRevision).toBeTruthy();
+  const hostTurnText = await hostPhone.locator('.turn-state').textContent();
+  const activePhone = /YOUR TURN/i.test(hostTurnText ?? '') ? hostPhone : guestPhone;
+  const otherPhone = activePhone === hostPhone ? guestPhone : hostPhone;
+
+  await holdAndReleaseFire(activePhone);
+  await expect(activePhone.locator('.last-shot')).toBeVisible({ timeout: 30_000 });
+  await expect(otherPhone.locator('.last-shot')).toBeVisible({ timeout: 30_000 });
+  await expect
+    .poll(() => hostStage.getAttribute('data-snapshot-rev'), { timeout: 30_000 })
+    .not.toBe(beforeRevision);
+  const afterRevision = await hostStage.getAttribute('data-snapshot-rev');
+  expect(afterRevision).toBeTruthy();
+  await expect(guestStage).toHaveAttribute('data-snapshot-rev', afterRevision!, { timeout: 20_000 });
 
   await hostTv.close();
   await hostPhone.close();
