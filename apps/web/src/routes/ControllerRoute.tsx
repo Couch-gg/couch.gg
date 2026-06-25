@@ -19,6 +19,7 @@ import {
   ELEV_MIN,
   POWER_MAX,
   POWER_MIN,
+  TEAM_COLORS,
   type TrebuchetEvent,
   type TrebuchetSnapshot
 } from '@couch/trebuchet';
@@ -26,6 +27,35 @@ import { GameCatalog } from '../components/GameCatalog.js';
 import { ChatPanel } from '../components/ChatPanel.js';
 import { fetchLobby, sendChat } from '../api.js';
 import { createSocket, emitAck } from '../socket.js';
+
+// The audio engine lives in public/ (served at /js/sfx.js), not in src/, so it must be loaded via a
+// runtime dynamic import rather than a static one. We wrap import() in `new Function` so Vite leaves
+// the specifier untouched (same approach LobbyRoute/TrebuchetStage use for public modules). The module
+// is a shared singleton — the Phaser game imports the same URL — so it also respects the global mute.
+interface SfxModule {
+  play: (name: string) => void;
+  startCharge: () => void;
+  setChargeLevel: (p01: number) => void;
+  stopCharge: () => void;
+}
+
+let sfxPromise: Promise<SfxModule | null> | null = null;
+
+function loadSfx(): Promise<SfxModule | null> {
+  if (sfxPromise) return sfxPromise;
+  sfxPromise = (async () => {
+    try {
+      if (typeof window === 'undefined') return null;
+      const importer = new Function('p', 'return import(p)') as (p: string) => Promise<any>;
+      const mod = await importer('/js/sfx.js');
+      return (mod?.SFX ?? mod?.default ?? null) as SfxModule | null;
+    } catch {
+      // Audio is optional — never let a load failure break the controller.
+      return null;
+    }
+  })();
+  return sfxPromise;
+}
 
 export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (to: string) => void }) {
   const [name, setName] = useState(() => window.localStorage.getItem('couch:name') || '');
@@ -47,6 +77,14 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   const chargeStartRef = useRef<number | null>(null);
   const chargeTimerRef = useRef<number | null>(null);
   const lastChargeSendRef = useRef(0);
+
+  // Retro button sounds. Loaded once on mount into a ref (not state) so input
+  // handlers can fire it synchronously without triggering re-renders; null until
+  // the public module resolves, so every call site optional-chains it.
+  const sfxRef = useRef<SfxModule | null>(null);
+  // Guards the "I got hit" haptic/audio effect from re-firing on the same event
+  // reference (effects can re-run when their other deps — like `player` — change).
+  const handledEventRef = useRef<TrebuchetEvent | null>(null);
 
   // --- Hold-to-repeat aim state -------------------------------------------
   const aimRepeatRef = useRef<number | null>(null);
@@ -103,6 +141,10 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   }, [slug]);
 
   useEffect(() => {
+    // Warm the shared audio engine so input handlers have it ready; respects global mute.
+    void loadSfx().then((m) => {
+      sfxRef.current = m;
+    });
     return () => {
       stopChargeTimer();
       stopAimRepeat();
@@ -230,6 +272,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   const applyAngle = useCallback(
     (nextAngle: number, direction: -1 | 0 | 1) => {
       if (nextAngle === angleRef.current) return;
+      sfxRef.current?.play('aim');
       setAngle(nextAngle);
       void sendPreview('trebuchet.aim', { angle: nextAngle, direction, step: aimStep });
     },
@@ -345,6 +388,8 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     // A new charge cancels any in-progress aim repeat.
     stopAimRepeat();
     haptic(15);
+    sfxRef.current?.play('click');
+    sfxRef.current?.startCharge();
     const now = performance.now();
     chargeStartRef.current = now;
     lastChargeSendRef.current = now;
@@ -356,6 +401,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     chargeTimerRef.current = window.setInterval(() => {
       const nextPower = chargePower();
       setPower(nextPower);
+      sfxRef.current?.setChargeLevel(nextPower / 100);
       const tick = performance.now();
       if (tick - lastChargeSendRef.current > 120 || nextPower >= POWER_MAX) {
         lastChargeSendRef.current = tick;
@@ -364,6 +410,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
       if (nextPower >= POWER_MAX) {
         setAtFull(true);
         haptic([30, 40, 30]);
+        sfxRef.current?.play('charge_full');
         void releaseCharge();
       }
     }, 40);
@@ -378,6 +425,8 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     setAtFull(false);
     setPower(shotPower);
     haptic(45);
+    sfxRef.current?.stopCharge();
+    sfxRef.current?.play('fire');
     await sendPreview('trebuchet.charge', { active: false, power: shotPower });
     await fire(shotPower);
   };
@@ -385,6 +434,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   const cancelCharge = () => {
     if (chargeStartRef.current == null) return;
     stopChargeTimer();
+    sfxRef.current?.stopCharge();
     chargeStartRef.current = null;
     setCharging(false);
     setAtFull(false);
@@ -414,6 +464,27 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [myTurn]);
 
+  // Buzz + sound when THIS player takes damage or dies on the latest shot. `haptic`
+  // is iOS-safe (silent no-op there), so the audio cue doubles as the iOS fallback.
+  // We dedupe on the event reference so it never re-fires when `player` changes.
+  useEffect(() => {
+    if (!player || !lastEvent || lastEvent.type !== 'shot') return;
+    if (handledEventRef.current === lastEvent) return;
+    handledEventRef.current = lastEvent;
+    const r = lastEvent.result;
+    const died = r.deaths.includes(player.id);
+    const unit = r.hits.find((h) => h.id === player.id);
+    const castle = r.castleHits.find((h) => h.id === player.id);
+    if (died) {
+      haptic([60, 50, 120]);
+      sfxRef.current?.play('death');
+    } else if (unit || castle) {
+      const dmg = (unit?.dmg ?? 0) + (castle?.dmg ?? 0);
+      haptic(dmg >= 20 ? [40, 30, 40] : 25);
+      sfxRef.current?.play(dmg >= 20 ? 'bighit' : 'hit');
+    }
+  }, [lastEvent, player]);
+
   if (!player) {
     return (
       <main className="controller-shell">
@@ -434,6 +505,10 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   }
 
   const aiming = arcInfo(angle);
+
+  // This player's team color (game palette) for the handheld's active-turn LED / accent.
+  const colorIdx = snapshot?.units.find((unit) => unit.id === player.id)?.colorIdx ?? 0;
+  const teamHex = `#${TEAM_COLORS[colorIdx % TEAM_COLORS.length].toString(16).padStart(6, '0')}`;
 
   return (
     <main className="controller-shell">
@@ -487,129 +562,143 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
             </div>
           </div>
         ) : (
-          <div className="trebuchet-controls">
-            <div className={myTurn ? 'turn-card active' : 'turn-card'}>
-              <span>{myTurn ? 'Your turn' : 'Waiting'}</span>
-              <strong>{turnName(snapshot, currentTurn)}</strong>
-            </div>
-
-            {/* AIM: elevation gauge + drag + hold-repeat buttons */}
-            <div className="aim-block" aria-label="Trebuchet aim controls">
-              <div className="aim-headline">
-                <span className="aim-side-label">
-                  <Crosshair size={14} /> {aiming.side === 'left' ? 'Firing LEFT' : 'Firing RIGHT'}
-                </span>
-                <span className="aim-elev-label">
-                  <strong>{aiming.elevation}°</strong> elevation
-                </span>
+          <div className="trebuchet-controls retro-pad" style={{ ['--team' as never]: teamHex }}>
+            <div className="retro-pad-shell">
+              {/* Console brand + status LED strip */}
+              <div className="retro-pad-brand">
+                <span className={myTurn ? 'retro-led on' : 'retro-led'} aria-hidden="true" />
+                <span className="retro-pad-name">COUCH.GG</span>
+                <span className="retro-pad-model" aria-hidden="true">TREB-01</span>
               </div>
 
-              <div className="aim-pad">
-                <button
-                  type="button"
-                  className="aim-btn"
-                  disabled={!myTurn || charging}
-                  onPointerDown={(e) => {
-                    e.preventDefault();
-                    startAimRepeat(1);
-                  }}
-                  onPointerUp={stopAimRepeat}
-                  onPointerLeave={stopAimRepeat}
-                  onPointerCancel={stopAimRepeat}
-                  aria-label="Aim left"
-                >
-                  <ChevronLeft size={30} />
-                </button>
+              <div className={myTurn ? 'turn-card active' : 'turn-card'}>
+                <span className="turn-led" aria-hidden="true" />
+                <span className="turn-state">{myTurn ? 'YOUR TURN' : 'WAITING'}</span>
+                <strong>{turnName(snapshot, currentTurn)}</strong>
+              </div>
 
-                <div
-                  ref={gaugeRef}
-                  className={`elev-gauge${myTurn && !charging ? '' : ' disabled'} side-${aiming.side}`}
-                  role="slider"
-                  aria-label="Elevation"
-                  aria-valuemin={ELEV_MIN}
-                  aria-valuemax={ELEV_MAX}
-                  aria-valuenow={aiming.elevation}
-                  aria-valuetext={`${aiming.elevation} degrees, firing ${aiming.side}`}
-                  aria-orientation="vertical"
-                  tabIndex={myTurn && !charging ? 0 : -1}
-                  onPointerDown={onGaugePointerDown}
-                  onPointerMove={onGaugePointerMove}
-                  onPointerUp={onGaugePointerUp}
-                  onPointerCancel={onGaugePointerUp}
-                  onKeyDown={(e) => {
-                    if (!myTurn || charging) return;
-                    if (e.key === 'ArrowUp' || e.key === 'ArrowRight') {
-                      e.preventDefault();
-                      aimStepBy(aiming.side === 'left' ? -1 : 1, aimStep);
-                    } else if (e.key === 'ArrowDown' || e.key === 'ArrowLeft') {
-                      e.preventDefault();
-                      aimStepBy(aiming.side === 'left' ? 1 : -1, aimStep);
-                    }
-                  }}
-                >
-                  <div className="elev-fill" style={{ height: `${aiming.fillPct}%` }} />
-                  <div className="elev-needle" style={{ bottom: `${aiming.fillPct}%` }}>
-                    <span className="elev-needle-val">{aiming.elevation}°</span>
-                  </div>
-                  <span className="elev-tick top">{ELEV_MAX}°</span>
-                  <span className="elev-tick bottom">{ELEV_MIN}°</span>
-                  <span className="elev-hint">drag</span>
+              {/* AIM: D-pad arrows + segmented LED elevation meter */}
+              <div className="aim-block" aria-label="Trebuchet aim controls">
+                <div className="aim-headline">
+                  <span className="aim-side-label">
+                    <Crosshair size={14} /> {aiming.side === 'left' ? 'Firing LEFT' : 'Firing RIGHT'}
+                  </span>
+                  <span className="aim-elev-label">
+                    <strong>{aiming.elevation}°</strong> elevation
+                  </span>
                 </div>
 
+                <div className="aim-pad">
+                  <button
+                    type="button"
+                    className="aim-btn dpad-btn dpad-up"
+                    disabled={!myTurn || charging}
+                    onPointerDown={(e) => {
+                      e.preventDefault();
+                      startAimRepeat(1);
+                    }}
+                    onPointerUp={stopAimRepeat}
+                    onPointerLeave={stopAimRepeat}
+                    onPointerCancel={stopAimRepeat}
+                    aria-label="Aim left"
+                  >
+                    <ChevronLeft size={30} />
+                  </button>
+
+                  <div
+                    ref={gaugeRef}
+                    className={`elev-gauge${myTurn && !charging ? '' : ' disabled'} side-${aiming.side}`}
+                    role="slider"
+                    aria-label="Elevation"
+                    aria-valuemin={ELEV_MIN}
+                    aria-valuemax={ELEV_MAX}
+                    aria-valuenow={aiming.elevation}
+                    aria-valuetext={`${aiming.elevation} degrees, firing ${aiming.side}`}
+                    aria-orientation="vertical"
+                    tabIndex={myTurn && !charging ? 0 : -1}
+                    onPointerDown={onGaugePointerDown}
+                    onPointerMove={onGaugePointerMove}
+                    onPointerUp={onGaugePointerUp}
+                    onPointerCancel={onGaugePointerUp}
+                    onKeyDown={(e) => {
+                      if (!myTurn || charging) return;
+                      if (e.key === 'ArrowUp' || e.key === 'ArrowRight') {
+                        e.preventDefault();
+                        aimStepBy(aiming.side === 'left' ? -1 : 1, aimStep);
+                      } else if (e.key === 'ArrowDown' || e.key === 'ArrowLeft') {
+                        e.preventDefault();
+                        aimStepBy(aiming.side === 'left' ? 1 : -1, aimStep);
+                      }
+                    }}
+                  >
+                    <div className="elev-segments" aria-hidden="true" />
+                    <div className="elev-fill" style={{ height: `${aiming.fillPct}%` }} />
+                    <div className="elev-needle" style={{ bottom: `${aiming.fillPct}%` }}>
+                      <span className="elev-needle-val">{aiming.elevation}°</span>
+                    </div>
+                    <span className="elev-tick top">{ELEV_MAX}°</span>
+                    <span className="elev-tick bottom">{ELEV_MIN}°</span>
+                    <span className="elev-hint">drag</span>
+                  </div>
+
+                  <button
+                    type="button"
+                    className="aim-btn dpad-btn dpad-down"
+                    disabled={!myTurn || charging}
+                    onPointerDown={(e) => {
+                      e.preventDefault();
+                      startAimRepeat(-1);
+                    }}
+                    onPointerUp={stopAimRepeat}
+                    onPointerLeave={stopAimRepeat}
+                    onPointerCancel={stopAimRepeat}
+                    aria-label="Aim right"
+                  >
+                    <ChevronRight size={30} />
+                  </button>
+                </div>
+
+                <div className="aim-foot">
+                  <span className="aim-arc-text">ARC {aiming.side === 'left' ? '◄' : '►'} {angle}°</span>
+                  <button
+                    type="button"
+                    className="step-toggle"
+                    onClick={() => setAimStep((value) => (value === 1 ? 5 : 1))}
+                    aria-label={`Aim step ${aimStep} degrees, tap to toggle`}
+                  >
+                    Step {aimStep}°
+                  </button>
+                </div>
+              </div>
+
+              {/* CHARGE + FIRE: big round A button (+ decorative B label) */}
+              <div className="action-row">
                 <button
-                  type="button"
-                  className="aim-btn"
-                  disabled={!myTurn || charging}
-                  onPointerDown={(e) => {
-                    e.preventDefault();
-                    startAimRepeat(-1);
+                  className={`fire-btn${charging ? ' charging' : ''}${atFull ? ' full' : ''}`}
+                  disabled={!myTurn}
+                  onPointerDown={beginCharge}
+                  onPointerUp={() => void releaseCharge()}
+                  onPointerCancel={cancelCharge}
+                  onPointerLeave={() => {
+                    if (charging) void releaseCharge();
                   }}
-                  onPointerUp={stopAimRepeat}
-                  onPointerLeave={stopAimRepeat}
-                  onPointerCancel={stopAimRepeat}
-                  aria-label="Aim right"
+                  onContextMenu={(e) => e.preventDefault()}
+                  aria-label={charging ? 'Release to fire' : 'Hold to charge and fire'}
                 >
-                  <ChevronRight size={30} />
+                  <span className="fire-fill" style={{ width: `${power}%` }} aria-hidden="true" />
+                  <span className="fire-content">
+                    <span className="fire-ab" aria-hidden="true">A</span>
+                    <Flame size={22} />
+                    <span className="fire-label">{charging ? 'RELEASE TO FIRE' : 'HOLD TO CHARGE'}</span>
+                    <span className="fire-power">{power}%</span>
+                  </span>
                 </button>
               </div>
 
-              <div className="aim-foot">
-                <span className="aim-arc-text">ARC {aiming.side === 'left' ? '◄' : '►'} {angle}°</span>
-                <button
-                  type="button"
-                  className="step-toggle"
-                  onClick={() => setAimStep((value) => (value === 1 ? 5 : 1))}
-                  aria-label={`Aim step ${aimStep} degrees, tap to toggle`}
-                >
-                  Step {aimStep}°
-                </button>
-              </div>
+              {lastEvent?.type === 'shot' ? (
+                <p className="muted last-shot">Last shot: {lastEvent.power}% at {lastEvent.angle}°</p>
+              ) : null}
             </div>
-
-            {/* CHARGE + FIRE */}
-            <button
-              className={`fire-btn${charging ? ' charging' : ''}${atFull ? ' full' : ''}`}
-              disabled={!myTurn}
-              onPointerDown={beginCharge}
-              onPointerUp={() => void releaseCharge()}
-              onPointerCancel={cancelCharge}
-              onPointerLeave={() => {
-                if (charging) void releaseCharge();
-              }}
-              onContextMenu={(e) => e.preventDefault()}
-              aria-label={charging ? 'Release to fire' : 'Hold to charge and fire'}
-            >
-              <span className="fire-fill" style={{ width: `${power}%` }} aria-hidden="true" />
-              <span className="fire-content">
-                <Flame size={22} />
-                <span className="fire-label">{charging ? 'RELEASE TO FIRE' : 'HOLD TO CHARGE'}</span>
-                <span className="fire-power">{power}%</span>
-              </span>
-            </button>
-
-            {lastEvent?.type === 'shot' ? (
-              <p className="muted last-shot">Last shot: {lastEvent.power}% at {lastEvent.angle}°</p>
-            ) : null}
           </div>
         )}
 
