@@ -355,6 +355,14 @@ export class TrebuchetEngine {
     };
   }
 
+  renamePlayer(playerId: PlayerId, name: string): TrebuchetSnapshot {
+    const rosterPlayer = this.roster.get(playerId);
+    if (rosterPlayer) rosterPlayer.name = name;
+    const unit = this.units.get(playerId);
+    if (unit) unit.name = name;
+    return this.snapshot();
+  }
+
   removePlayer(playerId: PlayerId): TrebuchetSnapshot {
     const unit = this.units.get(playerId);
     if (unit) {

@@ -8,7 +8,8 @@ import type {
   LobbySlug,
   Player,
   PlayerId,
-  PlayerToken
+  PlayerToken,
+  RenamePlayerResponse
 } from '@couch/types';
 import {
   createId,
@@ -168,6 +169,33 @@ export class LobbyStore {
       lobby: this.publicLobby(lobby),
       player: this.publicPlayer(lobby, player),
       playerToken: player.token
+    };
+  }
+
+  renamePlayer(slug: string, playerToken: string, name: unknown): RenamePlayerResponse & { gameEvent: TrebuchetSnapshot | null } {
+    const lobby = this.getLobby(slug);
+    const player = this.playerByToken(lobby, playerToken);
+    const nextName = sanitizePlayerName(name);
+    const previousName = player.name;
+    player.name = nextName;
+
+    let gameEvent: TrebuchetSnapshot | null = null;
+    if (lobby.engine) {
+      gameEvent = lobby.engine.renamePlayer(player.id, nextName);
+      this.updateGameSession(lobby, gameEvent);
+    } else if (lobby.gameSession?.snapshot) {
+      gameEvent = {
+        ...lobby.gameSession.snapshot,
+        units: lobby.gameSession.snapshot.units.map((unit) => (unit.id === player.id ? { ...unit, name: nextName } : unit))
+      };
+      this.updateGameSession(lobby, gameEvent);
+    }
+
+    if (previousName !== nextName) this.addActivity(lobby, `${previousName} heißt jetzt ${nextName}`);
+    return {
+      lobby: this.publicLobby(lobby),
+      player: this.publicPlayer(lobby, player),
+      gameEvent
     };
   }
 

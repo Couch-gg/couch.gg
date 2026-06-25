@@ -169,6 +169,12 @@ button:disabled {
   background: rgba(248, 237, 207, 0.06);
 }
 
+.icon-btn.compact {
+  width: 42px;
+  min-height: 42px;
+  padding: 0;
+}
+
 .text-btn {
   justify-content: flex-start;
   min-height: 36px;
@@ -572,6 +578,56 @@ button:disabled {
   justify-content: space-between;
   gap: 12px;
   align-items: start;
+}
+
+.controller-identity {
+  display: grid;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 6px;
+}
+
+.name-edit-trigger {
+  display: inline-flex;
+  max-width: 100%;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+}
+
+.name-edit-trigger span {
+  min-width: 0;
+  font-size: 36px;
+  font-weight: 900;
+  line-height: 1;
+  overflow-wrap: anywhere;
+}
+
+.name-edit-trigger svg {
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+
+.name-edit-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 42px 42px;
+  gap: 8px;
+  align-items: center;
+  width: 100%;
+  max-width: 320px;
+}
+
+.controller-card .name-edit-form input {
+  min-height: 42px;
+  padding: 0 12px;
+  font-size: 20px;
+  font-weight: 900;
 }
 
 .micro-label {
@@ -1065,6 +1121,10 @@ button:disabled {
     font-size: 30px;
   }
 
+  .name-edit-trigger span {
+    font-size: 30px;
+  }
+
   .aim-pad {
     grid-template-columns: 52px minmax(0, 1fr) 52px;
     gap: 8px;
@@ -1093,6 +1153,10 @@ button:disabled {
 
   .controller-card h1 {
     margin: 6px 0;
+    font-size: 26px;
+  }
+
+  .name-edit-trigger span {
     font-size: 26px;
   }
 

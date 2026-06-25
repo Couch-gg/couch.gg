@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import type { TrebuchetSnapshot } from '@couch/trebuchet';
 import { LobbyStore } from '../src/lobbies.js';
 
 describe('LobbyStore', () => {
@@ -36,5 +37,21 @@ describe('LobbyStore', () => {
     expect(second.player.id).toBe(first.player.id);
     expect(second.player.connected).toBe(true);
     expect(second.lobby.players).toHaveLength(1);
+  });
+
+  it('renames a player in the lobby and active Trebuchet snapshot', () => {
+    const store = new LobbyStore();
+    const lobby = store.createLobby();
+    const host = store.joinPlayer(lobby.slug, 'Alex');
+    store.joinPlayer(lobby.slug, 'Bea');
+    store.startGame(lobby.slug, host.playerToken);
+
+    const renamed = store.renamePlayer(lobby.slug, host.playerToken, 'Mina');
+    const snapshot = renamed.lobby.gameSession?.snapshot as TrebuchetSnapshot | undefined;
+    const unit = snapshot?.units.find((row) => row.id === host.player.id);
+
+    expect(renamed.player.name).toBe('Mina');
+    expect(renamed.lobby.players.find((row) => row.id === host.player.id)?.name).toBe('Mina');
+    expect(unit?.name).toBe('Mina');
   });
 });

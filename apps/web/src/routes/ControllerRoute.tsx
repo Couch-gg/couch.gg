@@ -7,12 +7,14 @@ import {
   Flame,
   Gamepad2,
   LogOut,
+  Pencil,
   Play,
-  Share2
+  Share2,
+  X
 } from 'lucide-react';
-import { useCallback, useEffect, useRef, useState, type MutableRefObject, type PointerEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type FormEvent, type MutableRefObject, type PointerEvent } from 'react';
 import type { Socket } from 'socket.io-client';
-import type { GameManifest, JoinLobbyResponse, Lobby, Player } from '@couch/types';
+import type { GameManifest, JoinLobbyResponse, Lobby, Player, RenamePlayerResponse } from '@couch/types';
 import {
   CHARGE_TIME_MS,
   ELEV_MAX,
@@ -68,6 +70,9 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   const [joinStatus, setJoinStatus] = useState<'idle' | 'joining' | 'failed'>('idle');
   const [lobby, setLobby] = useState<Lobby | null>(null);
   const [games, setGames] = useState<GameManifest[]>([]);
+  const [editingName, setEditingName] = useState(false);
+  const [draftName, setDraftName] = useState('');
+  const [renaming, setRenaming] = useState(false);
   const [angle, setAngle] = useState(72);
   const [power, setPower] = useState(POWER_MIN);
   const [aimStep, setAimStep] = useState(1);
@@ -237,6 +242,10 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   const myUnit = player ? snapshot?.units.find((unit) => unit.id === player.id) : undefined;
 
   useEffect(() => {
+    if (player && !editingName) setDraftName(player.name);
+  }, [editingName, player]);
+
+  useEffect(() => {
     if (!player || !myTurn || !snapshot || !myUnit) return;
     const turnKey = [snapshot.seed, snapshot.turn, snapshot.turnEndsAt ?? 0].join(':');
     if (lastTurnAimKeyRef.current === turnKey) return;
@@ -250,6 +259,40 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   const start = async () => {
     if (!socket) return;
     await emitAck(socket, 'game:start', { slug, playerToken });
+  };
+
+  const startNameEdit = () => {
+    setDraftName((player?.name ?? name) || 'Player');
+    setEditingName(true);
+  };
+
+  const cancelNameEdit = () => {
+    setDraftName(player?.name ?? 'Player');
+    setEditingName(false);
+  };
+
+  const saveNameEdit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!socket || !player) return;
+    setError(null);
+    setRenaming(true);
+    try {
+      const renamed = await emitAck<RenamePlayerResponse & { ok: true }>(socket, 'controller:rename', {
+        slug,
+        playerToken,
+        name: draftName
+      });
+      setPlayer(renamed.player);
+      setLobby(renamed.lobby);
+      setName(renamed.player.name);
+      setDraftName(renamed.player.name);
+      window.localStorage.setItem('couch:name', renamed.player.name);
+      setEditingName(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Name konnte nicht geändert werden');
+    } finally {
+      setRenaming(false);
+    }
   };
 
   const selectGame = async (gameId: string) => {
@@ -589,9 +632,30 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
       <section className="controller-card tall">
         {reconnecting ? <div className="reconnect-pill">Reconnecting…</div> : null}
         <div className="controller-top">
-          <div>
+          <div className="controller-identity">
             <span className="micro-label">Room {slug}</span>
-            <h1>{player.name}</h1>
+            {editingName ? (
+              <form className="name-edit-form" onSubmit={saveNameEdit}>
+                <input
+                  autoFocus
+                  aria-label="Player name"
+                  maxLength={18}
+                  value={draftName}
+                  onChange={(event) => setDraftName(event.target.value)}
+                />
+                <button className="icon-btn compact" type="submit" aria-label="Name speichern" disabled={renaming}>
+                  <Check size={18} />
+                </button>
+                <button className="icon-btn compact" type="button" aria-label="Abbrechen" onClick={cancelNameEdit} disabled={renaming}>
+                  <X size={18} />
+                </button>
+              </form>
+            ) : (
+              <button className="name-edit-trigger" type="button" onClick={startNameEdit} aria-label="Spielernamen ändern">
+                <span>{player.name}</span>
+                <Pencil size={16} />
+              </button>
+            )}
           </div>
           {isHost ? <span className="host-pill"><Crown size={14} /> Host</span> : null}
         </div>

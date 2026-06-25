@@ -79,6 +79,11 @@ test('desktop attract pairs a phone, lobby chat + game start work', async ({ bro
 
   // 5) The creator auto-joins as host.
   await expect(tv.locator('.player-name', { hasText: 'Alex' })).toBeVisible();
+  await phoneOne.getByRole('button', { name: /Spielernamen ändern/i }).click();
+  await phoneOne.getByLabel(/Player name/i).fill('Mina');
+  await phoneOne.getByRole('button', { name: /Name speichern/i }).click();
+  await expect(phoneOne.getByRole('button', { name: /Spielernamen ändern/i })).toContainText('Mina');
+  await expect(tv.locator('.player-name', { hasText: 'Mina' })).toBeVisible({ timeout: 10_000 });
 
   // 6) A second phone scans the lobby QR (/j/:slug) and auto-joins as controller.
   const phoneTwo = await browser.newPage({
@@ -91,7 +96,7 @@ test('desktop attract pairs a phone, lobby chat + game start work', async ({ bro
   await expect(phoneTwo).toHaveURL(new RegExp('/c/' + slug), { timeout: 15_000 });
 
   // Both players appear on the TV.
-  await expect(tv.locator('.player-name', { hasText: 'Alex' })).toBeVisible();
+  await expect(tv.locator('.player-name', { hasText: 'Mina' })).toBeVisible();
   await expect(tv.locator('.player-name', { hasText: 'Bea' })).toBeVisible();
 
   // The TV shows the game catalog overview including Trebuchet.
