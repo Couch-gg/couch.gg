@@ -1751,3 +1751,445 @@ button:disabled {
     opacity: 0.55;
   }
 }
+
+/* =====================================================================
+   RETRO HANDHELD CONTROLLER (in-GAME controls only)
+   Restyles the .trebuchet-controls block into a chunky pixel game pad to
+   match the attract/CRT aesthetic. Pure CSS + JSX-wrapper restyle: no input
+   logic changes. Hard (no-blur) bevels, segmented LED meters, Press Start 2P
+   labels, per-player --team accent. The waiting-lobby/join UIs are untouched.
+   ===================================================================== */
+
+/* --team is set inline from TEAM_COLORS; fall back to gold if absent. */
+.trebuchet-controls.retro-pad {
+  --team: var(--accent);
+  display: block;
+  padding: 0;
+}
+
+/* The device body: dark plastic slab with hard outer bevel + grille texture. */
+.retro-pad-shell {
+  display: grid;
+  gap: 14px;
+  padding: 16px 14px 18px;
+  border: 2px solid #0c0e0d;
+  border-radius: 10px;
+  background:
+    repeating-linear-gradient(
+      135deg,
+      rgba(255, 255, 255, 0.015) 0,
+      rgba(255, 255, 255, 0.015) 2px,
+      transparent 2px,
+      transparent 4px
+    ),
+    var(--surface-2);
+  box-shadow:
+    inset 0 2px 0 rgba(255, 255, 255, 0.08),
+    inset 0 -3px 0 rgba(0, 0, 0, 0.55),
+    0 4px 0 #0a0c0b,
+    0 8px 0 rgba(0, 0, 0, 0.35);
+}
+
+/* ----- Brand / LED strip ----- */
+.retro-pad-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 2px solid #0c0e0d;
+  border-radius: 4px;
+  background: #14110a;
+  box-shadow: inset 0 0 0 1px rgba(241, 207, 106, 0.12), inset 0 2px 6px rgba(0, 0, 0, 0.6);
+}
+
+.retro-pad-name {
+  font-family: "Press Start 2P", monospace;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: var(--accent);
+  text-shadow: 1px 1px 0 rgba(0, 0, 0, 0.7);
+}
+
+.retro-pad-model {
+  margin-left: auto;
+  font-family: "Press Start 2P", monospace;
+  font-size: 8px;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  opacity: 0.7;
+}
+
+.retro-led {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #3a3326;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.6);
+}
+
+.retro-led.on {
+  background: var(--team);
+  box-shadow:
+    inset 0 0 0 1px rgba(0, 0, 0, 0.4),
+    0 0 6px var(--team);
+}
+
+/* ----- Status strip (was turn-card) ----- */
+.retro-pad .turn-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 11px;
+  border: 2px solid #0c0e0d;
+  border-radius: 4px;
+  background: #14110a;
+  box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.6);
+}
+
+.retro-pad .turn-card.active {
+  background: #141512;
+  box-shadow:
+    inset 0 2px 6px rgba(0, 0, 0, 0.6),
+    inset 0 0 0 1px color-mix(in srgb, var(--team) 55%, transparent);
+}
+
+.retro-pad .turn-led {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 1px;
+  background: #3a3326;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.5);
+}
+
+.retro-pad .turn-card.active .turn-led {
+  background: var(--team);
+  box-shadow: 0 0 6px var(--team);
+}
+
+.retro-pad .turn-state {
+  font-family: "Press Start 2P", monospace;
+  font-size: 9px;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+.retro-pad .turn-card.active .turn-state {
+  color: var(--team);
+}
+
+.retro-pad .turn-card strong {
+  margin-left: auto;
+  font-family: "Press Start 2P", monospace;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.2;
+  color: var(--text);
+  text-shadow: 1px 1px 0 rgba(0, 0, 0, 0.6);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ----- Aim block reframed as a sunken panel ----- */
+.retro-pad .aim-block {
+  border: 2px solid #0c0e0d;
+  border-radius: 6px;
+  background: #14110a;
+  box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.6);
+}
+
+.retro-pad .aim-side-label {
+  font-family: "Press Start 2P", monospace;
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  text-transform: none;
+  color: var(--accent);
+}
+
+.retro-pad .aim-elev-label {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ----- D-pad arms: squared, hard 3D bevel, press DOWN (not scale) ----- */
+.retro-pad .aim-btn.dpad-btn {
+  min-width: 52px;
+  border: 2px solid #0c0e0d;
+  border-radius: 5px;
+  background: linear-gradient(180deg, #2c2d24 0%, #1d1e17 100%);
+  color: var(--accent);
+  box-shadow:
+    inset 0 2px 0 rgba(255, 255, 255, 0.12),
+    inset 0 -2px 0 rgba(0, 0, 0, 0.5),
+    0 3px 0 #0a0c0b;
+  /* press-down replaces the old scale transform */
+  transition: transform 60ms steps(2), box-shadow 60ms steps(2), background 60ms steps(2);
+}
+
+.retro-pad .aim-btn.dpad-btn:active:not(:disabled) {
+  transform: translateY(2px);
+  background: linear-gradient(180deg, #24251d 0%, #181911 100%);
+  box-shadow:
+    inset 0 2px 0 rgba(255, 255, 255, 0.06),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.5),
+    0 1px 0 #0a0c0b;
+}
+
+.retro-pad .aim-btn.dpad-btn:disabled {
+  color: var(--muted);
+}
+
+/* ----- Segmented LED elevation meter ----- */
+.retro-pad .elev-gauge {
+  border: 2px solid #0c0e0d;
+  border-radius: 4px;
+  background: #0e0b06;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.5), inset 0 2px 8px rgba(0, 0, 0, 0.7);
+}
+
+/* Horizontal segment dividers carve the fill into discrete LED bars. */
+.retro-pad .elev-segments {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    to top,
+    #0c0e0d 0,
+    #0c0e0d 2px,
+    transparent 2px,
+    transparent 12px
+  );
+}
+
+.retro-pad .elev-fill {
+  /* stepped, glow-free fill in the team-neutral gold */
+  background: repeating-linear-gradient(
+    to top,
+    color-mix(in srgb, var(--accent) 85%, #000) 0,
+    color-mix(in srgb, var(--accent) 85%, #000) 10px,
+    color-mix(in srgb, var(--accent) 60%, #000) 10px,
+    color-mix(in srgb, var(--accent) 60%, #000) 12px
+  );
+  border-top: 2px solid var(--accent);
+}
+
+.retro-pad .elev-gauge.side-left .elev-fill {
+  background: repeating-linear-gradient(
+    to top,
+    color-mix(in srgb, var(--cyan) 85%, #000) 0,
+    color-mix(in srgb, var(--cyan) 85%, #000) 10px,
+    color-mix(in srgb, var(--cyan) 60%, #000) 10px,
+    color-mix(in srgb, var(--cyan) 60%, #000) 12px
+  );
+  border-top-color: var(--cyan);
+}
+
+.retro-pad .elev-needle-val {
+  border-radius: 2px;
+  font-variant-numeric: tabular-nums;
+  box-shadow: 0 2px 0 rgba(0, 0, 0, 0.5);
+}
+
+.retro-pad .elev-tick,
+.retro-pad .elev-hint {
+  font-family: "Press Start 2P", monospace;
+  font-size: 7px;
+  font-weight: 400;
+  letter-spacing: 0.02em;
+}
+
+/* ----- Aim foot: pixel arc readout + chunky step toggle ----- */
+.retro-pad .aim-arc-text {
+  font-family: "Press Start 2P", monospace;
+  font-size: 9px;
+  letter-spacing: 0.02em;
+  color: var(--muted);
+}
+
+.retro-pad .step-toggle {
+  border: 2px solid #0c0e0d;
+  border-radius: 4px;
+  background: linear-gradient(180deg, #2c2d24 0%, #1d1e17 100%);
+  color: var(--accent);
+  font-family: "Press Start 2P", monospace;
+  font-size: 9px;
+  box-shadow:
+    inset 0 2px 0 rgba(255, 255, 255, 0.1),
+    0 2px 0 #0a0c0b;
+  transition: transform 60ms steps(2), box-shadow 60ms steps(2);
+}
+
+.retro-pad .step-toggle:active {
+  transform: translateY(2px);
+  box-shadow: inset 0 2px 0 rgba(255, 255, 255, 0.05), 0 0 0 #0a0c0b;
+}
+
+/* ----- Action row + round A button ----- */
+.retro-pad .action-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 0 2px;
+}
+
+.retro-pad .fire-btn {
+  position: relative;
+  width: 156px;
+  height: 156px;
+  min-height: 0;
+  flex: 0 0 auto;
+  border: 3px solid #0c0e0d;
+  border-radius: 50%;
+  background: radial-gradient(circle at 50% 38%, #ff6a62 0%, var(--red) 55%, #b83a33 100%);
+  color: #fff8e8;
+  /* hard pixel bevel, no soft glow */
+  box-shadow:
+    inset 0 4px 0 rgba(255, 255, 255, 0.22),
+    inset 0 -6px 0 rgba(0, 0, 0, 0.4),
+    0 5px 0 #7a2823,
+    0 9px 0 rgba(0, 0, 0, 0.3);
+  transition: transform 60ms steps(2), box-shadow 60ms steps(2);
+}
+
+.retro-pad .fire-btn:hover {
+  /* override the platform-wide translateY(-1px) hover lift for the pad */
+  transform: none;
+}
+
+.retro-pad .fire-fill {
+  /* Keep the existing inline width:${power}% binding — it sweeps left->right as
+     a stepped gold bar, clipped to the round button by overflow:hidden. */
+  background: repeating-linear-gradient(
+    to top,
+    color-mix(in srgb, var(--accent) 90%, #000) 0,
+    color-mix(in srgb, var(--accent) 90%, #000) 8px,
+    color-mix(in srgb, var(--accent) 65%, #000) 8px,
+    color-mix(in srgb, var(--accent) 65%, #000) 10px
+  );
+  box-shadow: none;
+}
+
+.retro-pad .fire-content {
+  flex-direction: column;
+  gap: 4px;
+  text-align: center;
+  padding: 0 14px;
+}
+
+.retro-pad .fire-ab {
+  font-family: "Press Start 2P", monospace;
+  font-size: 22px;
+  line-height: 1;
+  color: #fff8e8;
+  text-shadow: 2px 2px 0 rgba(0, 0, 0, 0.45);
+}
+
+.retro-pad .fire-label {
+  font-family: "Press Start 2P", monospace;
+  font-size: 8px;
+  line-height: 1.4;
+  letter-spacing: 0.02em;
+}
+
+.retro-pad .fire-power {
+  min-width: 0;
+  text-align: center;
+  font-size: 13px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.95;
+}
+
+.retro-pad .fire-btn.charging,
+.retro-pad .fire-btn.charging:active {
+  transform: translateY(3px);
+  box-shadow:
+    inset 0 3px 0 rgba(255, 255, 255, 0.16),
+    inset 0 -3px 0 rgba(0, 0, 0, 0.4),
+    0 2px 0 #7a2823;
+}
+
+.retro-pad .fire-btn.full {
+  animation: retro-fire-pulse 360ms steps(2) infinite alternate;
+}
+
+@keyframes retro-fire-pulse {
+  from {
+    box-shadow:
+      inset 0 4px 0 rgba(255, 255, 255, 0.22),
+      inset 0 -6px 0 rgba(0, 0, 0, 0.4),
+      0 5px 0 #7a2823;
+  }
+  to {
+    box-shadow:
+      inset 0 4px 0 rgba(255, 255, 255, 0.22),
+      inset 0 -6px 0 rgba(0, 0, 0, 0.4),
+      0 0 0 4px var(--accent),
+      0 5px 0 #7a2823;
+  }
+}
+
+.retro-pad .last-shot {
+  font-family: "Press Start 2P", monospace;
+  font-size: 8px;
+  line-height: 1.6;
+  letter-spacing: 0.02em;
+}
+
+/* ----- Responsive: keep the pad reachable on small phones ----- */
+@media (max-width: 380px) {
+  .retro-pad-shell {
+    padding: 12px 10px 14px;
+    gap: 12px;
+  }
+
+  .retro-pad .aim-btn.dpad-btn {
+    min-width: 44px;
+  }
+
+  .retro-pad .fire-btn {
+    width: 132px;
+    height: 132px;
+  }
+
+  .retro-pad .fire-ab {
+    font-size: 18px;
+  }
+}
+
+/* ----- Short landscape: shrink the round button so it stays in view ----- */
+@media (max-height: 480px) and (orientation: landscape) {
+  .retro-pad-shell {
+    gap: 10px;
+    padding: 12px;
+  }
+
+  .retro-pad .fire-btn {
+    width: 116px;
+    height: 116px;
+  }
+
+  .retro-pad .fire-label {
+    font-size: 7px;
+  }
+}
+
+/* ----- Reduced motion: drop the stepped press/pulse transitions ----- */
+@media (prefers-reduced-motion: reduce) {
+  .retro-pad .aim-btn.dpad-btn,
+  .retro-pad .step-toggle,
+  .retro-pad .fire-btn {
+    transition: none;
+  }
+
+  .retro-pad .fire-btn.full {
+    animation: none;
+    box-shadow:
+      inset 0 4px 0 rgba(255, 255, 255, 0.22),
+      inset 0 -6px 0 rgba(0, 0, 0, 0.4),
+      0 0 0 4px var(--accent),
+      0 5px 0 #7a2823;
+  }
+}
