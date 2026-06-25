@@ -61,6 +61,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   const [name, setName] = useState(() => window.localStorage.getItem('couch:name') || '');
   const [player, setPlayer] = useState<Player | null>(null);
   const [playerToken, setPlayerToken] = useState(() => window.localStorage.getItem(tokenKey(slug)) || '');
+  const [joinStatus, setJoinStatus] = useState<'idle' | 'joining' | 'failed'>('idle');
   const [lobby, setLobby] = useState<Lobby | null>(null);
   const [games, setGames] = useState<GameManifest[]>([]);
   const [angle, setAngle] = useState(72);
@@ -155,12 +156,14 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     };
   }, []);
 
-  const join = async () => {
+  const join = useCallback(async () => {
     setError(null);
     if (!socket) {
       setError('Realtime-Verbindung startet noch');
+      setJoinStatus('failed');
       return;
     }
+    setJoinStatus('joining');
     try {
       const joined = await emitAck<JoinLobbyResponse & { ok: true; games: GameManifest[] }>(socket, 'controller:join', {
         slug,
@@ -174,12 +177,19 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
       window.localStorage.setItem(tokenKey(slug), joined.playerToken);
       window.localStorage.setItem('couch:activeSlug', slug);
       window.localStorage.setItem('couch:name', joined.player.name);
+      setJoinStatus('idle');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Join fehlgeschlagen');
+      setJoinStatus('failed');
     }
-  };
+  }, [name, playerToken, slug, socket]);
 
-  // (Returning users auto-join + reconnect via the socket effect's 'connect' listener above.)
+  // First-time visitors should land directly in the controller. Returning users
+  // still auto-join + reconnect via the socket effect's 'connect' listener above.
+  useEffect(() => {
+    if (player || !socket || joinStatus !== 'idle') return;
+    void join();
+  }, [join, joinStatus, player, socket]);
 
   useEffect(() => {
     if (!player) return;
@@ -493,11 +503,15 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
             <span className="brand-mark">c</span>
             <span>Room {slug}</span>
           </div>
-          <h1>Join as controller</h1>
-          <input value={name} onChange={(event) => setName(event.target.value)} placeholder="Your name" aria-label="Your name" />
-          <button className="primary-btn wide" onClick={join}>
-            <Gamepad2 size={18} /> Join
-          </button>
+          <h1>{joinStatus === 'failed' ? 'Controller join failed' : 'Joining room...'}</h1>
+          {joinStatus === 'failed' ? (
+            <>
+              <input value={name} onChange={(event) => setName(event.target.value)} placeholder="Your name" aria-label="Your name" />
+              <button className="primary-btn wide" onClick={join}>
+                <Gamepad2 size={18} /> Try again
+              </button>
+            </>
+          ) : null}
           {error ? <p className="error-line">{error}</p> : null}
         </section>
       </main>

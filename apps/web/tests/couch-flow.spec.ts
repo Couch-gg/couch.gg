@@ -33,6 +33,7 @@ test('desktop attract pairs a phone, lobby chat + game start work', async ({ bro
     isMobile: true,
     hasTouch: true
   });
+  await phoneOne.addInitScript(() => window.localStorage.setItem('couch:name', 'Alex'));
   await phoneOne.goto('/s/' + screenId);
   await phoneOne.getByRole('button', { name: /Create a room/i }).click();
   await expect(phoneOne).toHaveURL(/\/c\/[A-Z0-9]+/, { timeout: 15_000 });
@@ -41,19 +42,17 @@ test('desktop attract pairs a phone, lobby chat + game start work', async ({ bro
   // 3) Claiming the screen navigates the TV into that lobby (socket push, with REST poll fallback).
   await expect(tv).toHaveURL(new RegExp('/l/' + slug), { timeout: 15_000 });
 
-  // 4) The creator joins as host.
-  await phoneOne.getByLabel(/Your name/i).fill('Alex');
-  await phoneOne.getByRole('button', { name: /^Join$/i }).click();
+  // 4) The creator auto-joins as host.
+  await expect(tv.locator('.player-name', { hasText: 'Alex' })).toBeVisible();
 
-  // 5) A second phone joins via the controller route.
+  // 5) A second phone auto-joins via the controller route.
   const phoneTwo = await browser.newPage({
     viewport: { width: 390, height: 844 },
     isMobile: true,
     hasTouch: true
   });
+  await phoneTwo.addInitScript(() => window.localStorage.setItem('couch:name', 'Bea'));
   await phoneTwo.goto('/c/' + slug);
-  await phoneTwo.getByLabel(/Your name/i).fill('Bea');
-  await phoneTwo.getByRole('button', { name: /^Join$/i }).click();
 
   // Both players appear on the TV.
   await expect(tv.locator('.player-name', { hasText: 'Alex' })).toBeVisible();
@@ -103,12 +102,12 @@ test('invite link opens the mobile join confirm', async ({ browser }) => {
   const screenId = await tv.evaluate(() => window.sessionStorage.getItem('couch:screenId'));
 
   const host = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  await host.addInitScript(() => window.localStorage.setItem('couch:name', 'Alex'));
   await host.goto('/s/' + screenId);
   await host.getByRole('button', { name: /Create a room/i }).click();
   await expect(host).toHaveURL(/\/c\/[A-Z0-9]+/, { timeout: 15_000 });
   const slug = host.url().split('/').pop()!;
-  await host.getByLabel(/Your name/i).fill('Alex');
-  await host.getByRole('button', { name: /^Join$/i }).click();
+  await expect(tv.locator('.player-name', { hasText: 'Alex' })).toBeVisible();
 
   // A friend opens the invite link on a phone -> mobile join confirm (never the desktop home).
   const friend = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
@@ -139,12 +138,11 @@ test('controller survives a network drop and auto-rejoins (slept phone)', async 
   const screenId = await tv.evaluate(() => window.sessionStorage.getItem('couch:screenId'));
 
   const host = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  await host.addInitScript(() => window.localStorage.setItem('couch:name', 'Alex'));
   await host.goto('/s/' + screenId);
   await host.getByRole('button', { name: /Create a room/i }).click();
   await expect(host).toHaveURL(/\/c\/[A-Z0-9]+/, { timeout: 15_000 });
   const slug = host.url().split('/').pop()!;
-  await host.getByLabel(/Your name/i).fill('Alex');
-  await host.getByRole('button', { name: /^Join$/i }).click();
 
   const alexConnection = tv.locator('.player-row', { hasText: 'Alex' }).locator('.connection');
   await expect(alexConnection).toHaveText(/online/i, { timeout: 15_000 });
