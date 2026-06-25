@@ -12,7 +12,7 @@ describe('TrebuchetEngine', () => {
     const event = engine.start(roster);
     expect(event.snapshot.phase).toBe('running');
     expect(event.snapshot.units).toHaveLength(2);
-    expect(event.snapshot.heights).toHaveLength(480);
+    expect(event.snapshot.heights).toHaveLength(960);
     expect(event.snapshot.castles).toHaveLength(2);
     expect(event.snapshot.turnEndsAt).toBe(61_000);
   });
