@@ -1,9 +1,15 @@
 import type {
   ActivityMessage,
   ChatMessage,
+  ControllerEvent,
+  ExternalGameManifest,
+  ExternalGameSnapshot,
   GameEventEnvelope,
   GameId,
+  GameInputEnvelope,
+  GameManifest,
   GameSession,
+  InputAction,
   JoinLobbyResponse,
   Lobby,
   LobbySlug,
@@ -21,6 +27,64 @@ import {
   sanitizePlayerName
 } from '@couch/game-runtime';
 import { TrebuchetEngine, type TrebuchetEvent, type TrebuchetSnapshot } from '@couch/trebuchet';
+
+// Resolves a game id to its manifest (built-in or env-registered external),
+// returning null for unknown ids. Injected into LobbyStore so the store never
+// calls the throwing getGameManifest directly and can see external games.
+export type ManifestResolver = (id: GameId) => GameManifest | null;
+
+const INPUT_ACTIONS: readonly InputAction[] = ['press', 'release', 'change'];
+const MAX_INPUT_VALUE_BYTES = 1024;
+const INPUT_LOG_LIMIT = 128;
+const INPUT_LOG_PUBLIC_LIMIT = 64;
+const MAX_EXTERNAL_SCORES = 8;
+
+// The snapshot union the server may hold: the built-in Trebuchet snapshot or the
+// thin external snapshot (seed + reported scores, no authoritative state).
+export type LobbySnapshot = TrebuchetSnapshot | ExternalGameSnapshot;
+
+// Narrow a stored snapshot to the Trebuchet shape. External snapshots have no
+// `units`, so this guards every code path that reaches into Trebuchet internals.
+export function isTrebuchetSnapshot(snapshot: unknown): snapshot is TrebuchetSnapshot {
+  return !!snapshot && typeof snapshot === 'object' && 'units' in (snapshot as Record<string, unknown>);
+}
+
+// Narrow a stored snapshot to the external shape (`kind: 'external'`).
+export function isExternalSnapshot(snapshot: unknown): snapshot is ExternalGameSnapshot {
+  return !!snapshot && typeof snapshot === 'object' && (snapshot as Record<string, unknown>).kind === 'external';
+}
+
+// Narrow a manifest to an external (iframe-hosted) game.
+function isExternalManifest(manifest: GameManifest): manifest is ExternalGameManifest {
+  return manifest.origin === 'external';
+}
+
+// A URL-safe random seed for an external game run. Uses the OS CSPRNG (same
+// rationale as randomSlug/createId — Math.random can repeat across snapshot-
+// restored serverless instances). 16 chars, well over the 12-char minimum.
+function createSeed(): string {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  const length = 16;
+  const cryptoRef = globalThis.crypto;
+  let out = '';
+  if (cryptoRef?.getRandomValues) {
+    const bytes = new Uint8Array(length);
+    cryptoRef.getRandomValues(bytes);
+    for (let i = 0; i < length; i++) out += alphabet[bytes[i] % alphabet.length];
+    return out;
+  }
+  for (let i = 0; i < length; i++) out += alphabet[Math.floor(Math.random() * alphabet.length)];
+  return out;
+}
+
+// Wraps the throwing built-in getGameManifest into the nullable resolver shape.
+function builtinManifestResolver(id: GameId): GameManifest | null {
+  try {
+    return getGameManifest(id);
+  } catch {
+    return null;
+  }
+}
 
 export const LOBBY_TTL_MS = 4 * 60 * 60 * 1000;
 export const RECONNECT_GRACE_MS = 10 * 60 * 1000;
@@ -42,8 +106,13 @@ export interface SerializedLobbyRecord {
   players: InternalPlayer[];
   activity: ActivityMessage[];
   chat?: ChatMessage[]; // optional for backward compatibility with records persisted before chat existed
-  gameSession: GameSession<TrebuchetSnapshot> | null;
+  gameSession: GameSession<LobbySnapshot> | null;
   lastEvent?: GameEventEnvelope | null; // optional for backward compatibility with records persisted before lastEvent existed
+  // All optional for back-compat with records persisted before external-game support:
+  // default mode 'local', inputSeq 0, inputLog [].
+  mode?: 'local' | 'remote';
+  inputSeq?: number;
+  inputLog?: GameInputEnvelope[];
 }
 
 export interface LobbyRecord {
@@ -58,9 +127,12 @@ export interface LobbyRecord {
   players: Map<PlayerId, InternalPlayer>;
   activity: ActivityMessage[];
   chat: ChatMessage[];
-  gameSession: GameSession<TrebuchetSnapshot> | null;
+  gameSession: GameSession<LobbySnapshot> | null;
   lastEvent: GameEventEnvelope | null;
   engine: TrebuchetEngine | null;
+  mode: 'local' | 'remote';
+  inputSeq: number;
+  inputLog: GameInputEnvelope[];
 }
 
 export class LobbyError extends Error {
@@ -74,8 +146,21 @@ export class LobbyError extends Error {
 
 export class LobbyStore {
   readonly lobbies = new Map<LobbySlug, LobbyRecord>();
+  private readonly resolveManifest: ManifestResolver;
 
-  createLobby(now = Date.now()): LobbyRecord {
+  constructor(getManifest: ManifestResolver = builtinManifestResolver) {
+    this.resolveManifest = getManifest;
+  }
+
+  // Resolve a manifest or throw the standard 404 LobbyError. Used where the
+  // caller expects the game to exist (join/select/start).
+  private manifestOrThrow(id: GameId): GameManifest {
+    const manifest = this.resolveManifest(id);
+    if (!manifest) throw new LobbyError('Spiel nicht gefunden', 404);
+    return manifest;
+  }
+
+  createLobby(now = Date.now(), mode: 'local' | 'remote' = 'local'): LobbyRecord {
     let slug = randomSlug();
     while (this.lobbies.has(slug)) slug = randomSlug();
     const lobby: LobbyRecord = {
@@ -92,7 +177,10 @@ export class LobbyStore {
       chat: [],
       gameSession: null,
       lastEvent: null,
-      engine: null
+      engine: null,
+      mode,
+      inputSeq: 0,
+      inputLog: []
     };
     this.addActivity(lobby, 'Lobby erstellt');
     this.lobbies.set(slug, lobby);
@@ -124,7 +212,9 @@ export class LobbyStore {
       activity: lobby.activity.slice(-8),
       chat: lobby.chat.slice(-50),
       gameSession: lobby.gameSession,
-      lastEvent: lobby.lastEvent
+      lastEvent: lobby.lastEvent,
+      mode: lobby.mode,
+      inputLog: lobby.inputLog.slice(-INPUT_LOG_PUBLIC_LIMIT)
     };
   }
 
@@ -146,7 +236,7 @@ export class LobbyStore {
       };
     }
 
-    const manifest = getGameManifest(lobby.currentGameId);
+    const manifest = this.manifestOrThrow(lobby.currentGameId);
     if (lobby.players.size >= manifest.maxPlayers) {
       throw new LobbyError('Lobby ist voll', 409);
     }
@@ -188,10 +278,11 @@ export class LobbyStore {
     if (lobby.engine) {
       gameEvent = lobby.engine.renamePlayer(player.id, nextName);
       this.updateGameSession(lobby, gameEvent);
-    } else if (lobby.gameSession?.snapshot) {
+    } else if (isTrebuchetSnapshot(lobby.gameSession?.snapshot)) {
+      const snapshot = lobby.gameSession.snapshot;
       gameEvent = {
-        ...lobby.gameSession.snapshot,
-        units: lobby.gameSession.snapshot.units.map((unit) => (unit.id === player.id ? { ...unit, name: nextName } : unit))
+        ...snapshot,
+        units: snapshot.units.map((unit) => (unit.id === player.id ? { ...unit, name: nextName } : unit))
       };
       this.updateGameSession(lobby, gameEvent);
     }
@@ -207,22 +298,45 @@ export class LobbyStore {
   selectGame(slug: string, playerToken: string, gameId: GameId): Lobby {
     const lobby = this.getLobby(slug);
     this.assertHost(lobby, playerToken);
-    getGameManifest(gameId);
-    if (getGameManifest(gameId).comingSoon) throw new LobbyError('Dieses Spiel ist noch nicht spielbar', 409);
+    const manifest = this.manifestOrThrow(gameId);
+    if (manifest.comingSoon) throw new LobbyError('Dieses Spiel ist noch nicht spielbar', 409);
     if (lobby.state !== 'waiting') throw new LobbyError('Spielauswahl ist nur in der Lobby möglich');
+    if (lobby.mode === 'remote' && isExternalManifest(manifest) && !manifest.supportsRemote) {
+      throw new LobbyError('Dieses Spiel unterstützt Remote Couch nicht', 409);
+    }
     lobby.currentGameId = gameId;
-    this.addActivity(lobby, `Spiel gewählt: ${getGameManifest(gameId).title}`);
+    this.addActivity(lobby, `Spiel gewählt: ${manifest.title}`);
     return this.publicLobby(lobby);
   }
 
-  startGame(slug: string, playerToken: string): TrebuchetEvent {
+  startGame(slug: string, playerToken: string): TrebuchetEvent | null {
     const lobby = this.getLobby(slug);
     this.assertHost(lobby, playerToken);
     if (lobby.state === 'playing') throw new LobbyError('Spiel läuft bereits');
-    const manifest = getGameManifest(lobby.currentGameId);
+    const manifest = this.manifestOrThrow(lobby.currentGameId);
     if (manifest.comingSoon) throw new LobbyError('Dieses Spiel ist noch nicht spielbar', 409);
     if (lobby.players.size < manifest.minPlayers) {
       throw new LobbyError(`Mindestens ${manifest.minPlayers} Spieler nötig`, 409);
+    }
+
+    // External (iframe-hosted) games run with no server engine. The server holds
+    // only a seed + relayed input log; the game is deterministic client-side.
+    if (isExternalManifest(manifest)) {
+      lobby.engine = null;
+      lobby.state = 'playing';
+      lobby.inputSeq = 0;
+      lobby.inputLog = [];
+      lobby.gameSession = {
+        id: createId('session'),
+        lobbyId: lobby.id,
+        gameId: lobby.currentGameId,
+        state: 'running',
+        startedAt: new Date().toISOString(),
+        endedAt: null,
+        snapshot: { kind: 'external', seed: createSeed() }
+      };
+      this.addActivity(lobby, `${manifest.title} gestartet`);
+      return null;
     }
 
     const engine = new TrebuchetEngine();
@@ -258,7 +372,8 @@ export class LobbyStore {
   controllerForCurrentTurn(slug: string, playerToken: string): Player | null {
     const lobby = this.getLobby(slug);
     const player = this.playerByToken(lobby, playerToken);
-    const turn = lobby.gameSession?.snapshot.turn ?? null;
+    const snapshot = lobby.gameSession?.snapshot;
+    const turn = isTrebuchetSnapshot(snapshot) ? snapshot.turn : null;
     if (lobby.state !== 'playing' || turn !== player.id) return null;
     return this.publicPlayer(lobby, player);
   }
@@ -279,6 +394,88 @@ export class LobbyStore {
     const seq = (lobby.lastEvent?.seq ?? 0) + 1;
     lobby.lastEvent = { seq, at: new Date().toISOString(), event };
     return seq;
+  }
+
+  // Relay one external-game controller input into the lobby's ordered input log.
+  // The player is derived from the token (payload playerId is never trusted); the
+  // control is validated against the current game's declared layout; the action
+  // must be in the enum; the value payload is capped at 1KB. Stamps a monotonic
+  // seq from a per-game-start counter and trims the ring buffer to the last 128.
+  recordGameInput(slug: string, playerToken: string, event: ControllerEvent): GameInputEnvelope {
+    const lobby = this.getLobby(slug);
+    const player = this.playerByToken(lobby, playerToken);
+    if (lobby.state !== 'playing') throw new LobbyError('Kein laufendes Spiel', 409);
+
+    const manifest = this.manifestOrThrow(lobby.currentGameId);
+    if (!isExternalManifest(manifest)) throw new LobbyError('Kein externes Spiel', 409);
+
+    const rawControl = event?.control;
+    if (typeof rawControl !== 'string') throw new LobbyError('Ungültige Steuerung', 400);
+    const declared = manifest.controllerLayout.controls.some((ctrl) => ctrl.control === rawControl);
+    if (!declared) throw new LobbyError('Unbekannte Steuerung', 400);
+
+    const value = event?.value as { action?: unknown; data?: unknown } | undefined;
+    const action = value?.action;
+    if (typeof action !== 'string' || !INPUT_ACTIONS.includes(action as InputAction)) {
+      throw new LobbyError('Ungültige Aktion', 400);
+    }
+
+    const data = value?.data;
+    if (data !== undefined) {
+      const encoded = JSON.stringify(data);
+      if (typeof encoded === 'string' && encoded.length > MAX_INPUT_VALUE_BYTES) {
+        throw new LobbyError('Eingabe zu groß', 413);
+      }
+    }
+
+    const envelope: GameInputEnvelope = {
+      seq: ++lobby.inputSeq,
+      at: new Date().toISOString(),
+      playerId: player.id,
+      control: rawControl,
+      action: action as InputAction,
+      value: data
+    };
+    lobby.inputLog.push(envelope);
+    if (lobby.inputLog.length > INPUT_LOG_LIMIT) {
+      lobby.inputLog = lobby.inputLog.slice(-INPUT_LOG_LIMIT);
+    }
+    return envelope;
+  }
+
+  // Finish an external game with reported scores (from the trusted screen shell).
+  // Idempotent: a duplicate report (e.g. from a second TV) is a no-op returning
+  // false. Scores are validated and filtered to the current roster.
+  finishExternalGame(slug: string, scores: unknown): boolean {
+    const lobby = this.getLobby(slug);
+    const session = lobby.gameSession;
+    if (!session || !isExternalSnapshot(session.snapshot)) return false;
+    if (session.state === 'finished' || lobby.state === 'ended') return false;
+
+    if (!Array.isArray(scores) || scores.length > MAX_EXTERNAL_SCORES) {
+      throw new LobbyError('Ungültige Punktestände', 400);
+    }
+    const roster = new Set(lobby.players.keys());
+    const clean: Array<{ playerId: PlayerId; score: number }> = [];
+    for (const entry of scores) {
+      if (!entry || typeof entry !== 'object') continue;
+      const playerId = (entry as { playerId?: unknown }).playerId;
+      const score = (entry as { score?: unknown }).score;
+      if (typeof playerId !== 'string' || typeof score !== 'number' || !Number.isFinite(score)) {
+        throw new LobbyError('Ungültige Punktestände', 400);
+      }
+      if (roster.has(playerId)) clean.push({ playerId, score });
+    }
+
+    session.snapshot = { ...session.snapshot, scores: clean };
+    session.state = 'finished';
+    session.endedAt = new Date().toISOString();
+    lobby.state = 'ended';
+
+    const winner = clean.slice().sort((a, b) => b.score - a.score)[0];
+    const winnerName = winner ? lobby.players.get(winner.playerId)?.name : undefined;
+    this.addActivity(lobby, winnerName ? `Spiel beendet — ${winnerName} gewinnt` : 'Spiel beendet');
+    return true;
   }
 
   postChat(slug: string, playerToken: string, text: unknown): ChatMessage {
@@ -424,7 +621,10 @@ export function serializeLobbyRecord(lobby: LobbyRecord): SerializedLobbyRecord 
           snapshot: cloneSnapshot(lobby.gameSession.snapshot)
         }
       : null,
-    lastEvent: lobby.lastEvent
+    lastEvent: lobby.lastEvent,
+    mode: lobby.mode,
+    inputSeq: lobby.inputSeq,
+    inputLog: lobby.inputLog.slice()
   };
 }
 
@@ -449,11 +649,25 @@ export function deserializeLobbyRecord(serialized: SerializedLobbyRecord): Lobby
         }
       : null,
     lastEvent: serialized.lastEvent ?? null,
-    engine: snapshot && serialized.state === 'playing' ? TrebuchetEngine.fromSnapshot(snapshot) : null
+    // Only rebuild a Trebuchet engine for a live Trebuchet snapshot — external
+    // games have no engine, and fromSnapshot would fault on their shape.
+    engine:
+      isTrebuchetSnapshot(snapshot) && serialized.state === 'playing'
+        ? TrebuchetEngine.fromSnapshot(snapshot)
+        : null,
+    // Back-compat: records persisted before external-game support lack these.
+    mode: serialized.mode ?? 'local',
+    inputSeq: serialized.inputSeq ?? 0,
+    inputLog: serialized.inputLog ? serialized.inputLog.slice() : []
   };
 }
 
-function cloneSnapshot(snapshot: TrebuchetSnapshot): TrebuchetSnapshot {
+// Deep-clone a stored snapshot. External snapshots are shallow (seed + scores)
+// so a spread suffices; Trebuchet snapshots need their nested arrays copied.
+function cloneSnapshot(snapshot: LobbySnapshot): LobbySnapshot {
+  if (!isTrebuchetSnapshot(snapshot)) {
+    return { ...snapshot, ...(snapshot.scores ? { scores: snapshot.scores.map((s) => ({ ...s })) } : {}) };
+  }
   return {
     ...snapshot,
     heights: snapshot.heights.slice(),

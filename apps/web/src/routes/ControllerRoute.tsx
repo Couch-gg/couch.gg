@@ -14,7 +14,7 @@ import {
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState, type FormEvent, type MutableRefObject, type PointerEvent } from 'react';
 import type { Socket } from 'socket.io-client';
-import type { GameManifest, JoinLobbyResponse, Lobby, Player, RenamePlayerResponse } from '@couch/types';
+import type { GameManifest, InputAction, JoinLobbyResponse, Lobby, Player, RenamePlayerResponse } from '@couch/types';
 import {
   CHARGE_TIME_MS,
   ELEV_MAX,
@@ -29,8 +29,17 @@ import {
 } from '@couch/trebuchet';
 import { GameCatalog } from '../components/GameCatalog.js';
 import { ChatPanel } from '../components/ChatPanel.js';
+import { GenericController } from '../components/GenericController.js';
 import { fetchLobby, sendChat } from '../api.js';
 import { createSocket, emitAck } from '../socket.js';
+
+// True only for the built-in trebuchet snapshot shape. External games report
+// an `ExternalGameSnapshot` ({kind:'external', seed, scores?}) with no `units`
+// array — this guard keeps the trebuchet-only fields below from being read off
+// a snapshot that doesn't have them.
+function isTrebuchetSnapshot(snapshot: unknown): snapshot is TrebuchetSnapshot {
+  return !!snapshot && typeof snapshot === 'object' && 'units' in snapshot;
+}
 
 // The audio engine lives in public/ (served at /js/sfx.js), not in src/, so it must be loaded via a
 // runtime dynamic import rather than a static one. We wrap import() in `new Function` so Vite leaves
@@ -256,11 +265,16 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   }, [player, slug]);
 
   const isHost = Boolean(player && lobby?.hostPlayerId === player.id);
-  const snapshot = lobby?.gameSession?.snapshot as TrebuchetSnapshot | undefined;
+  const rawSnapshot = lobby?.gameSession?.snapshot;
+  const snapshot = isTrebuchetSnapshot(rawSnapshot) ? rawSnapshot : undefined;
   const currentTurn = snapshot?.turn;
   const myTurn = Boolean(player && currentTurn === player.id);
   const canStart = Boolean(isHost && lobby && lobby.players.length >= 2 && lobby.state !== 'playing');
   const myUnit = player ? snapshot?.units.find((unit) => unit.id === player.id) : undefined;
+  const currentManifest = games.find((game) => game.id === lobby?.currentGameId);
+  const isGenericLayout = currentManifest
+    ? currentManifest.controllerLayout.kind !== 'trebuchet-aim-fire' || currentManifest.origin === 'external'
+    : false;
 
   useEffect(() => {
     if (player && !editingName) setDraftName(player.name);
@@ -384,6 +398,31 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     }
     setShareRoomOpen(false);
   };
+
+  // Generic-controller event path for external/non-trebuchet games — no turn
+  // gating here (external games do their own turn logic per the manifest), and
+  // no preview/final split: every interaction is sent as-is via the same
+  // controller:event message the trebuchet pad already uses.
+  const sendGenericEvent = useCallback(
+    (control: string, action: InputAction, data?: unknown) => {
+      if (!socket) return;
+      void emitAck(socket, 'controller:event', {
+        slug,
+        playerToken,
+        event: {
+          playerId: player?.id,
+          type: 'game',
+          control,
+          value: { action, data },
+          timestamp: Date.now()
+        }
+      }).catch(() => {
+        // Best-effort like the trebuchet preview path; a dropped/rate-limited
+        // ack ({ok:true, dropped:true}) resolves fine and never reaches here.
+      });
+    },
+    [player?.id, playerToken, slug, socket]
+  );
 
   const sendPreview = useCallback(async (control: 'trebuchet.aim' | 'trebuchet.charge', value: unknown) => {
     if (!socket || !myTurn) return;
@@ -710,7 +749,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
 
             {isHost ? (
               <button className="primary-btn wide" disabled={!canStart} onClick={start}>
-                <Play size={18} /> Trebuchet starten
+                <Play size={18} /> {`${currentManifest?.title ?? 'Spiel'} starten`}
               </button>
             ) : (
               <p className="muted">Warte auf den Host. Dein Handy bleibt gekoppelt.</p>
@@ -720,6 +759,8 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
               <ChatPanel messages={lobby?.chat ?? []} onSend={sendChatMessage} />
             </div>
           </div>
+        ) : isGenericLayout && currentManifest ? (
+          <GenericController layout={currentManifest.controllerLayout} enabled onEvent={sendGenericEvent} />
         ) : (
           <div className="trebuchet-controls retro-pad" style={{ ['--team' as never]: teamHex }}>
             <div className="retro-pad-shell">

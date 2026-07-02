@@ -1,14 +1,17 @@
 import { Copy, MessageSquare, Plus, RotateCcw, Smartphone, Volume2, VolumeX } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { GameManifest, Lobby } from '@couch/types';
+import type { ExternalGameManifest, GameManifest, Lobby } from '@couch/types';
+import type { Socket } from 'socket.io-client';
 import type { TrebuchetEvent, TrebuchetSnapshot } from '@couch/trebuchet';
 import { createLobby, fetchGames, fetchLobby } from '../api.js';
 import { createSocket, emitAck } from '../socket.js';
 import { ChatPanel } from '../components/ChatPanel.js';
 import { GameCatalog } from '../components/GameCatalog.js';
+import { GameHostStage, type GameHostStageHandle } from '../components/GameHostStage.js';
 import { PlayerRoster } from '../components/PlayerRoster.js';
 import { QrPanel } from '../components/QrPanel.js';
 import { TrebuchetStage, type TrebuchetControlEvent } from '../components/TrebuchetStage.js';
+import { useExternalGameInputs } from '../hooks/useExternalGameInputs.js';
 
 // The audio engine lives in public/ (served at /js/sfx.js), not in src/, so it must be loaded via a
 // runtime dynamic import rather than a static one. We wrap import() in `new Function` so Vite leaves
@@ -46,6 +49,10 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
   const [lastControlEvent, setLastControlEvent] = useState<TrebuchetControlEvent | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [muted, setMuted] = useState(false);
+  // Exposed to the external-game host (game:finish auth) + input hook. The
+  // trebuchet path never reads it, so its flow is untouched.
+  const [socket, setSocket] = useState<Socket | null>(null);
+  const gameHostRef = useRef<GameHostStageHandle | null>(null);
 
   // A shot can reach this screen via the socket (same instance, instant) or via the
   // polled/snapshot lobby state (cross-instance, ≤750ms). Dedupe by monotonic seq so
@@ -60,6 +67,7 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
   useEffect(() => {
     let active = true;
     const socket = createSocket();
+    setSocket(socket);
     Promise.all([fetchLobby(slug), fetchGames()])
       .then(([initialLobby, gameList]) => {
         if (!active) return;
@@ -88,6 +96,7 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
       active = false;
       window.clearInterval(refreshTimer);
       socket.disconnect();
+      setSocket(null);
     };
   }, [slug, applyGameEvent]);
 
@@ -135,6 +144,18 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
   const eventSnapshot = lastEvent && 'snapshot' in lastEvent ? (lastEvent.snapshot as TrebuchetSnapshot) : undefined;
   const snapshot = (lobby?.gameSession?.snapshot as TrebuchetSnapshot | undefined) ?? eventSnapshot;
   const currentGame = games.find((game) => game.id === lobby?.currentGameId);
+  // An external game is any resolved manifest whose origin is 'external' (the
+  // catalog now returns those from GET /api/games). Absent origin ⇒ builtin.
+  const externalManifest =
+    currentGame && currentGame.origin === 'external' ? (currentGame as ExternalGameManifest) : null;
+
+  // Strict seq-ordered relay: socket 'game:input' + polled inputLog -> iframe.
+  // Always mounted (hooks can't be conditional); it no-ops until an external
+  // game is playing and the ref is attached.
+  const forwardInput = useCallback((input: Parameters<GameHostStageHandle['forwardInput']>[0]) => {
+    gameHostRef.current?.forwardInput(input);
+  }, []);
+  useExternalGameInputs({ socket, lobby, onInput: forwardInput });
 
   const createAnother = async () => {
     const next = await createLobby();
@@ -221,7 +242,17 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
             </span>
           </div>
           {lobby?.state === 'playing' ? (
-            <TrebuchetStage snapshot={snapshot ?? null} event={lastEvent} controlEvent={lastControlEvent} />
+            externalManifest && lobby ? (
+              <GameHostStage
+                ref={gameHostRef}
+                manifest={externalManifest}
+                lobby={lobby}
+                socket={socket}
+                mode="live"
+              />
+            ) : (
+              <TrebuchetStage snapshot={snapshot ?? null} event={lastEvent} controlEvent={lastControlEvent} />
+            )
           ) : (
             <GameCatalog games={games} currentGameId={lobby?.currentGameId ?? null} selectable={false} />
           )}

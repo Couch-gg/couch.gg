@@ -2362,3 +2362,148 @@ button:disabled {
       0 5px 0 #7a2823;
   }
 }
+
+/* =====================================================================
+   Generic controller (manifest-driven, external games) — reuses the
+   trebuchet retro-pad shell/LED/gauge vocabulary above via new variants.
+   ===================================================================== */
+
+.generic-controls.generic-disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.generic-pad-shell {
+  gap: 16px;
+}
+
+.generic-select-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.generic-select-label,
+.generic-slider-label {
+  font-family: "Press Start 2P", monospace;
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.generic-segmented {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.generic-segment {
+  min-height: 40px;
+  padding: 0 12px;
+  border: 2px solid #0c0e0d;
+  border-radius: 5px;
+  background: linear-gradient(180deg, #2c2d24 0%, #1d1e17 100%);
+  color: var(--text);
+  font-weight: 800;
+  font-size: 13px;
+}
+
+.generic-segment.selected {
+  color: var(--accent);
+  box-shadow: inset 0 0 0 1px rgba(241, 207, 106, 0.5);
+}
+
+.generic-cluster {
+  display: grid;
+  grid-template-columns: minmax(0, 96px) minmax(0, 1fr);
+  gap: 14px;
+  align-items: stretch;
+}
+
+.generic-cluster-single {
+  grid-template-columns: minmax(0, 1fr);
+  justify-items: center;
+}
+
+.generic-slider-col {
+  display: grid;
+  gap: 10px;
+}
+
+.generic-slider {
+  display: grid;
+  gap: 6px;
+}
+
+.generic-gauge {
+  min-height: 160px;
+}
+
+.generic-slider-value {
+  position: absolute;
+  left: 50%;
+  bottom: 6px;
+  transform: translateX(-50%);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--accent);
+  pointer-events: none;
+}
+
+.generic-action-cluster {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(64px, 1fr));
+  gap: 10px;
+  align-content: center;
+  max-height: min(60vh, 480px);
+  overflow-y: auto;
+}
+
+.generic-btn {
+  position: relative;
+  min-width: 64px;
+  min-height: 64px;
+  overflow: hidden;
+  border: 2px solid #0c0e0d;
+  border-radius: 8px;
+  background: linear-gradient(180deg, #2c2d24 0%, #1d1e17 100%);
+  color: var(--text);
+  font-family: "Press Start 2P", monospace;
+  font-size: 9px;
+  letter-spacing: 0.02em;
+  box-shadow:
+    inset 0 2px 0 rgba(255, 255, 255, 0.12),
+    inset 0 -2px 0 rgba(0, 0, 0, 0.5),
+    0 3px 0 #0a0c0b;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  transition: transform 60ms steps(2), box-shadow 60ms steps(2);
+}
+
+.generic-btn:active:not(:disabled) {
+  transform: translateY(2px);
+  box-shadow:
+    inset 0 2px 0 rgba(255, 255, 255, 0.06),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.5),
+    0 1px 0 #0a0c0b;
+}
+
+.generic-hold.charging {
+  color: var(--accent);
+}
+
+.generic-hold-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  background: color-mix(in srgb, var(--accent) 45%, transparent);
+  pointer-events: none;
+}
+
+.generic-btn-label {
+  position: relative;
+  z-index: 1;
+}

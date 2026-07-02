@@ -91,6 +91,9 @@ importers:
       '@couch/game-runtime':
         specifier: workspace:*
         version: link:../../packages/game-runtime
+      '@couch/game-sdk':
+        specifier: workspace:*
+        version: link:../../packages/game-sdk
       '@couch/trebuchet':
         specifier: workspace:*
         version: link:../../packages/games/trebuchet
