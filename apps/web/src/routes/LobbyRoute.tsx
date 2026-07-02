@@ -26,6 +26,9 @@ interface SfxModule {
 
 let sfxPromise: Promise<SfxModule | null> | null = null;
 
+// How long an external game's winner screen stays up after the lobby ends.
+const GAME_OVER_LINGER_MS = 5_000;
+
 function loadSfx(): Promise<SfxModule | null> {
   if (sfxPromise) return sfxPromise;
   sfxPromise = (async () => {
@@ -157,6 +160,43 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
   }, []);
   useExternalGameInputs({ socket, lobby, onInput: forwardInput });
 
+  // GAME-OVER LINGER: the server flips the lobby to 'ended' within milliseconds
+  // of couch:gameOver, which would unmount the iframe before anyone sees the
+  // game's winner screen. The linger is derived SYNCHRONOUSLY during render
+  // (a deadline in a ref, armed while playing) so the very render that sees
+  // state 'ended' still shows the stage — an effect would leave a one-frame
+  // unmount that reloads the iframe and erases the winner screen.
+  const lingerRef = useRef<{ manifest: ExternalGameManifest; deadline: number } | null>(null);
+  const [, forceLingerTick] = useState(0);
+  if (lobby?.state === 'playing' && externalManifest) {
+    lingerRef.current = { manifest: externalManifest, deadline: 0 }; // armed while live
+  } else if (lingerRef.current) {
+    if (lobby?.state === 'ended') {
+      if (lingerRef.current.deadline === 0) {
+        lingerRef.current = { manifest: lingerRef.current.manifest, deadline: Date.now() + GAME_OVER_LINGER_MS };
+      } else if (Date.now() >= lingerRef.current.deadline) {
+        lingerRef.current = null;
+      }
+    } else {
+      lingerRef.current = null; // back to waiting / a new game: drop immediately
+    }
+  }
+  const lingerManifest =
+    lobby?.state === 'ended' && lingerRef.current && lingerRef.current.deadline > 0
+      ? lingerRef.current.manifest
+      : null;
+  useEffect(() => {
+    if (!lingerManifest) return;
+    const remaining = Math.max(0, (lingerRef.current?.deadline ?? 0) - Date.now());
+    const timer = window.setTimeout(() => forceLingerTick((n) => n + 1), remaining + 20);
+    return () => window.clearTimeout(timer);
+  }, [lingerManifest]);
+
+  // The stage manifest for the SINGLE GameHostStage render position below —
+  // same element position across playing → linger keeps the iframe instance
+  // (and the game's winner screen) alive through the transition.
+  const stageManifest = lobby?.state === 'playing' ? externalManifest : lingerManifest;
+
   const createAnother = async () => {
     const next = await createLobby();
     navigate(`/l/${next.slug}`);
@@ -241,18 +281,16 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
               {lobby?.state === 'playing' ? 'Live' : lobby?.players.length ? 'Ready' : 'Waiting'}
             </span>
           </div>
-          {lobby?.state === 'playing' ? (
-            externalManifest && lobby ? (
-              <GameHostStage
-                ref={gameHostRef}
-                manifest={externalManifest}
-                lobby={lobby}
-                socket={socket}
-                mode="live"
-              />
-            ) : (
-              <TrebuchetStage snapshot={snapshot ?? null} event={lastEvent} controlEvent={lastControlEvent} />
-            )
+          {stageManifest && lobby ? (
+            <GameHostStage
+              ref={gameHostRef}
+              manifest={stageManifest}
+              lobby={lobby}
+              socket={socket}
+              mode="live"
+            />
+          ) : lobby?.state === 'playing' ? (
+            <TrebuchetStage snapshot={snapshot ?? null} event={lastEvent} controlEvent={lastControlEvent} />
           ) : (
             <GameCatalog games={games} currentGameId={lobby?.currentGameId ?? null} selectable={false} />
           )}

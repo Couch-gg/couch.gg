@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Tap Race</title>
+  <style>
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 1rem;
+      background: #0b1a24;
+      color: #e8f4ff;
+      font-family: ui-monospace, monospace;
+    }
+    h1 { letter-spacing: 0.1em; }
+    .lanes { display: flex; flex-direction: column; gap: 0.5rem; width: min(80%, 480px); }
+    .lane {
+      display: flex;
+      justify-content: space-between;
+      padding: 0.5rem 1rem;
+      background: #123049;
+      border-radius: 6px;
+    }
+    .lane-name { font-weight: bold; }
+    .lane-count { font-variant-numeric: tabular-nums; }
+    #winner { font-size: 1.5rem; min-height: 2rem; color: #ffd166; }
+  </style>
+</head>
+<body>
+  <h1>TAP RACE</h1>
+  <div class="lanes" id="lanes"></div>
+  <div id="winner" data-testid="winner"></div>
+
+  <script src="./couch-sdk.js"></script>
+  <script>
+    const WIN_TAPS = 5;
+
+    async function main() {
+      const manifestRes = await fetch('./couch.game.json');
+      const manifest = await manifestRes.json();
+
+      const counts = new Map();
+      let finished = false;
+
+      const lanesEl = document.getElementById('lanes');
+      const winnerEl = document.getElementById('winner');
+
+      function renderPlayers(players) {
+        lanesEl.innerHTML = '';
+        for (const player of players) {
+          if (!counts.has(player.id)) counts.set(player.id, 0);
+          const lane = document.createElement('div');
+          lane.className = 'lane';
+          lane.dataset.testid = 'lane-' + player.id;
+
+          const name = document.createElement('span');
+          name.className = 'lane-name';
+          name.textContent = player.name;
+          lane.appendChild(name);
+
+          const count = document.createElement('span');
+          count.className = 'lane-count';
+          count.dataset.testid = 'count-' + player.id;
+          count.textContent = String(counts.get(player.id));
+          lane.appendChild(count);
+
+          lanesEl.appendChild(lane);
+        }
+      }
+
+      function updateCount(playerId) {
+        const countEl = document.querySelector('[data-testid="count-' + playerId + '"]');
+        if (countEl) countEl.textContent = String(counts.get(playerId) ?? 0);
+      }
+
+      const couch = await CouchSDK.init({
+        manifest,
+        onPlayersChanged(players) {
+          renderPlayers(players);
+        },
+        onInput(input) {
+          if (finished) return;
+          if (input.control !== 'tap' || input.action !== 'press') return;
+
+          const playerId = input.playerId;
+          const next = (counts.get(playerId) ?? 0) + 1;
+          counts.set(playerId, next);
+          updateCount(playerId);
+
+          if (next >= WIN_TAPS) {
+            finished = true;
+            const players = couch.players;
+            const winner = players.find((p) => p.id === playerId);
+            const winnerName = winner ? winner.name : playerId;
+            winnerEl.textContent = winnerName.toUpperCase() + ' WINS!';
+
+            const scores = players.map((p) => ({ playerId: p.id, score: counts.get(p.id) ?? 0 }));
+            couch.gameOver(scores);
+          }
+        }
+      });
+
+      renderPlayers(couch.players);
+    }
+
+    main();
+  </script>
+</body>
+</html>
