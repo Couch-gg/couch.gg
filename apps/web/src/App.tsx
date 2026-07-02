@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { ControllerRoute } from './routes/ControllerRoute.js';
+import { DevSubmitRoute } from './routes/DevSubmitRoute.js';
 import { HomeRoute } from './routes/HomeRoute.js';
 import { JoinRoute } from './routes/JoinRoute.js';
 import { LobbyRoute } from './routes/LobbyRoute.js';
@@ -7,7 +8,7 @@ import { PairRoute } from './routes/PairRoute.js';
 import { TrebuchetStandaloneRoute } from './routes/TrebuchetStandaloneRoute.js';
 
 interface Route {
-  kind: 'home' | 'lobby' | 'controller' | 'trebuchet' | 'pair' | 'join';
+  kind: 'home' | 'lobby' | 'controller' | 'trebuchet' | 'pair' | 'join' | 'dev';
   slug?: string;
   screenId?: string;
 }
@@ -34,6 +35,7 @@ export function App() {
     // Screen ids are case-sensitive — do NOT uppercase.
     if (parts[0] === 's' && parts[1]) return { kind: 'pair', screenId: parts[1] };
     if (parts[0] === 'j' && parts[1]) return { kind: 'join', slug: parts[1].toUpperCase() };
+    if (parts[0] === 'dev') return { kind: 'dev' };
     return { kind: 'home' };
   }, [path]);
 
@@ -42,5 +44,6 @@ export function App() {
   if (route.kind === 'trebuchet') return <TrebuchetStandaloneRoute navigate={navigate} />;
   if (route.kind === 'pair') return <PairRoute screenId={route.screenId!} navigate={navigate} />;
   if (route.kind === 'join') return <JoinRoute slug={route.slug!} navigate={navigate} />;
+  if (route.kind === 'dev') return <DevSubmitRoute navigate={navigate} />;
   return <HomeRoute navigate={navigate} />;
 }

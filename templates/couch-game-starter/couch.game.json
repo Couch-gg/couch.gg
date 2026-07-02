@@ -1,0 +1,24 @@
+{
+  "id": "my-tap-race",
+  "title": "Tap Race",
+  "description": "First to 30 taps wins. Mash your button faster than everyone else in the room.",
+  "minPlayers": 1,
+  "maxPlayers": 8,
+  "controllerLayout": {
+    "kind": "generic-buttons",
+    "controls": [
+      { "control": "tap", "type": "button", "label": "TAP!" }
+    ]
+  },
+  "aspectRatio": "16:9",
+  "estimatedDurationMinutes": 2,
+  "thumbnail": {
+    "kind": "css",
+    "gradient": "linear-gradient(160deg,#12324d,#2d8fbe)",
+    "icon": "zap"
+  },
+  "entryUrl": "https://YOUR-HOST.example.com/index.html",
+  "sdkProtocol": 1,
+  "supportsRemote": true,
+  "author": { "name": "Your Name" }
+}

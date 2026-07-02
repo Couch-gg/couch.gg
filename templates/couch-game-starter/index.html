@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tap Race — couch.gg starter</title>
+  <style>
+    :root { color-scheme: dark; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 1.5rem;
+      background: radial-gradient(circle at 50% 30%, #12324d, #060d14);
+      color: #e8f4ff;
+      font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+      text-align: center;
+    }
+    h1 { margin: 0; letter-spacing: 0.16em; font-size: clamp(1.5rem, 5vw, 3rem); }
+    .lanes { display: flex; flex-direction: column; gap: 0.5rem; width: min(80%, 560px); }
+    .lane {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.6rem 1rem;
+      border-radius: 8px;
+      background: #123049;
+      /* --lane-color is set per player from their assigned palette index. */
+      border-left: 6px solid var(--lane-color, #2d8fbe);
+    }
+    .lane-name { font-weight: 700; }
+    .lane-count { font-variant-numeric: tabular-nums; font-size: 1.25rem; }
+    .bar { height: 6px; border-radius: 3px; background: #0a1a28; overflow: hidden; margin-top: 4px; }
+    .bar > span { display: block; height: 100%; background: var(--lane-color, #2d8fbe); width: 0; }
+    #status { min-height: 2.5rem; font-size: clamp(1.1rem, 3vw, 2rem); color: #ffd166; }
+    /* Respect reduced-motion: the transition is removed at runtime when the
+       platform reports the player prefers reduced motion. */
+    .bar > span { transition: width 120ms linear; }
+    body.reduced-motion .bar > span { transition: none; }
+  </style>
+</head>
+<body>
+  <h1>TAP RACE</h1>
+  <div class="lanes" id="lanes"></div>
+  <div id="status">Waiting for players…</div>
+
+  <!--
+    The couch.gg SDK, hot-linked from production. This is the recommended source.
+
+    Local-file alternative (for offline editing): download the bundle and load it
+    relative to this file instead:
+      <script src="./couch-sdk.js"></script>
+    Get it from https://couch-gg.vercel.app/sdk/v1/couch-sdk.js
+  -->
+  <script src="https://couch-gg.vercel.app/sdk/v1/couch-sdk.js"></script>
+  <script>
+    // First to this many taps wins.
+    const WIN_TAPS = 30;
+
+    async function main() {
+      // The manifest is fetched from the same host as this page. Because the game
+      // runs in a sandboxed (opaque-origin) iframe, this fetch sends `Origin: null`
+      // — your host MUST send `Access-Control-Allow-Origin: *` or the browser
+      // blocks it. (GitHub Pages does this by default; for Netlify/Vercel see the
+      // starter README.) You could also inline the manifest object and skip the
+      // fetch entirely — the SDK never fetches it for you.
+      const manifest = await (await fetch('./couch.game.json')).json();
+
+      // Per-player tap counts, keyed by player.id (NEVER by array index — indices
+      // shift when a player leaves mid-game).
+      const counts = new Map();
+      let finished = false;
+
+      const lanesEl = document.getElementById('lanes');
+      const statusEl = document.getElementById('status');
+
+      // couch.gg's 8-colour palette, indexed by player.colorIdx.
+      const PALETTE = ['#ff5d73', '#4dd6ff', '#ffd166', '#8affc1', '#c792ea', '#ff9f68', '#5ce1e6', '#f78fb3'];
+      const laneColor = (i) => PALETTE[i % PALETTE.length];
+
+      function renderRoster(players) {
+        lanesEl.innerHTML = '';
+        for (const player of players) {
+          if (!counts.has(player.id)) counts.set(player.id, 0);
+          const lane = document.createElement('div');
+          lane.className = 'lane';
+          lane.style.setProperty('--lane-color', laneColor(player.colorIdx));
+
+          const name = document.createElement('span');
+          name.className = 'lane-name';
+          // Show a dot when a phone is reconnecting so nobody looks eliminated.
+          name.textContent = player.name + (player.connected ? '' : ' •');
+          lane.appendChild(name);
+
+          const count = document.createElement('span');
+          count.className = 'lane-count';
+          count.id = 'count-' + player.id;
+          count.textContent = String(counts.get(player.id));
+          lane.appendChild(count);
+
+          lanesEl.appendChild(lane);
+        }
+        if (!finished && players.length > 0) {
+          statusEl.textContent = 'First to ' + WIN_TAPS + ' wins — TAP!';
+        }
+      }
+
+      function bump(playerId) {
+        const el = document.getElementById('count-' + playerId);
+        if (el) el.textContent = String(counts.get(playerId) ?? 0);
+      }
+
+      const couch = await CouchSDK.init({
+        manifest,
+
+        // Honour the player's reduced-motion preference (drops bar transitions).
+        // `couch.reducedMotion` is also readable on the handle after init.
+        onPlayersChanged(players) {
+          renderRoster(players);
+        },
+
+        onInput(input) {
+          if (finished) return;
+          // We declared one control named "tap" of type "button". A button emits
+          // `press` then `release`; count the press.
+          if (input.control !== 'tap' || input.action !== 'press') return;
+
+          const next = (counts.get(input.playerId) ?? 0) + 1;
+          counts.set(input.playerId, next);
+          bump(input.playerId);
+
+          if (next >= WIN_TAPS) endGame(input.playerId);
+        },
+
+        // The big-screen tab was backgrounded / restored. This game has no loop to
+        // pause, but real games should stop timers/animation here.
+        onPause() { /* stop your game loop */ },
+        onResume() { /* resume your game loop */ }
+      });
+
+      if (couch.reducedMotion) document.body.classList.add('reduced-motion');
+
+      function endGame(winnerId) {
+        finished = true;
+        const winner = couch.players.find((p) => p.id === winnerId);
+        // Draw the winner screen NOW: the platform keeps this screen up for ~5
+        // seconds after gameOver, then returns to the catalog. Design for that
+        // window — no input arrives after gameOver.
+        statusEl.textContent = (winner ? winner.name.toUpperCase() : 'SOMEONE') + ' WINS!';
+
+        // Report final scores exactly once. Higher score = better (the platform
+        // sorts descending to name the winner).
+        const scores = couch.players.map((p) => ({ playerId: p.id, score: counts.get(p.id) ?? 0 }));
+        couch.gameOver(scores);
+      }
+
+      // Initial paint from the roster the SDK already has.
+      renderRoster(couch.players);
+    }
+
+    main();
+  </script>
+</body>
+</html>

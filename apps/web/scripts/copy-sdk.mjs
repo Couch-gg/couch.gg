@@ -21,6 +21,14 @@ const source = resolve(repoRoot, 'packages', 'game-sdk', 'dist', 'couch-sdk.iife
 const destDir = resolve(scriptDir, '..', 'public', 'sdk', 'v1');
 const dest = resolve(destDir, 'couch-sdk.js');
 
+// The creator-facing guide lives next to the SDK source and is served at a
+// stable public URL (/COUCH-GAME-GUIDE.md) so creators can hot-link it into
+// their coding agent. It is copied to public/ root — NOT public/sdk/ — because
+// public/sdk/ is gitignored while the guide copy is a plain public asset.
+const guideSource = resolve(repoRoot, 'packages', 'game-sdk', 'COUCH-GAME-GUIDE.md');
+const publicDir = resolve(scriptDir, '..', 'public');
+const guideDest = resolve(publicDir, 'COUCH-GAME-GUIDE.md');
+
 async function main() {
   try {
     await access(source);
@@ -35,6 +43,20 @@ async function main() {
   await mkdir(destDir, { recursive: true });
   await copyFile(source, dest);
   console.log(`[copy-sdk] Copied SDK bundle -> ${dest}`);
+
+  try {
+    await access(guideSource);
+  } catch {
+    console.error(
+      `[copy-sdk] Creator guide not found:\n  ${guideSource}\n` +
+        `Expected packages/game-sdk/COUCH-GAME-GUIDE.md to exist.`
+    );
+    process.exit(1);
+  }
+
+  await mkdir(publicDir, { recursive: true });
+  await copyFile(guideSource, guideDest);
+  console.log(`[copy-sdk] Copied creator guide -> ${guideDest}`);
 }
 
 main().catch((err) => {
