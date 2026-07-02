@@ -116,6 +116,7 @@ export interface GameManifest {
   thumbnail: GameThumbnail;
   comingSoon?: boolean;
   origin?: GameOrigin;         // absent ⇒ builtin
+  featured?: boolean;          // admin-curated catalog boost (games registry)
 }
 
 // Snapshot kind for external (creator-hosted, iframe-sandboxed) games. The
