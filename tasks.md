@@ -21,7 +21,8 @@ Gates: `pnpm build:packages` → `pnpm typecheck` → `pnpm test:unit` → `pnpm
 | 4A | /dev submit + test-harness page | 4 | Sonnet | apps/web/src/routes/DevSubmitRoute.tsx (new), apps/web/src/App.tsx, apps/web/src/styles.css | PASS | 0* | Verified: live-browser run (handshake OK, taps round-trip, publish 201+token UI, unpublish); App.tsx wiring minimal; no sockets; 12/12 e2e by builder. Partial from dead 1st attempt was fully correct — kept 100%. |
 | 4B | COUCH-GAME-GUIDE.md + starter template | 4 | Opus | packages/game-sdk/COUCH-GAME-GUIDE.md (new, 669 lines), templates/couch-game-starter/** (new), apps/web/scripts/copy-sdk.mjs (guide copy), README.md pointer | PASS | 0* | Verified: orchestrator accuracy audit (rate limits/quick-start/linger/tiers all match source); template validated against real validator; simulator verified headless. Public guide copy gitignored (orchestrator). |
 | — | W4 GATE | 4 | — | — | GREEN | — | 204 unit, tc 0, build 0, e2e 12/12. Committed ad86851. |
-| 5A | E2E expansion (submit flow, remote 2-TV, dev simulator) | 5 | Sonnet | apps/web/tests/external-game.spec.ts | IN-FLIGHT | 0 | |
+| 5A | E2E expansion (submit flow, remote 2-TV, dev simulator) | 5 | Sonnet | apps/web/tests/external-game.spec.ts | PASS | 0 | Verified: 18/18 twice, no flake, no project restrictions; fixed latent substring-selector brittleness. |
+| — | W5 GATE + LANDED | 5 | — | — | DONE | — | Final gate green (204 unit, 18/18 e2e). PR #9 merged (f029543). PROD VERIFIED: guide+SDK+/dev live; real publish→catalog→delete lifecycle green on couch-gg.vercel.app (Redis registry working). Outstanding: ADMIN_KEY env (user action — secret write blocked by policy). |
 
 ## Wave gates
 - W1: build:packages + typecheck + new unit tests green → launch W2
