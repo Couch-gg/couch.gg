@@ -6,7 +6,19 @@ import {
   type LobbyRecord,
   type SerializedLobbyRecord
 } from './lobbies.js';
+import type { PublishedGameRecord } from './games-registry.js';
 import { SCREEN_CLAIM_GRACE_MS, type ScreenRecord } from './screens.js';
+
+// Durable store for the published-games registry. Unlike lobbies/screens these
+// records have NO TTL — a published game lives until it is explicitly deleted or
+// taken down. The registry class caches on top of this and re-lists when stale.
+export interface GamePersistence {
+  enabled: boolean;
+  loadGame(id: string): Promise<PublishedGameRecord | null>;
+  saveGame(record: PublishedGameRecord): Promise<void>;
+  deleteGame(id: string): Promise<void>;
+  listGames(): Promise<PublishedGameRecord[]>;
+}
 
 export interface LobbyPersistence {
   enabled: boolean;
@@ -235,6 +247,127 @@ class QueueLobbyPersistence implements LobbyPersistence {
     });
   }
 }
+
+// --- Games registry persistence ---------------------------------------------
+//
+// Redis when REDIS_URL is set; otherwise an in-memory Map so local dev and e2e
+// get the full submit flow without Redis. On Vercel without Redis the registry
+// is disabled (submit returns 503, catalog stays builtin-only) — the Queue is
+// deliberately NOT used here: it is a log, the wrong shape for a keyed index we
+// must overwrite/delete in place.
+export function createProductionGamePersistence(redisUrl = process.env.REDIS_URL): GamePersistence {
+  if (redisUrl) return new RedisGamePersistence(redisUrl);
+  if (process.env.VERCEL) return disabledGamePersistence;
+  return new InMemoryGamePersistence();
+}
+
+const disabledGamePersistence: GamePersistence = {
+  enabled: false,
+  async loadGame() {
+    return null;
+  },
+  async saveGame() {
+    throw new Error('Games persistence is disabled');
+  },
+  async deleteGame() {},
+  async listGames() {
+    return [];
+  }
+};
+
+// Full submit flow without Redis (local dev + e2e). Clones on the way in and out
+// so callers can never mutate the stored record by reference.
+class InMemoryGamePersistence implements GamePersistence {
+  enabled = true;
+  private readonly games = new Map<string, PublishedGameRecord>();
+
+  async loadGame(id: string): Promise<PublishedGameRecord | null> {
+    const record = this.games.get(id);
+    return record ? clone(record) : null;
+  }
+
+  async saveGame(record: PublishedGameRecord): Promise<void> {
+    this.games.set(record.manifest.id, clone(record));
+  }
+
+  async deleteGame(id: string): Promise<void> {
+    this.games.delete(id);
+  }
+
+  async listGames(): Promise<PublishedGameRecord[]> {
+    return [...this.games.values()].map(clone);
+  }
+}
+
+class RedisGamePersistence implements GamePersistence {
+  enabled = true;
+  private clientPromise: Promise<RedisClientType> | null = null;
+
+  constructor(private readonly redisUrl: string) {}
+
+  async loadGame(id: string): Promise<PublishedGameRecord | null> {
+    const client = await this.client();
+    const raw = await client.get(gameKey(id));
+    if (!raw) return null;
+    return JSON.parse(raw) as PublishedGameRecord;
+  }
+
+  // Plain SET (no PXAT/EX) — published games are durable, not TTL'd. The id is
+  // also added to the index SET so listGames can enumerate without SCAN.
+  async saveGame(record: PublishedGameRecord): Promise<void> {
+    const client = await this.client();
+    await client.set(gameKey(record.manifest.id), JSON.stringify(record));
+    await client.sAdd(GAMES_INDEX_KEY, record.manifest.id);
+  }
+
+  async deleteGame(id: string): Promise<void> {
+    const client = await this.client();
+    await client.del(gameKey(id));
+    await client.sRem(GAMES_INDEX_KEY, id);
+  }
+
+  // SMEMBERS + MGET, pruning any index ids whose record has vanished (e.g. a key
+  // was manually deleted) so the index never accumulates dangling entries.
+  async listGames(): Promise<PublishedGameRecord[]> {
+    const client = await this.client();
+    const ids = await client.sMembers(GAMES_INDEX_KEY);
+    if (ids.length === 0) return [];
+    const keys = ids.map((id) => gameKey(id));
+    const raws = await client.mGet(keys);
+    const out: PublishedGameRecord[] = [];
+    const dangling: string[] = [];
+    raws.forEach((raw, i) => {
+      if (raw == null) {
+        dangling.push(ids[i]);
+        return;
+      }
+      out.push(JSON.parse(raw) as PublishedGameRecord);
+    });
+    if (dangling.length > 0) await client.sRem(GAMES_INDEX_KEY, dangling);
+    return out;
+  }
+
+  private async client(): Promise<RedisClientType> {
+    if (!this.clientPromise) {
+      const client = createClient({ url: this.redisUrl });
+      client.on('error', (err: unknown) => {
+        console.error('Redis games persistence error', err);
+      });
+      this.clientPromise = client.connect() as Promise<RedisClientType>;
+    }
+    return this.clientPromise;
+  }
+}
+
+function clone<T>(value: T): T {
+  return structuredClone(value);
+}
+
+function gameKey(id: string): string {
+  return `couch:game:${id}`;
+}
+
+const GAMES_INDEX_KEY = 'couch:games:index';
 
 function key(slug: string): string {
   return `couch:lobby:${slug.toUpperCase()}`;

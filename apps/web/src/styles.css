@@ -1728,6 +1728,61 @@ button:disabled {
   letter-spacing: 0.03em;
 }
 
+.game-card-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 12px;
+}
+
+.game-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+}
+
+.game-badge.community {
+  background: rgba(98, 213, 213, 0.16);
+  color: var(--cyan);
+}
+
+.game-badge.remote {
+  background: rgba(93, 201, 97, 0.16);
+  color: var(--green);
+}
+
+.game-card-report {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(16, 18, 17, 0.55);
+  color: var(--muted);
+  cursor: pointer;
+  transition: color 160ms ease, border-color 160ms ease;
+
+  /* Button reset */
+  -webkit-appearance: none;
+  appearance: none;
+  font: inherit;
+}
+
+.game-card-report:hover {
+  color: var(--text);
+  border-color: rgba(241, 207, 106, 0.32);
+}
+
 /* ----- Chat panel ----- */
 
 .chat-panel {

@@ -292,7 +292,12 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
           ) : lobby?.state === 'playing' ? (
             <TrebuchetStage snapshot={snapshot ?? null} event={lastEvent} controlEvent={lastControlEvent} />
           ) : (
-            <GameCatalog games={games} currentGameId={lobby?.currentGameId ?? null} selectable={false} />
+            <GameCatalog
+              games={games}
+              currentGameId={lobby?.currentGameId ?? null}
+              selectable={false}
+              remoteMode={lobby?.mode === 'remote'}
+            />
           )}
         </section>
       </section>

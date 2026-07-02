@@ -745,6 +745,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
               currentGameId={lobby?.currentGameId ?? null}
               selectable={isHost}
               onSelect={selectGame}
+              remoteMode={lobby?.mode === 'remote'}
             />
 
             {isHost ? (
