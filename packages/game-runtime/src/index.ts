@@ -1,5 +1,11 @@
 import type { GameManifest, GameId } from '@couch/types';
 
+export {
+  RESERVED_GAME_IDS,
+  validateExternalManifestInput
+} from './external-manifest.js';
+export type { ExternalManifestInput } from './external-manifest.js';
+
 export const TREBUCHET_MANIFEST: GameManifest = {
   id: 'trebuchet',
   title: 'Trebuchet',
@@ -17,6 +23,7 @@ export const TREBUCHET_MANIFEST: GameManifest = {
   aspectRatio: '16:9',
   estimatedDurationMinutes: 8,
   status: 'internal',
+  origin: 'builtin',
   thumbnail: {
     kind: 'css',
     gradient: 'linear-gradient(160deg, #2a1b3d 0%, #5a2c42 60%, #e8554d 135%)',
@@ -38,6 +45,7 @@ export const TANK_DUEL_MANIFEST: GameManifest = {
   aspectRatio: '16:9',
   estimatedDurationMinutes: 6,
   status: 'internal',
+  origin: 'builtin',
   comingSoon: true,
   thumbnail: {
     kind: 'css',
@@ -60,6 +68,7 @@ export const QUIZ_RUSH_MANIFEST: GameManifest = {
   aspectRatio: '16:9',
   estimatedDurationMinutes: 10,
   status: 'internal',
+  origin: 'builtin',
   comingSoon: true,
   thumbnail: {
     kind: 'css',
@@ -82,6 +91,7 @@ export const KART_CHAOS_MANIFEST: GameManifest = {
   aspectRatio: '16:9',
   estimatedDurationMinutes: 5,
   status: 'internal',
+  origin: 'builtin',
   comingSoon: true,
   thumbnail: {
     kind: 'css',

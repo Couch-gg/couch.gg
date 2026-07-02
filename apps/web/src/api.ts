@@ -15,8 +15,13 @@ export const REALTIME_URL = import.meta.env.VITE_REALTIME_URL || fallbackRealtim
 export const REALTIME_API_PREFIX = import.meta.env.VITE_REALTIME_API_PREFIX || (isLocalDevHost ? '/api' : '/api/realtime');
 export const REALTIME_SOCKET_PATH = import.meta.env.VITE_REALTIME_SOCKET_PATH || (isLocalDevHost ? '/socket.io' : '/api/realtime/socket.io');
 
-export async function createLobby(): Promise<Lobby> {
-  const response = await fetch(`${REALTIME_URL}${REALTIME_API_PREFIX}/lobbies`, { method: 'POST' });
+export async function createLobby(mode?: 'local' | 'remote'): Promise<Lobby> {
+  const response = await fetch(`${REALTIME_URL}${REALTIME_API_PREFIX}/lobbies`, {
+    method: 'POST',
+    ...(mode
+      ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode }) }
+      : {})
+  });
   if (!response.ok) throw new Error('Lobby konnte nicht erstellt werden');
   const body = (await response.json()) as CreateLobbyResponse;
   return body.lobby;

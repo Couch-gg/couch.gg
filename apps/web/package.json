@@ -4,14 +4,15 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite --host 0.0.0.0",
-    "build": "tsc -p tsconfig.json && vite build",
+    "dev": "node scripts/copy-sdk.mjs && vite --host 0.0.0.0",
+    "build": "node scripts/copy-sdk.mjs && tsc -p tsconfig.json && vite build",
     "preview": "vite preview --host 0.0.0.0",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "echo \"@couch/web uses Playwright e2e tests from the repo root\""
   },
   "dependencies": {
     "@couch/game-runtime": "workspace:*",
+    "@couch/game-sdk": "workspace:*",
     "@couch/trebuchet": "workspace:*",
     "@couch/types": "workspace:*",
     "@vitejs/plugin-react": "^5.1.1",

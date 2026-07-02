@@ -66,6 +66,22 @@ curl https://couch-gg.vercel.app/api/realtime/health
 PLAYWRIGHT_BASE_URL=https://couch-gg.vercel.app pnpm exec playwright test
 ~~~
 
+## Publish your own game
+
+Anyone can build a game that runs on couch.gg — you write only the big-screen
+render + logic; the platform provides the lobby, QR pairing, phone controllers,
+and input relay. Games run in a sandboxed iframe and talk to the platform via the
+`@couch/game-sdk`.
+
+- **Full contract for creators (and their coding agents):**
+  [`packages/game-sdk/COUCH-GAME-GUIDE.md`](packages/game-sdk/COUCH-GAME-GUIDE.md)
+  — also served at https://couch-gg.vercel.app/COUCH-GAME-GUIDE.md.
+- **Starter template:** [`templates/couch-game-starter/`](templates/couch-game-starter/)
+  — a complete, degit-able example game. Open its `index.html` to try it in the
+  built-in dev simulator.
+- **Test & publish:** validate your manifest and publish (no account) at
+  https://couch-gg.vercel.app/dev.
+
 ## Games
 
 ### [TREBUCHET](games/trebuchet/) — siege artillery duel

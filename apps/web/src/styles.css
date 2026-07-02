@@ -1728,6 +1728,61 @@ button:disabled {
   letter-spacing: 0.03em;
 }
 
+.game-card-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 12px;
+}
+
+.game-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+}
+
+.game-badge.community {
+  background: rgba(98, 213, 213, 0.16);
+  color: var(--cyan);
+}
+
+.game-badge.remote {
+  background: rgba(93, 201, 97, 0.16);
+  color: var(--green);
+}
+
+.game-card-report {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(16, 18, 17, 0.55);
+  color: var(--muted);
+  cursor: pointer;
+  transition: color 160ms ease, border-color 160ms ease;
+
+  /* Button reset */
+  -webkit-appearance: none;
+  appearance: none;
+  font: inherit;
+}
+
+.game-card-report:hover {
+  color: var(--text);
+  border-color: rgba(241, 207, 106, 0.32);
+}
+
 /* ----- Chat panel ----- */
 
 .chat-panel {
@@ -2360,5 +2415,334 @@ button:disabled {
       inset 0 -6px 0 rgba(0, 0, 0, 0.4),
       0 0 0 4px var(--accent),
       0 5px 0 #7a2823;
+  }
+}
+
+/* =====================================================================
+   Generic controller (manifest-driven, external games) — reuses the
+   trebuchet retro-pad shell/LED/gauge vocabulary above via new variants.
+   ===================================================================== */
+
+.generic-controls.generic-disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.generic-pad-shell {
+  gap: 16px;
+}
+
+.generic-select-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.generic-select-label,
+.generic-slider-label {
+  font-family: "Press Start 2P", monospace;
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.generic-segmented {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.generic-segment {
+  min-height: 40px;
+  padding: 0 12px;
+  border: 2px solid #0c0e0d;
+  border-radius: 5px;
+  background: linear-gradient(180deg, #2c2d24 0%, #1d1e17 100%);
+  color: var(--text);
+  font-weight: 800;
+  font-size: 13px;
+}
+
+.generic-segment.selected {
+  color: var(--accent);
+  box-shadow: inset 0 0 0 1px rgba(241, 207, 106, 0.5);
+}
+
+.generic-cluster {
+  display: grid;
+  grid-template-columns: minmax(0, 96px) minmax(0, 1fr);
+  gap: 14px;
+  align-items: stretch;
+}
+
+.generic-cluster-single {
+  grid-template-columns: minmax(0, 1fr);
+  justify-items: center;
+}
+
+.generic-slider-col {
+  display: grid;
+  gap: 10px;
+}
+
+.generic-slider {
+  display: grid;
+  gap: 6px;
+}
+
+.generic-gauge {
+  min-height: 160px;
+}
+
+.generic-slider-value {
+  position: absolute;
+  left: 50%;
+  bottom: 6px;
+  transform: translateX(-50%);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--accent);
+  pointer-events: none;
+}
+
+.generic-action-cluster {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(64px, 1fr));
+  gap: 10px;
+  align-content: center;
+  max-height: min(60vh, 480px);
+  overflow-y: auto;
+}
+
+.generic-btn {
+  position: relative;
+  min-width: 64px;
+  min-height: 64px;
+  overflow: hidden;
+  border: 2px solid #0c0e0d;
+  border-radius: 8px;
+  background: linear-gradient(180deg, #2c2d24 0%, #1d1e17 100%);
+  color: var(--text);
+  font-family: "Press Start 2P", monospace;
+  font-size: 9px;
+  letter-spacing: 0.02em;
+  box-shadow:
+    inset 0 2px 0 rgba(255, 255, 255, 0.12),
+    inset 0 -2px 0 rgba(0, 0, 0, 0.5),
+    0 3px 0 #0a0c0b;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  transition: transform 60ms steps(2), box-shadow 60ms steps(2);
+}
+
+.generic-btn:active:not(:disabled) {
+  transform: translateY(2px);
+  box-shadow:
+    inset 0 2px 0 rgba(255, 255, 255, 0.06),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.5),
+    0 1px 0 #0a0c0b;
+}
+
+.generic-hold.charging {
+  color: var(--accent);
+}
+
+.generic-hold-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  background: color-mix(in srgb, var(--accent) 45%, transparent);
+  pointer-events: none;
+}
+
+.generic-btn-label {
+  position: relative;
+  z-index: 1;
+}
+
+/* ---- /dev: minimal creator submission surface -------------------------- */
+.dev-shell {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: clamp(22px, 4vw, 64px);
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
+.dev-header {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.dev-title {
+  margin: 6px 0 0;
+  font-size: clamp(28px, 5vw, 44px);
+  line-height: 1.1;
+  color: var(--text);
+}
+
+.dev-sub {
+  margin: 0;
+  max-width: 60ch;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+.dev-section {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(27, 33, 31, 0.86);
+  box-shadow: var(--shadow);
+}
+
+.dev-section-title {
+  margin: 0;
+  font-size: 16px;
+  color: var(--text);
+}
+
+.dev-textarea {
+  width: 100%;
+  min-height: 320px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(248, 237, 207, 0.05);
+  color: var(--text);
+  padding: 14px;
+  outline: none;
+  resize: vertical;
+  font-family: ui-monospace, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.dev-hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.dev-valid-line {
+  margin: 0;
+  color: var(--green);
+  font-weight: 700;
+  font-size: 13px;
+}
+
+.dev-error-list {
+  margin: 0;
+  padding-left: 20px;
+  color: #ff9a8e;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.dev-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.dev-test-harness {
+  display: grid;
+  grid-template-columns: minmax(0, 640px) minmax(220px, 1fr);
+  gap: 20px;
+  align-items: start;
+}
+
+.dev-test-stage {
+  width: 100%;
+  max-width: 640px;
+  aspect-ratio: 16 / 9;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #000;
+}
+
+.dev-test-controllers {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.dev-fake-phone {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.dev-fake-phone-label {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.dev-scores {
+  color: var(--text);
+  font-size: 14px;
+}
+
+.dev-scores ul {
+  margin: 8px 0 0;
+  padding-left: 20px;
+  color: var(--muted);
+}
+
+.dev-publish-success {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.dev-token-box {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(248, 237, 207, 0.08);
+  padding: 10px 14px;
+}
+
+.dev-token-value {
+  flex: 1;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, monospace;
+  font-size: 13px;
+  color: var(--accent);
+}
+
+.dev-manage-section {
+  background: transparent;
+  box-shadow: none;
+  border-style: dashed;
+}
+
+.dev-manage-toggle {
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.dev-manage-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: 4px;
+}
+
+@media (max-width: 780px) {
+  .dev-test-harness {
+    grid-template-columns: 1fr;
   }
 }

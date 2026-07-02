@@ -5,10 +5,51 @@ import express from 'express';
 import { Server, type ServerOptions } from 'socket.io';
 import { GAME_MANIFESTS } from '@couch/game-runtime';
 import type { TrebuchetEvent } from '@couch/trebuchet';
-import type { ControllerEvent, GameId, PlayerId, ScreenId } from '@couch/types';
-import { LobbyError, LobbyStore, RECONNECT_GRACE_MS, type LobbyRecord } from './lobbies.js';
-import { createProductionLobbyPersistence } from './persistence.js';
+import type { ControllerEvent, GameId, GameManifest, PlayerId, ScreenId } from '@couch/types';
+import { createHash, timingSafeEqual } from 'node:crypto';
+import { LobbyError, LobbyStore, RECONNECT_GRACE_MS, type LobbyRecord, type ManifestResolver } from './lobbies.js';
+import { mergeCatalog, parseExternalGamesJson } from './external-games.js';
+import { RateLimiter } from './rate-limit.js';
+import { createProductionGamePersistence, createProductionLobbyPersistence } from './persistence.js';
+import { GamesRegistry, RegistryError, adminGameView, publicGame } from './games-registry.js';
 import { ScreenRegistry } from './screens.js';
+
+// Per-key token bucket for report throttling: capacity 5, refill 5 tokens/hour.
+// Same shape as RateLimiter but with report-specific constants; kept local so
+// rate-limit.ts (input-relay tuned) stays untouched. Keyed `report:<ip>`.
+const REPORT_CAPACITY = 5;
+const REPORT_REFILL_PER_MS = 5 / 3_600_000; // 5 per 3600s
+const REPORT_IDLE_PRUNE_MS = 3_600_000;
+
+class ReportRateLimiter {
+  private readonly buckets = new Map<string, { tokens: number; lastRefill: number }>();
+  private lastPrune = 0;
+
+  allow(key: string, now = Date.now()): boolean {
+    this.pruneIdle(now);
+    let bucket = this.buckets.get(key);
+    if (!bucket) {
+      bucket = { tokens: REPORT_CAPACITY, lastRefill: now };
+      this.buckets.set(key, bucket);
+    }
+    const elapsed = now - bucket.lastRefill;
+    if (elapsed > 0) {
+      bucket.tokens = Math.min(REPORT_CAPACITY, bucket.tokens + elapsed * REPORT_REFILL_PER_MS);
+      bucket.lastRefill = now;
+    }
+    if (bucket.tokens < 1) return false;
+    bucket.tokens -= 1;
+    return true;
+  }
+
+  private pruneIdle(now: number): void {
+    if (now - this.lastPrune < REPORT_IDLE_PRUNE_MS) return;
+    this.lastPrune = now;
+    for (const [key, bucket] of this.buckets) {
+      if (now - bucket.lastRefill > REPORT_IDLE_PRUNE_MS) this.buckets.delete(key);
+    }
+  }
+}
 
 interface SocketContext {
   role: 'screen' | 'controller' | 'screen-pairing';
@@ -35,10 +76,39 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   const clientOrigin = options.clientOrigin ?? process.env.CLIENT_ORIGIN ?? '*';
   const apiPrefix = normalizeApiPrefix(options.apiPrefix ?? process.env.API_PREFIX ?? '/api');
   const socketPath = options.socketPath ?? process.env.SOCKET_PATH ?? '/socket.io';
-  const store = new LobbyStore();
+  // Env-registered external games (ops escape hatch before the durable registry).
+  // Parsed once at startup; localhost http is allowed only off Vercel (local dev).
+  const externalGames = parseExternalGamesJson(process.env.EXTERNAL_GAMES_JSON, {
+    allowHttpLocalhost: !process.env.VERCEL
+  });
+  const externalById = new Map<GameId, GameManifest>(externalGames.map((game) => [game.id, game]));
+
+  // Durable published-games registry (Redis / in-memory / disabled). The manifest
+  // resolver and catalog both consult its in-memory cache synchronously; REST and
+  // async socket handlers await ensureFresh() first so the cache reflects writes
+  // from other serverless instances within the 30s window.
+  const gamesPersistence = createProductionGamePersistence();
+  const registry = new GamesRegistry(gamesPersistence);
+
+  // Resolver the store uses instead of the throwing getGameManifest: built-ins
+  // first, then env-registered externals, then the durable registry (sync cache
+  // read) so selecting/starting a registry game resolves end-to-end.
+  const resolveManifest: ManifestResolver = (id) =>
+    GAME_MANIFESTS.find((game) => game.id === id) ?? externalById.get(id) ?? registry.resolveById(id) ?? null;
+
+  // Merged catalog served everywhere the built-in list used to be: built-ins +
+  // env-registered externals + published registry games (public slice from the
+  // cache). Keep it sync — callers await ensureFresh() before hitting it.
+  const catalog = (): GameManifest[] => mergeCatalog([...externalGames, ...registry.listPublic()]);
+
+  const store = new LobbyStore(resolveManifest);
   const screens = new ScreenRegistry();
   const persistence = createProductionLobbyPersistence();
   const turnTimers = new Map<string, NodeJS.Timeout>();
+  const inputLimiter = new RateLimiter();
+  // Per-IP report throttle: 5 reports/hour. Same token-bucket shape as the input
+  // limiter but with report-specific capacity/refill, keyed `report:<ip>`.
+  const reportLimiter = new ReportRateLimiter();
 
   const app = express();
   app.use(cors({ origin: clientOrigin }));
@@ -52,13 +122,19 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
     res.json({ ok: true, lobbies: store.lobbies.size });
   });
 
-  app.get(`${apiPrefix}/games`, (_req, res) => {
-    res.json({ games: GAME_MANIFESTS });
+  app.get(`${apiPrefix}/games`, async (_req, res) => {
+    try {
+      await registry.ensureFresh();
+      res.json({ games: catalog() });
+    } catch (err) {
+      sendHttpError(res, err);
+    }
   });
 
-  app.post(`${apiPrefix}/lobbies`, async (_req, res) => {
+  app.post(`${apiPrefix}/lobbies`, async (req, res) => {
     try {
-      const lobby = store.createLobby();
+      const mode = req.body?.mode === 'remote' ? 'remote' : 'local';
+      const lobby = store.createLobby(Date.now(), mode);
       await saveLobby(lobby);
       res.status(201).json({ lobby: store.publicLobby(lobby) });
     } catch (err) {
@@ -86,6 +162,137 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
     }
   });
 
+  // --- Published-games registry REST ----------------------------------------
+
+  // Submit → auto-publish after automated checks. Body { manifest, attestation? }.
+  // Registry disabled (Vercel without Redis) → 503. The managementToken is
+  // returned exactly once here; it is never persisted or exposed again.
+  app.post(`${apiPrefix}/games`, async (req, res) => {
+    try {
+      if (!registry.enabled) {
+        res.status(503).json({ error: 'publishing unavailable' });
+        return;
+      }
+      await registry.ensureFresh();
+      const attestation = req.body?.attestation as { handshakeOk?: boolean } | undefined;
+      // Reserve every id already claimed by a built-in or env-registered game so
+      // a submit can never shadow them (the registry also checks its own records).
+      const reservedIds = [...GAME_MANIFESTS.map((game) => game.id), ...externalById.keys()];
+      const { record, managementToken } = await registry.submit(req.body?.manifest, {
+        reservedIds,
+        handshakeOk: attestation?.handshakeOk === true
+      });
+      res.status(201).json({ game: publicGame(record), managementToken });
+    } catch (err) {
+      sendHttpError(res, err);
+    }
+  });
+
+  // Self-service update by management token. Body { manifest } re-validated.
+  app.patch(`${apiPrefix}/games/:id`, async (req, res) => {
+    try {
+      await registry.ensureFresh();
+      const token = String(req.header('x-management-token') ?? '');
+      const record = await registry.update(req.params.id, token, req.body?.manifest);
+      res.json({ game: publicGame(record) });
+    } catch (err) {
+      sendHttpError(res, err);
+    }
+  });
+
+  // Self-service delete by management token.
+  app.delete(`${apiPrefix}/games/:id`, async (req, res) => {
+    try {
+      await registry.ensureFresh();
+      const token = String(req.header('x-management-token') ?? '');
+      await registry.remove(req.params.id, token);
+      res.status(204).end();
+    } catch (err) {
+      sendHttpError(res, err);
+    }
+  });
+
+  // Community report. Per-IP throttled; at 3 reports the game auto-hides.
+  app.post(`${apiPrefix}/games/:id/report`, async (req, res) => {
+    try {
+      await registry.ensureFresh();
+      const ip = clientIp(req);
+      if (!reportLimiter.allow(`report:${ip}`)) {
+        res.status(429).json({ error: 'too many reports' });
+        return;
+      }
+      const record = await registry.report(req.params.id);
+      res.json({ ok: true, hidden: record.hidden });
+    } catch (err) {
+      sendHttpError(res, err);
+    }
+  });
+
+  // First-load probe result from a real TV. Only counts if a live lobby with the
+  // given slug is currently playing this game — otherwise 202-ignored, which
+  // prevents drive-by probe spoofing of an arbitrary game's health.
+  app.post(`${apiPrefix}/games/:id/probe-result`, async (req, res) => {
+    try {
+      await registry.ensureFresh();
+      const slug = String(req.body?.slug ?? '').toUpperCase();
+      const ok = req.body?.ok === true;
+      if (!isLiveLobbyPlaying(slug, req.params.id)) {
+        res.status(202).json({ ok: true, counted: false });
+        return;
+      }
+      const record = await registry.probeResult(req.params.id, ok);
+      res.json({ ok: true, counted: true, status: record.probe.status });
+    } catch (err) {
+      sendHttpError(res, err);
+    }
+  });
+
+  // --- Admin surface (x-admin-key, timing-safe) -----------------------------
+
+  app.get(`${apiPrefix}/admin/games`, async (req, res) => {
+    try {
+      if (!requireAdmin(req, res)) return;
+      await registry.ensureFresh();
+      res.json({ games: registry.listAll().map(adminGameView) });
+    } catch (err) {
+      sendHttpError(res, err);
+    }
+  });
+
+  app.post(`${apiPrefix}/admin/games/:id/takedown`, async (req, res) => {
+    try {
+      if (!requireAdmin(req, res)) return;
+      await registry.ensureFresh();
+      const record = await registry.setHidden(req.params.id, true);
+      res.json({ game: adminGameView(record) });
+    } catch (err) {
+      sendHttpError(res, err);
+    }
+  });
+
+  app.post(`${apiPrefix}/admin/games/:id/restore`, async (req, res) => {
+    try {
+      if (!requireAdmin(req, res)) return;
+      await registry.ensureFresh();
+      const record = await registry.setHidden(req.params.id, false);
+      res.json({ game: adminGameView(record) });
+    } catch (err) {
+      sendHttpError(res, err);
+    }
+  });
+
+  app.post(`${apiPrefix}/admin/games/:id/feature`, async (req, res) => {
+    try {
+      if (!requireAdmin(req, res)) return;
+      await registry.ensureFresh();
+      const featured = req.body?.featured === true;
+      const record = await registry.setFeatured(req.params.id, featured);
+      res.json({ game: adminGameView(record) });
+    } catch (err) {
+      sendHttpError(res, err);
+    }
+  });
+
   const server = http.createServer(app);
   const socketOptions: Partial<ServerOptions> = {
     cors: { origin: clientOrigin },
@@ -105,10 +312,11 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
       try {
         const slug = String(payload?.slug ?? '').toUpperCase();
         await hydrateLobby(slug);
+        await registry.ensureFresh();
         const lobby = store.publicLobby(slug);
         ctx = { role: 'screen', slug };
         socket.join(room(slug));
-        ack?.({ ok: true, lobby, games: GAME_MANIFESTS });
+        ack?.({ ok: true, lobby, games: catalog() });
         socket.emit('lobby:snapshot', lobby);
       } catch (err) {
         ack?.(socketError(err));
@@ -119,11 +327,12 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
       try {
         const slug = String(payload?.slug ?? '').toUpperCase();
         await hydrateLobby(slug);
+        await registry.ensureFresh();
         const joined = store.joinPlayer(slug, payload?.name, payload?.playerToken);
         await saveLobby(slug);
         ctx = { role: 'controller', slug, playerId: joined.player.id };
         socket.join(room(slug));
-        ack?.({ ok: true, ...joined, games: GAME_MANIFESTS });
+        ack?.({ ok: true, ...joined, games: catalog() });
         emitLobby(slug);
         await autoStartIfFull(slug);
       } catch (err) {
@@ -149,6 +358,7 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
       try {
         const slug = String(payload?.slug ?? '').toUpperCase();
         await hydrateLobby(slug);
+        await registry.ensureFresh();
         const lobby = store.selectGame(slug, String(payload?.playerToken ?? ''), payload?.gameId ?? 'trebuchet');
         await saveLobby(slug);
         ack?.({ ok: true, lobby });
@@ -162,10 +372,18 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
       try {
         const slug = String(payload?.slug ?? '').toUpperCase();
         await hydrateLobby(slug);
+        await registry.ensureFresh();
         const event = store.startGame(slug, String(payload?.playerToken ?? ''));
         ack?.({ ok: true, event });
-        await dispatchGameEvent(slug, event);
-        armTurnTimer(slug);
+        // External games return null (no engine event): just persist + broadcast
+        // the started lobby; only the Trebuchet path dispatches/arms a turn timer.
+        if (event) {
+          await dispatchGameEvent(slug, event);
+          armTurnTimer(slug);
+        } else {
+          await saveLobby(slug);
+          emitLobby(slug);
+        }
       } catch (err) {
         ack?.(socketError(err));
       }
@@ -177,6 +395,29 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
         await hydrateLobby(slug);
         const controllerEvent = payload?.event;
         if (!controllerEvent) throw new LobbyError('Controller-Event fehlt');
+
+        // External (iframe-hosted) games relay inputs into the lobby's ordered
+        // input log — no server engine. Persist (the correctness path other
+        // instances poll) BEFORE emitting the socket envelope (the fast path).
+        const currentManifest = resolveManifest(store.getLobby(slug).currentGameId);
+        if (currentManifest?.origin === 'external') {
+          const playerToken = String(payload?.playerToken ?? '');
+          // Derive the player from the token for rate-limiting; recordGameInput
+          // re-derives and throws 401 if the token is unknown.
+          const derivedId = derivePlayerId(store.getLobby(slug), playerToken);
+          if (derivedId && !inputLimiter.allow(slug, derivedId)) {
+            // Rate-limited drops are not errors — acking success keeps the
+            // controller stream healthy; the input is simply not relayed.
+            ack?.({ ok: true, dropped: true });
+            return;
+          }
+          const envelope = store.recordGameInput(slug, playerToken, controllerEvent);
+          ack?.({ ok: true, seq: envelope.seq });
+          await saveLobby(slug);
+          io.to(room(slug)).emit('game:input', envelope);
+          return;
+        }
+
         let event = null;
         let controlPreview: { playerId: PlayerId; control: string; value: unknown; timestamp: number } | null = null;
         if (controllerEvent.control === 'fire' || controllerEvent.control === 'trebuchet.fire') {
@@ -200,6 +441,27 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
         if (event) {
           await dispatchGameEvent(slug, event);
           armTurnTimer(slug);
+        }
+      } catch (err) {
+        ack?.(socketError(err));
+      }
+    });
+
+    // An external game reports its final scores. Accepted ONLY from the trusted
+    // screen shell (the iframe can't reach the socket) whose joined slug matches.
+    // Idempotent: a duplicate report (e.g. a second TV) acks { ok:true, finished:false }.
+    socket.on('game:finish', async (payload: { slug?: string; scores?: unknown }, ack?: (value: unknown) => void) => {
+      try {
+        const slug = String(payload?.slug ?? '').toUpperCase();
+        if (!ctx || ctx.role !== 'screen' || ctx.slug !== slug) {
+          throw new LobbyError('Nur der Screen kann das Spiel beenden', 403);
+        }
+        await hydrateLobby(slug);
+        const finished = store.finishExternalGame(slug, payload?.scores);
+        ack?.({ ok: true, finished });
+        if (finished) {
+          await saveLobby(slug);
+          emitLobby(slug);
         }
       } catch (err) {
         ack?.(socketError(err));
@@ -348,6 +610,19 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
     }
   }
 
+  // True when a non-expired lobby with this slug is currently playing gameId.
+  // Gates probe-result so a report only counts against a game someone is actually
+  // running — a drive-by POST for an idle game is ignored.
+  function isLiveLobbyPlaying(slug: string, gameId: string): boolean {
+    if (!slug) return false;
+    try {
+      const lobby = store.getLobby(slug);
+      return lobby.state === 'playing' && lobby.currentGameId === gameId;
+    } catch {
+      return false;
+    }
+  }
+
   // Centralized game-event broadcast: stamp a monotonic seq onto the lobby state,
   // persist it (so it reaches clients on other serverless instances via their poll),
   // and emit the seq'd envelope over the socket (instant for same-instance clients).
@@ -363,14 +638,20 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   async function autoStartIfFull(slug: string): Promise<void> {
     try {
       const lobby = store.publicLobby(slug);
-      const manifest = GAME_MANIFESTS.find((game) => game.id === lobby.currentGameId);
+      const manifest = lobby.currentGameId ? resolveManifest(lobby.currentGameId) : null;
       if (!manifest || lobby.state !== 'waiting') return;
       if (lobby.players.length !== manifest.maxPlayers || !lobby.hostPlayerId) return;
       const host = [...store.getLobby(slug).players.values()].find((player) => player.id === lobby.hostPlayerId);
       if (!host) return;
       const event = store.startGame(slug, host.token);
-      await dispatchGameEvent(slug, event);
-      armTurnTimer(slug);
+      // External games have no engine event — just persist + broadcast the lobby.
+      if (event) {
+        await dispatchGameEvent(slug, event);
+        armTurnTimer(slug);
+      } else {
+        await saveLobby(slug);
+        emitLobby(slug);
+      }
     } catch {
       // Manual start remains available.
     }
@@ -454,9 +735,58 @@ function screenRoom(id: string): string {
   return 'screen:' + id;
 }
 
-function socketError(err: unknown): { ok: false; error: string; status: number } {
+function socketError(err: unknown): { ok: false; error: string; status: number; errors?: string[] } {
+  if (err instanceof RegistryError) {
+    return { ok: false, error: err.message, status: err.status, ...(err.errors ? { errors: err.errors } : {}) };
+  }
   if (err instanceof LobbyError) return { ok: false, error: err.message, status: err.status };
   return { ok: false, error: err instanceof Error ? err.message : 'Unbekannter Fehler', status: 500 };
+}
+
+// Verify the x-admin-key header against ADMIN_KEY (constant-time). Returns false
+// and writes the response when the key is unset (503) or wrong (401); the caller
+// short-circuits on false.
+function requireAdmin(req: express.Request, res: express.Response): boolean {
+  const configured = process.env.ADMIN_KEY;
+  if (!configured) {
+    res.status(503).json({ error: 'admin surface unavailable' });
+    return false;
+  }
+  const provided = String(req.header('x-admin-key') ?? '');
+  if (!timingSafeEqualStr(provided, configured)) {
+    res.status(401).json({ error: 'invalid admin key' });
+    return false;
+  }
+  return true;
+}
+
+// Constant-time string comparison via fixed-length sha256 digests, so the
+// comparison never leaks length or content through timing and never throws on a
+// length mismatch (timingSafeEqual requires equal-length buffers).
+function timingSafeEqualStr(a: string, b: string): boolean {
+  const ha = createHash('sha256').update(a).digest();
+  const hb = createHash('sha256').update(b).digest();
+  return timingSafeEqual(ha, hb);
+}
+
+// Best-effort client IP for per-IP report throttling. Prefers the leftmost
+// X-Forwarded-For hop (Vercel/edge proxies), falling back to the socket address.
+function clientIp(req: express.Request): string {
+  const forwarded = req.header('x-forwarded-for');
+  if (forwarded) {
+    const first = forwarded.split(',')[0]?.trim();
+    if (first) return first;
+  }
+  return req.socket.remoteAddress ?? 'unknown';
+}
+
+// Resolve a player id from a controller token for rate-limit keying. Returns null
+// for an unknown token; recordGameInput is the authoritative check (throws 401).
+function derivePlayerId(lobby: LobbyRecord, token: string): PlayerId | null {
+  for (const player of lobby.players.values()) {
+    if (player.token === token) return player.id;
+  }
+  return null;
 }
 
 function isTrebuchetPreviewControl(control: string): boolean {

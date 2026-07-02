@@ -82,7 +82,7 @@ export function PairRoute({ screenId, navigate }: { screenId: string; navigate: 
         goToController(screen.claimedSlug, true);
         return;
       }
-      const lobby = await createLobby();
+      const lobby = await createLobby('remote');
       await claimScreen(screenId, lobby.slug);
       goToController(lobby.slug, true);
     } catch (err) {

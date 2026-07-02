@@ -10,6 +10,9 @@ export type LobbyState = 'waiting' | 'playing' | 'ended';
 export type GameSessionState = 'ready' | 'running' | 'finished';
 export type DeviceRole = 'screen' | 'controller';
 
+export type GameOrigin = 'builtin' | 'external';
+export type InputAction = 'press' | 'release' | 'change';
+
 export type ControllerControl =
   | 'angle'
   | 'power'
@@ -26,12 +29,15 @@ export type ControllerLayoutKind = 'trebuchet-aim-fire' | 'generic-buttons';
 export interface ControllerLayout {
   kind: ControllerLayoutKind;
   controls: Array<{
-    control: ControllerControl;
+    // Widened to string so external (creator-authored) manifests can name their
+    // own controls. ControllerControl is kept exported for built-in back-compat.
+    control: string;
     type: 'slider' | 'button' | 'hold' | 'select';
     label: string;
     min?: number;
     max?: number;
     step?: number;
+    options?: string[];
   }>;
 }
 
@@ -58,6 +64,20 @@ export interface Lobby {
   chat: ChatMessage[];
   gameSession: GameSession | null;
   lastEvent: GameEventEnvelope | null;
+  // Populated in a later wave; optional so existing apps compile unchanged.
+  mode?: 'local' | 'remote';
+  inputLog?: GameInputEnvelope[];
+}
+
+// One relayed controller input for an external game. Ordered by monotonic `seq`
+// per lobby; external games are deterministic from `seed` + this ordered log.
+export interface GameInputEnvelope {
+  seq: number;
+  at: string;                 // ISO
+  playerId: PlayerId;
+  control: string;
+  action: InputAction;
+  value?: unknown;            // value payload capped ≤1KB by the server
 }
 
 export interface GameEventEnvelope {
@@ -95,6 +115,27 @@ export interface GameManifest {
   status: 'internal' | 'submitted' | 'published';
   thumbnail: GameThumbnail;
   comingSoon?: boolean;
+  origin?: GameOrigin;         // absent ⇒ builtin
+  featured?: boolean;          // admin-curated catalog boost (games registry)
+}
+
+// Snapshot kind for external (creator-hosted, iframe-sandboxed) games. The
+// platform holds no authoritative state — only the seed and reported scores.
+export interface ExternalGameSnapshot {
+  kind: 'external';
+  seed: string;
+  scores?: Array<{ playerId: PlayerId; score: number }>;
+}
+
+// A published external game manifest. The server composes this by stamping
+// origin/status/publishedAt onto the creator-supplied fields.
+export interface ExternalGameManifest extends GameManifest {
+  origin: 'external';
+  entryUrl: string;
+  supportsRemote?: boolean;
+  sdkProtocol: 1;
+  author?: { name: string; url?: string };
+  publishedAt: string;
 }
 
 export interface ControllerEvent<TValue = unknown> {

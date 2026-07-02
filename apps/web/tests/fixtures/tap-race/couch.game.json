@@ -1,0 +1,23 @@
+{
+  "id": "tap-race",
+  "title": "Tap Race",
+  "description": "First to 5 taps wins. A minimal fixture game for the external-game e2e slice.",
+  "minPlayers": 1,
+  "maxPlayers": 8,
+  "controllerLayout": {
+    "kind": "generic-buttons",
+    "controls": [
+      { "control": "tap", "type": "button", "label": "TAP!" }
+    ]
+  },
+  "aspectRatio": "16:9",
+  "estimatedDurationMinutes": 2,
+  "thumbnail": {
+    "kind": "css",
+    "gradient": "linear-gradient(160deg,#12324d,#2d8fbe)",
+    "icon": "zap"
+  },
+  "entryUrl": "http://127.0.0.1:4180/tap-race/index.html",
+  "sdkProtocol": 1,
+  "supportsRemote": true
+}

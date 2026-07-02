@@ -5,9 +5,11 @@ dist/
 apps/*/dist/
 packages/*/dist/
 packages/games/*/dist/
+apps/web/public/sdk/
 playwright-report/
 test-results/
 .env
 .env.local
 .vercel
 .env*
+apps/web/public/COUCH-GAME-GUIDE.md
