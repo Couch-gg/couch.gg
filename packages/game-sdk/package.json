@@ -1,0 +1,30 @@
+{
+  "name": "@couch/game-sdk",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Creator-facing SDK for third-party couch.gg games: typed postMessage protocol + dev simulator.",
+  "main": "./dist/couch-sdk.js",
+  "module": "./dist/couch-sdk.js",
+  "types": "./dist/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/couch-sdk.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "happy-dom": "^20.10.6",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.7",
+    "vitest": "^4.0.16"
+  }
+}

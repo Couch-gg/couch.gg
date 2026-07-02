@@ -8,11 +8,11 @@
     "@couch/realtime": "workspace:*"
   },
   "scripts": {
-    "build:packages": "pnpm --filter @couch/types build && pnpm --filter @couch/game-runtime build && pnpm --filter @couch/trebuchet build",
+    "build:packages": "pnpm --filter @couch/types build && pnpm --filter @couch/game-runtime build && pnpm --filter @couch/trebuchet build && pnpm --filter @couch/game-sdk build",
     "build": "pnpm build:packages && pnpm --filter @couch/realtime build && pnpm --filter @couch/web build",
     "dev": "pnpm build:packages && concurrently -n realtime,web -c cyan,magenta \"pnpm --filter @couch/realtime dev\" \"pnpm --filter @couch/web dev -- --host 0.0.0.0\"",
     "test": "pnpm test:unit && pnpm test:e2e",
-    "test:unit": "pnpm build:packages && pnpm --filter @couch/trebuchet test && pnpm --filter @couch/realtime test",
+    "test:unit": "pnpm build:packages && pnpm --filter @couch/trebuchet test && pnpm --filter @couch/game-runtime test && pnpm --filter @couch/game-sdk test && pnpm --filter @couch/realtime test",
     "test:e2e": "pnpm exec playwright test",
     "typecheck": "pnpm build:packages && pnpm --filter @couch/realtime typecheck && pnpm --filter @couch/web typecheck"
   },

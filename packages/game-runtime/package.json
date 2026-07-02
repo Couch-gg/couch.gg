@@ -12,12 +12,13 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "echo \"@couch/game-runtime has no tests yet\""
+    "test": "vitest run"
   },
   "dependencies": {
     "@couch/types": "workspace:*"
   },
   "devDependencies": {
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.16"
   }
 }

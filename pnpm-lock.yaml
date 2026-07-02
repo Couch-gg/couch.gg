@@ -35,7 +35,7 @@ importers:
         version: 7.3.5(@types/node@24.13.2)(tsx@4.22.4)
       vitest:
         specifier: ^4.0.16
-        version: 4.1.9(@types/node@24.13.2)(vite@7.3.5(@types/node@24.13.2)(tsx@4.22.4))
+        version: 4.1.9(@types/node@24.13.2)(happy-dom@20.10.6)(vite@7.3.5(@types/node@24.13.2)(tsx@4.22.4))
       wait-on:
         specifier: ^9.0.3
         version: 9.0.10
@@ -84,7 +84,7 @@ importers:
         version: 5.9.3
       vitest:
         specifier: ^4.0.16
-        version: 4.1.9(@types/node@24.13.2)(vite@7.3.5(@types/node@24.13.2)(tsx@4.22.4))
+        version: 4.1.9(@types/node@24.13.2)(happy-dom@20.10.6)(vite@7.3.5(@types/node@24.13.2)(tsx@4.22.4))
 
   apps/web:
     dependencies:
@@ -144,6 +144,24 @@ importers:
       typescript:
         specifier: ^5.9.3
         version: 5.9.3
+      vitest:
+        specifier: ^4.0.16
+        version: 4.1.9(@types/node@24.13.2)(happy-dom@20.10.6)(vite@7.3.5(@types/node@24.13.2)(tsx@4.22.4))
+
+  packages/game-sdk:
+    devDependencies:
+      happy-dom:
+        specifier: ^20.10.6
+        version: 20.10.6
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
+      vite:
+        specifier: ^7.2.7
+        version: 7.3.5(@types/node@24.13.2)(tsx@4.22.4)
+      vitest:
+        specifier: ^4.0.16
+        version: 4.1.9(@types/node@24.13.2)(happy-dom@20.10.6)(vite@7.3.5(@types/node@24.13.2)(tsx@4.22.4))
 
   packages/games/trebuchet:
     dependencies:
@@ -162,7 +180,7 @@ importers:
         version: 5.9.3
       vitest:
         specifier: ^4.0.16
-        version: 4.1.9(@types/node@24.13.2)(vite@7.3.5(@types/node@24.13.2)(tsx@4.22.4))
+        version: 4.1.9(@types/node@24.13.2)(happy-dom@20.10.6)(vite@7.3.5(@types/node@24.13.2)(tsx@4.22.4))
 
   packages/types:
     devDependencies:
@@ -853,6 +871,9 @@ packages:
   '@types/serve-static@2.2.0':
     resolution: {integrity: sha512-8mam4H1NHLtu7nmtalF7eyBH14QyOASmcxHhSfEoRyr0nP/YdoesEtU+uSRvMe96TW/HPTtkoKqQLl53N7UXMQ==}
 
+  '@types/whatwg-mimetype@3.0.2':
+    resolution: {integrity: sha512-c2AKvDT8ToxLIOUlN51gTiHXflsfIFisS4pO7pDPoKouJCESkhZnEy623gwP9laCy5lnLDAw1vAzu2vM2YLOrA==}
+
   '@types/ws@8.18.1':
     resolution: {integrity: sha512-ThVF6DCVhA8kUGy+aazFQ4kXQ7E1Ty7A3ypFOe0IcJV8O/M511G99AW24irKrW56Wt44yG9+ij8FaqoBGkuBXg==}
 
@@ -960,6 +981,10 @@ packages:
     resolution: {integrity: sha512-MTc8i/x9jBQd1iMw2CFGS+rwMa07eYjLR0CCTLDACl9xhxy+nIs3KeML/biicXtk9JrZ6dnnTatmc7ErPXIxqw==}
     engines: {node: ^6 || ^7 || ^8 || ^9 || ^10 || ^11 || ^12 || >=13.7}
     hasBin: true
+
+  buffer-image-size@0.6.4:
+    resolution: {integrity: sha512-nEh+kZOPY1w+gcCMobZ6ETUp9WfibndnosbpwB1iJk/8Gt5ZF2bhS6+B6bPYz424KtwsR6Rflc3tCz1/ghX2dQ==}
+    engines: {node: '>=4.0'}
 
   bytes@3.1.2:
     resolution: {integrity: sha512-/Nf7TyzTx6S3yRJObOAV7956r8cr2+Oj8AC5dt8wSP3BQAoeX58NoHyCU8P8zGkNXStjTSi6fzO6F0pBdcYbEg==}
@@ -1094,6 +1119,10 @@ packages:
     resolution: {integrity: sha512-clKkw4C7nJ22mGgoVcCg6V/W/TxdNyIOTr89k2ONZu81qqkddPFDF0LXcbAwhzPD8DjkiRCjzuiO6Y+fkpD4vg==}
     engines: {node: '>=10.2.0'}
 
+  entities@7.0.1:
+    resolution: {integrity: sha512-TWrgLOFUQTH994YUyl1yT4uyavY5nNB5muff+RtWaqNVCAK408b5ZnnbNAUEWLTCpum9w6arT70i1XdQ4UeOPA==}
+    engines: {node: '>=0.12'}
+
   es-define-property@1.0.1:
     resolution: {integrity: sha512-e3nRfgfUZ4rNGL232gUgX06QNyyez04KdjFrF+LTRoOXmrOgFKDg4BCdsjW8EnT69eqdYGmRpJwiPVYNrCaW3g==}
     engines: {node: '>= 0.4'}
@@ -1222,6 +1251,10 @@ packages:
   gopd@1.2.0:
     resolution: {integrity: sha512-ZUKRh6/kUFoAiTAtTYPZJ3hw9wNxx+BIBOijnlG9PnrJsCcSjs1wyyD6vJpaYtgnzDrKYRSqf3OO6Rfa93xsRg==}
     engines: {node: '>= 0.4'}
+
+  happy-dom@20.10.6:
+    resolution: {integrity: sha512-6QD0ilzDDt93tX44y8tbmZdAcdTRYDhUP+Asgi6pC8Pp5IA3cvaZGyoVN/EGtlq9ziT65iPuBBn3ASLr6hCgVw==}
+    engines: {node: '>=20.0.0'}
 
   has-flag@4.0.0:
     resolution: {integrity: sha512-EykJT/Q1KjTWctppgIAgfSO0tKVuZUjhgMr17kqTumMl6Afv3EISleU7qZUzoXDFTAHTDC4NOoG/ZxU3EvlMPQ==}
@@ -1745,6 +1778,10 @@ packages:
     resolution: {integrity: sha512-rCoJEhvMr0X6alHmwc9abbrA5ZrLZFKpFQVKPNFwl2h7DapXOGdmimIHDtLOWhT4PjhZhxFEtZoQgEXbkDWdZw==}
     engines: {node: '>=20.0.0'}
     hasBin: true
+
+  whatwg-mimetype@3.0.0:
+    resolution: {integrity: sha512-nt+N2dzIutVRxARx1nghPKGv1xHikU7HKdfafKkLNLindmPU/ch3U31NOCGGA/dmPcmb1VlofO0vnKAcsm0o/Q==}
+    engines: {node: '>=12'}
 
   which@2.0.2:
     resolution: {integrity: sha512-BLI3Tl1TW3Pvl70l3yq3Y64i+awpwXqsGBYWkkqMtnbXgrMD+yj7rhW0kuEDxzJaYXGjEW5ogapKNMEKNMjibA==}
@@ -2295,6 +2332,8 @@ snapshots:
       '@types/http-errors': 2.0.5
       '@types/node': 24.13.2
 
+  '@types/whatwg-mimetype@3.0.2': {}
+
   '@types/ws@8.18.1':
     dependencies:
       '@types/node': 24.13.2
@@ -2442,6 +2481,10 @@ snapshots:
       node-releases: 2.0.48
       update-browserslist-db: 1.2.3(browserslist@4.28.4)
 
+  buffer-image-size@0.6.4:
+    dependencies:
+      '@types/node': 24.13.2
+
   bytes@3.1.2: {}
 
   call-bind-apply-helpers@1.0.2:
@@ -2573,6 +2616,8 @@ snapshots:
       - bufferutil
       - supports-color
       - utf-8-validate
+
+  entities@7.0.1: {}
 
   es-define-property@1.0.1: {}
 
@@ -2774,6 +2819,19 @@ snapshots:
   get-stream@6.0.1: {}
 
   gopd@1.2.0: {}
+
+  happy-dom@20.10.6:
+    dependencies:
+      '@types/node': 24.13.2
+      '@types/whatwg-mimetype': 3.0.2
+      '@types/ws': 8.18.1
+      buffer-image-size: 0.6.4
+      entities: 7.0.1
+      whatwg-mimetype: 3.0.0
+      ws: 8.21.0
+    transitivePeerDependencies:
+      - bufferutil
+      - utf-8-validate
 
   has-flag@4.0.0: {}
 
@@ -3222,7 +3280,7 @@ snapshots:
       fsevents: 2.3.3
       tsx: 4.22.4
 
-  vitest@4.1.9(@types/node@24.13.2)(vite@7.3.5(@types/node@24.13.2)(tsx@4.22.4)):
+  vitest@4.1.9(@types/node@24.13.2)(happy-dom@20.10.6)(vite@7.3.5(@types/node@24.13.2)(tsx@4.22.4)):
     dependencies:
       '@vitest/expect': 4.1.9
       '@vitest/mocker': 4.1.9(vite@7.3.5(@types/node@24.13.2)(tsx@4.22.4))
@@ -3246,6 +3304,7 @@ snapshots:
       why-is-node-running: 2.3.0
     optionalDependencies:
       '@types/node': 24.13.2
+      happy-dom: 20.10.6
     transitivePeerDependencies:
       - msw
 
@@ -3259,6 +3318,8 @@ snapshots:
     transitivePeerDependencies:
       - debug
       - supports-color
+
+  whatwg-mimetype@3.0.0: {}
 
   which@2.0.2:
     dependencies:
