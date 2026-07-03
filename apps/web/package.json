@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node scripts/copy-sdk.mjs && vite --host 0.0.0.0",
-    "build": "node scripts/copy-sdk.mjs && tsc -p tsconfig.json && vite build",
+    "dev": "node scripts/copy-sdk.mjs && node scripts/build-guide.mjs && vite --host 0.0.0.0",
+    "build": "node scripts/copy-sdk.mjs && node scripts/build-guide.mjs && tsc -p tsconfig.json && vite build",
     "preview": "vite preview --host 0.0.0.0",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "echo \"@couch/web uses Playwright e2e tests from the repo root\""

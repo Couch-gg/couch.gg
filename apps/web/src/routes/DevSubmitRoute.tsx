@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   ExternalGameManifest,
   ExternalGameSnapshot,
@@ -48,6 +48,13 @@ const FAKE_PLAYERS: Array<{ id: string; name: string; colorIdx: number }> = [
   { id: 'dev-alex', name: 'Alex', colorIdx: 0 },
   { id: 'dev-bea', name: 'Bea', colorIdx: 1 }
 ];
+
+// Prepended verbatim to the raw guide so a creator can paste one block straight
+// into their coding agent. Kept exact — the plan/spec pins this wording.
+const GUIDE_PROMPT_PREFIX =
+  'You are building (or retrofitting) a web game to run on couch.gg. Follow this contract exactly:\n\n';
+
+const DEGIT_COMMAND = 'npx degit Couch-gg/couch.gg/templates/couch-game-starter my-game';
 
 /** Strip `//` line comments so the prefilled placeholder can carry guidance. */
 function stripLineComments(raw: string): string {
@@ -113,6 +120,14 @@ export function DevSubmitRoute({ navigate }: { navigate: (to: string) => void })
   const [publishError, setPublishError] = useState<string | null>(null);
   const [published, setPublished] = useState<{ id: string; managementToken: string } | null>(null);
   const [copied, setCopied] = useState(false);
+
+  // Hero: "Copy the guide for your AI". On any failure (fetch or clipboard) we
+  // fall back to a readOnly, auto-selected textarea carrying the exact same text
+  // so the creator can still Ctrl/Cmd+C it manually.
+  const [guideCopied, setGuideCopied] = useState(false);
+  const [guideFallback, setGuideFallback] = useState<string | null>(null);
+  const guideFallbackRef = useRef<HTMLTextAreaElement | null>(null);
+  const [degitCopied, setDegitCopied] = useState(false);
 
   const [manageOpen, setManageOpen] = useState(false);
   const [manageId, setManageId] = useState('');
@@ -228,6 +243,50 @@ export function DevSubmitRoute({ navigate }: { navigate: (to: string) => void })
     }
   };
 
+  // Step 1 of the hero: fetch the canonical guide, prepend the agent instruction,
+  // and copy the whole block. Any failure (fetch OR clipboard) drops to a
+  // select-all textarea carrying identical text so the copy path never dead-ends.
+  const copyGuideForAi = useCallback(async () => {
+    let text: string;
+    try {
+      const res = await fetch('/COUCH-GAME-GUIDE.md');
+      if (!res.ok) throw new Error(`Guide fetch failed (${res.status})`);
+      const md = await res.text();
+      text = GUIDE_PROMPT_PREFIX + md;
+    } catch {
+      // Fetch failed — surface the prefix alone so the creator at least has the
+      // framing instruction and a link to the raw guide in the fallback hint.
+      setGuideFallback(GUIDE_PROMPT_PREFIX);
+      return;
+    }
+    try {
+      if (!navigator.clipboard) throw new Error('Clipboard API unavailable');
+      await navigator.clipboard.writeText(text);
+      setGuideFallback(null);
+      setGuideCopied(true);
+      window.setTimeout(() => setGuideCopied(false), 4000);
+    } catch {
+      setGuideFallback(text);
+    }
+  }, []);
+
+  const copyDegit = useCallback(async () => {
+    try {
+      if (!navigator.clipboard) throw new Error('Clipboard API unavailable');
+      await navigator.clipboard.writeText(DEGIT_COMMAND);
+      setDegitCopied(true);
+      window.setTimeout(() => setDegitCopied(false), 2000);
+    } catch {
+      // The command is visible, monospace, and selectable — copy is a convenience.
+    }
+  }, []);
+
+  // Auto-select the fallback textarea the moment it appears so a single
+  // Ctrl/Cmd+C grabs everything.
+  useEffect(() => {
+    if (guideFallback !== null) guideFallbackRef.current?.select();
+  }, [guideFallback]);
+
   const manageUpdate = async () => {
     setManageBusy(true);
     setManageResult(null);
@@ -281,6 +340,168 @@ export function DevSubmitRoute({ navigate }: { navigate: (to: string) => void })
           Validate your manifest, test it against the real platform, then publish it to every couch's catalog.
         </p>
       </header>
+
+      {/* Scoped styles for the onboarding hero — styles.css is owned by another
+          builder, so the new bits live here and reuse the app's palette vars. */}
+      <style>{`
+        .dev-hero {
+          display: grid;
+          gap: 16px;
+          margin-bottom: 34px;
+        }
+        .dev-hero-intro {
+          margin: 0;
+          color: var(--muted);
+          font-size: 15px;
+          line-height: 1.55;
+        }
+        .dev-hero-steps {
+          display: grid;
+          gap: 14px;
+        }
+        @media (min-width: 900px) {
+          .dev-hero-steps { grid-template-columns: repeat(3, 1fr); }
+        }
+        .dev-hero-step {
+          display: flex;
+          flex-direction: column;
+          gap: 10px;
+          padding: 18px;
+          border: 1px solid var(--line);
+          border-radius: 12px;
+          background: rgba(248, 237, 207, 0.03);
+        }
+        .dev-hero-num {
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          font-family: "Press Start 2P", monospace;
+          font-size: 10px;
+          line-height: 1.4;
+          color: var(--accent);
+          letter-spacing: 0.02em;
+        }
+        .dev-hero-chip {
+          display: inline-grid;
+          place-items: center;
+          width: 24px;
+          height: 24px;
+          border-radius: 6px;
+          border: 1px solid rgba(241, 207, 106, 0.5);
+          background: rgba(241, 207, 106, 0.1);
+          color: var(--accent);
+        }
+        .dev-hero-step h3 {
+          margin: 0;
+          font-size: 15px;
+          font-weight: 800;
+          color: var(--text);
+        }
+        .dev-hero-step p {
+          margin: 0;
+          color: var(--muted);
+          font-size: 13px;
+          line-height: 1.5;
+        }
+        .dev-hero-actions {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 10px;
+          align-items: center;
+          margin-top: 2px;
+        }
+        .dev-copybox {
+          display: flex;
+          align-items: stretch;
+          gap: 8px;
+          padding: 8px 10px;
+          border: 1px solid var(--line);
+          border-radius: 8px;
+          background: #0c0e0d;
+        }
+        .dev-copybox code {
+          flex: 1 1 auto;
+          overflow-x: auto;
+          white-space: nowrap;
+          font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+          font-size: 12px;
+          color: var(--text);
+          align-self: center;
+        }
+        .dev-guide-fallback {
+          display: grid;
+          gap: 6px;
+          margin-top: 4px;
+        }
+        .dev-guide-fallback textarea {
+          width: 100%;
+          min-height: 120px;
+          resize: vertical;
+          border: 1px solid var(--line);
+          border-radius: 8px;
+          background: #0c0e0d;
+          color: var(--text);
+          padding: 10px 12px;
+          font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+          font-size: 12px;
+          line-height: 1.5;
+        }
+      `}</style>
+
+      <section className="dev-hero" aria-label="How to build a game">
+        <p className="dev-hero-intro">
+          New here? Build a web game your way — the platform gives you the lobby, QR pairing, phone controllers, and
+          input relay. Three steps to your first published game:
+        </p>
+        <div className="dev-hero-steps">
+          <div className="dev-hero-step">
+            <span className="dev-hero-num">
+              <span className="dev-hero-chip">1</span> Hand the contract to your AI
+            </span>
+            <h3>Copy the guide, paste it into your coding agent</h3>
+            <p>One block: the framing instruction plus the full couch.gg build contract, ready for Claude/Cursor/ChatGPT.</p>
+            <div className="dev-hero-actions">
+              <button className="primary-btn" onClick={() => void copyGuideForAi()}>
+                {guideCopied ? 'Copied — paste it into Claude/Cursor/ChatGPT' : 'Copy the guide for your AI'}
+              </button>
+              <a className="ghost-btn" href="/guide">
+                Read the guide
+              </a>
+            </div>
+            {guideFallback !== null && (
+              <div className="dev-guide-fallback">
+                <textarea ref={guideFallbackRef} readOnly value={guideFallback} aria-label="Guide text to copy" />
+                <p className="dev-hint">Press Ctrl/Cmd+C to copy.</p>
+              </div>
+            )}
+          </div>
+
+          <div className="dev-hero-step">
+            <span className="dev-hero-num">
+              <span className="dev-hero-chip">2</span> Build &amp; test locally
+            </span>
+            <h3>Start from the working template</h3>
+            <div className="dev-copybox">
+              <code>{DEGIT_COMMAND}</code>
+              <button className="ghost-btn compact" onClick={() => void copyDegit()} aria-label="Copy the degit command">
+                {degitCopied ? 'Copied' : 'Copy'}
+              </button>
+            </div>
+            <p>Open index.html — the SDK boots a simulator with fake phones. No account, no build step.</p>
+          </div>
+
+          <div className="dev-hero-step">
+            <span className="dev-hero-num">
+              <span className="dev-hero-chip">3</span> Test &amp; publish below
+            </span>
+            <h3>Validate, test, publish</h3>
+            <p>
+              Paste your manifest below, run the live test until the handshake is green, then publish. You'll get a
+              one-time management token.
+            </p>
+          </div>
+        </div>
+      </section>
 
       <section className="dev-section">
         <h2 className="dev-section-title">1. Manifest</h2>
@@ -388,7 +609,7 @@ export function DevSubmitRoute({ navigate }: { navigate: (to: string) => void })
               <button className="ghost-btn" onClick={() => navigate('/')}>
                 See it in the catalog
               </button>
-              <a className="ghost-btn" href="/COUCH-GAME-GUIDE.md" target="_blank" rel="noreferrer">
+              <a className="ghost-btn" href="/guide">
                 Read the creator guide
               </a>
             </div>

@@ -73,9 +73,12 @@ render + logic; the platform provides the lobby, QR pairing, phone controllers,
 and input relay. Games run in a sandboxed iframe and talk to the platform via the
 `@couch/game-sdk`.
 
-- **Full contract for creators (and their coding agents):**
+- **Read the guide (humans):** the rendered creator guide is at
+  https://couch-gg.vercel.app/guide.
+- **Full contract for coding agents:** the raw source is
   [`packages/game-sdk/COUCH-GAME-GUIDE.md`](packages/game-sdk/COUCH-GAME-GUIDE.md)
-  — also served at https://couch-gg.vercel.app/COUCH-GAME-GUIDE.md.
+  — also served verbatim at https://couch-gg.vercel.app/COUCH-GAME-GUIDE.md for
+  pasting into Claude/Cursor/ChatGPT.
 - **Starter template:** [`templates/couch-game-starter/`](templates/couch-game-starter/)
   — a complete, degit-able example game. Open its `index.html` to try it in the
   built-in dev simulator.

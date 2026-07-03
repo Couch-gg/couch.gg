@@ -24,6 +24,7 @@ async function attractScreenId(browser: Browser) {
   await expect(tv.locator('.attract-shell')).toBeVisible();
   await expect(tv.getByRole('heading', { name: 'Local Couch' })).toBeVisible();
   await expect(tv.getByRole('heading', { name: 'Remote Couch' })).toBeVisible();
+  await expect(tv.getByText('Made a game? couch.gg/dev')).toBeVisible();
   await expect
     .poll(() => tv.evaluate(() => window.sessionStorage.getItem('couch:screenId')), { timeout: 15_000 })
     .toBeTruthy();
@@ -44,6 +45,9 @@ test('phone home points to a shared screen (no create/join)', async ({ browser }
   await phone.goto('/');
   await expect(phone.getByText(/Scan a TV to begin/i)).toBeVisible();
   await expect(phone.getByRole('button', { name: /Create a room/i })).toHaveCount(0);
+  const buildLink = phone.getByRole('link', { name: /Build your own game/i });
+  await expect(buildLink).toBeVisible();
+  await expect(buildLink).toHaveAttribute('href', '/dev');
   await phone.close();
 });
 
@@ -70,6 +74,8 @@ test('LOCAL couch: scan a TV -> auto-create, second phone joins via invite, game
   await chat.fill('gg');
   await chat.press('Enter');
   await expect(tv.locator('.chat-msg-text', { hasText: 'gg' })).toBeVisible({ timeout: 10_000 });
+  await expect(alex.locator('.publish-card')).toBeVisible();
+  await expect(alex.locator('.publish-card')).toHaveAttribute('href', '/dev');
   await alex.locator('.game-card', { hasText: 'Trebuchet' }).click();
   const start = alex.getByRole('button', { name: /Trebuchet starten/i });
   await expect(start).toBeEnabled();

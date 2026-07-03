@@ -1,5 +1,5 @@
 import * as LucideIcons from 'lucide-react';
-import { Check, Flag } from 'lucide-react';
+import { Check, Flag, Zap } from 'lucide-react';
 import { useState } from 'react';
 import type { ExternalGameManifest, GameManifest } from '@couch/types';
 import { reportGame } from '../gamesApi.js';
@@ -103,6 +103,29 @@ export function GameCatalog({ games, currentGameId, selectable, onSelect, classN
           </button>
         );
       })}
+      {selectable ? (
+        <a className="game-card publish-card" href="/dev" target="_blank" rel="noreferrer">
+          <div className="game-card-thumb publish-card-thumb">
+            <span className="game-card-icon">
+              <Zap size={26} color="#fff" />
+            </span>
+          </div>
+          <div className="game-card-title">Your game here</div>
+          <div className="game-card-meta">Build & publish — no account</div>
+          <span className="game-card-badge">couch.gg/dev</span>
+        </a>
+      ) : (
+        <div className="game-card publish-card">
+          <div className="game-card-thumb publish-card-thumb">
+            <span className="game-card-icon">
+              <Zap size={26} color="#fff" />
+            </span>
+          </div>
+          <div className="game-card-title">Your game here</div>
+          <div className="game-card-meta">Build & publish — no account</div>
+          <span className="game-card-badge">couch.gg/dev</span>
+        </div>
+      )}
     </div>
   );
 }

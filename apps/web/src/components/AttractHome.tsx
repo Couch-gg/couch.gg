@@ -135,16 +135,19 @@ export function AttractHome({ navigate }: { navigate: (to: string) => void }) {
       <div className="attract-overlay">
         <div className="attract-brand">couch.gg</div>
         {screenId ? (
-          <div className="attract-qr-grid">
-            <div className="attract-choice">
-              <h2>Local Couch</h2>
-              <QrPanel value={localPairUrl} variant="attract" label="Same screen" />
+          <>
+            <div className="attract-qr-grid">
+              <div className="attract-choice">
+                <h2>Local Couch</h2>
+                <QrPanel value={localPairUrl} variant="attract" label="Same screen" />
+              </div>
+              <div className="attract-choice">
+                <h2>Remote Couch</h2>
+                <QrPanel value={remotePairUrl} variant="attract" label="Host or join" />
+              </div>
             </div>
-            <div className="attract-choice">
-              <h2>Remote Couch</h2>
-              <QrPanel value={remotePairUrl} variant="attract" label="Host or join" />
-            </div>
-          </div>
+            <div className="attract-footer">Made a game? couch.gg/dev</div>
+          </>
         ) : (
           <div className="attract-hint">Connecting…</div>
         )}

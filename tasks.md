@@ -1,4 +1,18 @@
-# Orchestrator Ledger — Third-Party Game Publishing
+# Orchestrator Ledger — Creator Discovery Layer (current)
+
+Plan: ~/.claude/plans/use-orchestrator-skill-wiggly-hejlsberg.md (rewritten for this project)
+Base: 517fb43 (merged origin/main f029543). Branch: claude/thirsty-blackwell-3bfd4e.
+
+| ID | Task | Wave | Tier | Scope (files) | State | Redos | Notes |
+|---|---|---|---|---|---|---|---|
+| T1 | Player-facing entry points (attract footer, phone-home link, catalog promo tile) | 1 | Sonnet | AttractHome.tsx, GameCatalog.tsx, HomeRoute.tsx, styles.css, couch-flow.spec.ts | PASS | 0 | Verified: diffs exact to brief; 18/18 by builder incl. new assertions; tile is <a>/<div> variants, no selector collisions. |
+| T2 | /dev hero (3 steps + copy-for-AI) + rendered guide.html + /guide route | 1 | Opus | DevSubmitRoute.tsx, App.tsx, scripts/build-guide.mjs (new), scripts/copy-sdk.mjs, apps/web+root package.json, .gitignore, tests/dev-page.spec.ts (new), READMEs | IN-FLIGHT | 0 | marked = build-only devDep; guide.html gitignored; styles.css owned by T1 |
+
+Gate: build:packages → typecheck → build → full e2e. Then land + prod verify.
+
+---
+
+# ARCHIVE — Orchestrator Ledger — Third-Party Game Publishing (SHIPPED, PR #9)
 
 Plan: ~/.claude/plans/use-orchestrator-skill-wiggly-hejlsberg.md
 Base: 86bb9b3 (origin/main). Branch: claude/thirsty-blackwell-3bfd4e.

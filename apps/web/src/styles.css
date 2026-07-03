@@ -2746,3 +2746,48 @@ button:disabled {
     grid-template-columns: 1fr;
   }
 }
+
+/* ----- Creator discovery entry points (T1) ----- */
+
+.attract-footer {
+  font-family: "Press Start 2P", monospace;
+  font-size: clamp(8px, 1vw, 11px);
+  color: var(--muted);
+  letter-spacing: 0.04em;
+  line-height: 1.6;
+  margin-top: clamp(12px, 2vw, 24px);
+}
+
+.ghost-btn[href] {
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.game-card.publish-card {
+  border-style: dashed;
+  border-color: var(--line);
+  opacity: 0.65;
+  transition: opacity 160ms ease, transform 160ms ease, border-color 160ms ease;
+}
+
+a.game-card.publish-card {
+  cursor: pointer;
+  text-decoration: none;
+  color: inherit;
+}
+
+.game-card.publish-card:hover,
+.game-card.publish-card:active {
+  opacity: 1;
+}
+
+.game-card.publish-card:hover .publish-card-thumb,
+.game-card.publish-card:active .publish-card-thumb {
+  filter: brightness(1.15);
+}
+
+.publish-card-thumb {
+  background: linear-gradient(135deg, rgba(248, 237, 207, 0.14), rgba(16, 18, 17, 0.4));
+}

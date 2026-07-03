@@ -8,6 +8,9 @@ wins. Use it as the skeleton for your own game.
 > say "turn this into my game following the guide." The guide is the full,
 > source-accurate contract; this template is a working starting point.
 
+Prefer to read it yourself first? The rendered guide for humans is at
+[couch-gg.vercel.app/guide](https://couch-gg.vercel.app/guide).
+
 ## What's here
 
 - `index.html` — the game. Loads the SDK, reads the manifest, counts taps, draws
