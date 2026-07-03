@@ -24,7 +24,8 @@ async function attractScreenId(browser: Browser) {
   await expect(tv.locator('.attract-shell')).toBeVisible();
   await expect(tv.getByRole('heading', { name: 'Local Couch' })).toBeVisible();
   await expect(tv.getByRole('heading', { name: 'Remote Couch' })).toBeVisible();
-  await expect(tv.getByText('Made a game? couch.gg/dev')).toBeVisible();
+  // The footer shows the real serving host (couch.gg is a parked domain).
+  await expect(tv.getByText(/Made a game\? .+\/dev/)).toBeVisible();
   await expect
     .poll(() => tv.evaluate(() => window.sessionStorage.getItem('couch:screenId')), { timeout: 15_000 })
     .toBeTruthy();

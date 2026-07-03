@@ -146,7 +146,11 @@ export function AttractHome({ navigate }: { navigate: (to: string) => void }) {
                 <QrPanel value={remotePairUrl} variant="attract" label="Host or join" />
               </div>
             </div>
-            <div className="attract-footer">Made a game? couch.gg/dev</div>
+            {/* Display the host the screen is actually served from — couch.gg
+                itself is a parked domain, so the typeable address must be the
+                real one (couch-gg.vercel.app today; auto-corrects if a proper
+                domain is connected later). */}
+            <div className="attract-footer">Made a game? {window.location.host}/dev</div>
           </>
         ) : (
           <div className="attract-hint">Connecting…</div>

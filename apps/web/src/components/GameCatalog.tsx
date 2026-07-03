@@ -112,7 +112,7 @@ export function GameCatalog({ games, currentGameId, selectable, onSelect, classN
           </div>
           <div className="game-card-title">Your game here</div>
           <div className="game-card-meta">Build & publish — no account</div>
-          <span className="game-card-badge">couch.gg/dev</span>
+          <span className="game-card-badge">{window.location.host}/dev</span>
         </a>
       ) : (
         <div className="game-card publish-card">
@@ -123,7 +123,7 @@ export function GameCatalog({ games, currentGameId, selectable, onSelect, classN
           </div>
           <div className="game-card-title">Your game here</div>
           <div className="game-card-meta">Build & publish — no account</div>
-          <span className="game-card-badge">couch.gg/dev</span>
+          <span className="game-card-badge">{window.location.host}/dev</span>
         </div>
       )}
     </div>
