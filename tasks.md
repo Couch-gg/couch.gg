@@ -1,4 +1,19 @@
-# Orchestrator Ledger — Third-Party Game Publishing
+# Orchestrator Ledger — Creator Discovery Layer (current)
+
+Plan: ~/.claude/plans/use-orchestrator-skill-wiggly-hejlsberg.md (rewritten for this project)
+Base: 517fb43 (merged origin/main f029543). Branch: claude/thirsty-blackwell-3bfd4e.
+
+| ID | Task | Wave | Tier | Scope (files) | State | Redos | Notes |
+|---|---|---|---|---|---|---|---|
+| T1 | Player-facing entry points (attract footer, phone-home link, catalog promo tile) | 1 | Sonnet | AttractHome.tsx, GameCatalog.tsx, HomeRoute.tsx, styles.css, couch-flow.spec.ts | PASS | 0 | Verified: diffs exact to brief; 18/18 by builder incl. new assertions; tile is <a>/<div> variants, no selector collisions. |
+| T2 | /dev hero (3 steps + copy-for-AI) + rendered guide.html + /guide route | 1 | Opus | DevSubmitRoute.tsx, App.tsx, scripts/build-guide.mjs (new), apps/web+root package.json, .gitignore, tests/dev-page.spec.ts (new), READMEs | PASS | 0 | Verified: exact prompt prefix; guide.html 42KB full doc w/ top bar; 26/26 e2e (orchestrator re-ran gate: tc 0, build 0, 26/26). |
+| — | GATE + LAND | 1 | — | — | IN PROGRESS | — | Committed; pushing/PR (classifier outage retry). |
+
+Gate: build:packages → typecheck → build → full e2e. Then land + prod verify.
+
+---
+
+# ARCHIVE — Orchestrator Ledger — Third-Party Game Publishing (SHIPPED, PR #9)
 
 Plan: ~/.claude/plans/use-orchestrator-skill-wiggly-hejlsberg.md
 Base: 86bb9b3 (origin/main). Branch: claude/thirsty-blackwell-3bfd4e.
@@ -21,7 +36,8 @@ Gates: `pnpm build:packages` → `pnpm typecheck` → `pnpm test:unit` → `pnpm
 | 4A | /dev submit + test-harness page | 4 | Sonnet | apps/web/src/routes/DevSubmitRoute.tsx (new), apps/web/src/App.tsx, apps/web/src/styles.css | PASS | 0* | Verified: live-browser run (handshake OK, taps round-trip, publish 201+token UI, unpublish); App.tsx wiring minimal; no sockets; 12/12 e2e by builder. Partial from dead 1st attempt was fully correct — kept 100%. |
 | 4B | COUCH-GAME-GUIDE.md + starter template | 4 | Opus | packages/game-sdk/COUCH-GAME-GUIDE.md (new, 669 lines), templates/couch-game-starter/** (new), apps/web/scripts/copy-sdk.mjs (guide copy), README.md pointer | PASS | 0* | Verified: orchestrator accuracy audit (rate limits/quick-start/linger/tiers all match source); template validated against real validator; simulator verified headless. Public guide copy gitignored (orchestrator). |
 | — | W4 GATE | 4 | — | — | GREEN | — | 204 unit, tc 0, build 0, e2e 12/12. Committed ad86851. |
-| 5A | E2E expansion (submit flow, remote 2-TV, dev simulator) | 5 | Sonnet | apps/web/tests/external-game.spec.ts | IN-FLIGHT | 0 | |
+| 5A | E2E expansion (submit flow, remote 2-TV, dev simulator) | 5 | Sonnet | apps/web/tests/external-game.spec.ts | PASS | 0 | Verified: 18/18 twice, no flake, no project restrictions; fixed latent substring-selector brittleness. |
+| — | W5 GATE + LANDED | 5 | — | — | DONE | — | Final gate green (204 unit, 18/18 e2e). PR #9 merged (f029543). PROD VERIFIED: guide+SDK+/dev live; real publish→catalog→delete lifecycle green on couch-gg.vercel.app (Redis registry working). Outstanding: ADMIN_KEY env (user action — secret write blocked by policy). |
 
 ## Wave gates
 - W1: build:packages + typecheck + new unit tests green → launch W2

@@ -22,6 +22,9 @@ function ScanPrompt() {
         <p className="scan-prompt-body">
           Open couch.gg on your TV, laptop, or shared screen. Then scan the QR code here with this phone.
         </p>
+        <div className="scan-prompt-actions">
+          <a className="ghost-btn" href="/dev">Build your own game →</a>
+        </div>
       </section>
     </main>
   );

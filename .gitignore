@@ -13,3 +13,4 @@ test-results/
 .vercel
 .env*
 apps/web/public/COUCH-GAME-GUIDE.md
+apps/web/public/guide.html
