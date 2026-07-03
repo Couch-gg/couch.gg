@@ -7,7 +7,7 @@ Base: 517fb43 (merged origin/main f029543). Branch: claude/thirsty-blackwell-3bf
 |---|---|---|---|---|---|---|---|
 | T1 | Player-facing entry points (attract footer, phone-home link, catalog promo tile) | 1 | Sonnet | AttractHome.tsx, GameCatalog.tsx, HomeRoute.tsx, styles.css, couch-flow.spec.ts | PASS | 0 | Verified: diffs exact to brief; 18/18 by builder incl. new assertions; tile is <a>/<div> variants, no selector collisions. |
 | T2 | /dev hero (3 steps + copy-for-AI) + rendered guide.html + /guide route | 1 | Opus | DevSubmitRoute.tsx, App.tsx, scripts/build-guide.mjs (new), apps/web+root package.json, .gitignore, tests/dev-page.spec.ts (new), READMEs | PASS | 0 | Verified: exact prompt prefix; guide.html 42KB full doc w/ top bar; 26/26 e2e (orchestrator re-ran gate: tc 0, build 0, 26/26). |
-| — | GATE + LAND | 1 | — | — | IN PROGRESS | — | Committed; pushing/PR (classifier outage retry). |
+| — | GATE + LAND | 1 | — | — | DONE | — | 26/26 e2e. PR #10 merged (ca5d737). PROD VERIFIED in real browser: attract footer, /dev hero + copy-for-AI button, /guide rendered page all live. Temp _prodshots spec + pngs to be cleaned (classifier outage at cleanup step — harmless untracked files). |
 
 Gate: build:packages → typecheck → build → full e2e. Then land + prod verify.
 
