@@ -197,6 +197,7 @@ class CouchCore {
       } catch (err) {
         // eslint-disable-next-line no-console
         console.error(`[couch] a '${event}' listener threw:`, err);
+        reportUncaught(err);
       }
     }
   }
@@ -298,6 +299,20 @@ class CouchCore {
     this.gameOverSent = true;
     const normalized = normalizeScores(scores);
     this.send({ v: PROTOCOL_VERSION, type: 'couch:gameOver', scores: normalized });
+  }
+}
+
+/**
+ * Hand a listener's exception to the page as an uncaught error, so the game's
+ * window 'error' handler and error trackers still see it.
+ */
+function reportUncaught(err: unknown): void {
+  if (typeof reportError === 'function') {
+    reportError(err);
+  } else {
+    setTimeout(() => {
+      throw err;
+    });
   }
 }
 

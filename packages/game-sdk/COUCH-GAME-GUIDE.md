@@ -244,9 +244,11 @@ const off = couch.on('input', (e) => { /* ... */ });
 Note: `pause`/`resume`/`abort` have no convenience-callback slot except pause and
 resume — subscribe to `abort` explicitly via `on('abort', ...)` if you need it.
 
-A listener that throws is logged with `console.error` and does not stop the
-other listeners of that event. `on()` with an event name this SDK doesn't know
-logs a warning and returns an unsubscribe function that does nothing.
+A listener that throws does not stop the other listeners of that event. Its
+error is logged with `console.error` and still reported as an uncaught error,
+so your `window` `error` handler and error trackers see it. `on()` with an event
+name this SDK doesn't know logs a warning and returns an unsubscribe function
+that does nothing.
 
 ### 4.4 Types
 

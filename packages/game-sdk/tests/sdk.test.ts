@@ -235,13 +235,19 @@ describe('CouchSDK abort on teardown', () => {
 });
 
 describe('CouchSDK listener isolation', () => {
-  it('a throwing listener is logged and the others still run', async () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('a throwing listener is logged, reported as uncaught, and the others still run', async () => {
     const h = embed();
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const reported = vi.fn();
+    vi.stubGlobal('reportError', reported);
     const p = CouchSDK.init({
       manifest,
-      onInput() {
-        throw new Error('game bug');
+      onInput(i) {
+        throw new Error(`game bug ${i.seq}`);
       }
     });
     h.deliver(initMessage());
@@ -256,6 +262,29 @@ describe('CouchSDK listener isolation', () => {
     expect(couch.lastSeq).toBe(2);
     expect(error).toHaveBeenCalledTimes(2);
     expect(String(error.mock.calls[0][0])).toContain("'input' listener threw");
+    // Handed to the page's error handlers (window 'error', error trackers).
+    expect(reported.mock.calls.map((c) => (c[0] as Error).message)).toEqual(['game bug 1', 'game bug 2']);
+    error.mockRestore();
+    h.restore();
+  });
+
+  it('without reportError the error is rethrown from a timer, after the other listeners ran', async () => {
+    const h = embed();
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.stubGlobal('reportError', undefined);
+    const p = CouchSDK.init({ manifest });
+    h.deliver(initMessage());
+    const couch = await p;
+    vi.useFakeTimers();
+    const seen: number[] = [];
+    couch.on('input', () => {
+      throw new Error('game bug');
+    });
+    couch.on('input', (i) => seen.push(i.seq));
+
+    h.deliver({ v: 1, type: 'couch:input', input: { seq: 1, at: 1, playerId: 'p1', control: 'tap', action: 'press' } });
+    expect(seen).toEqual([1]);
+    expect(() => vi.runAllTimers()).toThrow('game bug');
     error.mockRestore();
     h.restore();
   });
