@@ -36,6 +36,32 @@ export interface CouchPlayer {
   colorIdx: number;
   /** Whether the player's phone is currently connected. */
   connected: boolean;
+  /**
+   * The screen (TV) this player sits at, or null when unknown (joined by invite
+   * link without scanning a TV). Compare with `couch.screen.id`.
+   */
+  screenId?: string | null;
+}
+
+/** This screen's place in the lobby. */
+export interface CouchScreen {
+  /** This screen's id, or null when it has none (e.g. the /dev harness). */
+  id: string | null;
+  /**
+   * Whether this screen runs the game in host-authoritative mode: it simulates
+   * and `broadcast`s, every other screen renders `on('state')`. Exactly one
+   * screen per lobby is the host; on a single-screen couch it is that screen.
+   */
+  isHost: boolean;
+}
+
+/** A state broadcast from the host screen, as a non-host screen receives it. */
+export interface CouchStateEnvelope<TState = unknown> {
+  /** The host's broadcast counter; strictly increasing, older ones are dropped. */
+  seq: number;
+  /** Server time (ms) the broadcast passed through. */
+  at: number;
+  state: TState;
 }
 
 /** Discrete input actions a control can emit. */
@@ -190,8 +216,16 @@ export interface CouchSetControllerMessage {
   patch: CouchControllerPatch;
 }
 
+/** Host-authoritative state from the host screen's game (max 32 KB serialized). */
+export interface CouchBroadcastMessage {
+  v: ProtocolVersion;
+  type: 'couch:broadcast';
+  state: unknown;
+}
+
 export type CouchGameToHostMessage =
   | CouchHelloMessage
+  | CouchBroadcastMessage
   | CouchSetControllerMessage
   | CouchReadyMessage
   | CouchGameOverMessage
@@ -213,6 +247,8 @@ export interface CouchInitMessage {
   locale: string;
   reducedMotion: boolean;
   latencyTier: CouchLatencyTier;
+  /** Optional for hosts older than this field: absent means a lone host screen. */
+  screen?: CouchScreen;
 }
 
 /** A forwarded controller input (strict seq order). */
@@ -263,8 +299,24 @@ export interface CouchAbortMessage {
   reason: string;
 }
 
+/** State from the host screen, delivered to every other screen. */
+export interface CouchStateMessage {
+  v: ProtocolVersion;
+  type: 'couch:state';
+  envelope: CouchStateEnvelope;
+}
+
+/** This screen's role changed (e.g. the host player moved to another TV). */
+export interface CouchScreenMessage {
+  v: ProtocolVersion;
+  type: 'couch:screen';
+  screen: CouchScreen;
+}
+
 export type CouchHostToGameMessage =
   | CouchInitMessage
+  | CouchStateMessage
+  | CouchScreenMessage
   | CouchInputMessage
   | CouchPlayersMessage
   | CouchPlayerJoinedMessage
@@ -288,6 +340,7 @@ const COUCH_MESSAGE_TYPES = new Set<string>([
   'couch:gameOver',
   'couch:error',
   'couch:setController',
+  'couch:broadcast',
   // host -> game
   'couch:init',
   'couch:input',
@@ -296,7 +349,9 @@ const COUCH_MESSAGE_TYPES = new Set<string>([
   'couch:playerLeft',
   'couch:pause',
   'couch:resume',
-  'couch:abort'
+  'couch:abort',
+  'couch:state',
+  'couch:screen'
 ]);
 
 /**
@@ -323,6 +378,8 @@ export function isHostMessage(data: unknown): data is CouchHostToGameMessage {
       data.type === 'couch:playerLeft' ||
       data.type === 'couch:pause' ||
       data.type === 'couch:resume' ||
-      data.type === 'couch:abort')
+      data.type === 'couch:abort' ||
+      data.type === 'couch:state' ||
+      data.type === 'couch:screen')
   );
 }

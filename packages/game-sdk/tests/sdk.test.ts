@@ -209,6 +209,63 @@ describe('CouchSDK setController', () => {
   });
 });
 
+describe('CouchSDK host-authoritative mode', () => {
+  const seated: CouchPlayer[] = [
+    { id: 'p1', name: 'One', colorIdx: 0, connected: true, screenId: 'scr_a' },
+    { id: 'p2', name: 'Two', colorIdx: 1, connected: true, screenId: 'scr_b' }
+  ];
+
+  it('host screen broadcasts; localPlayers are the players at this screen', async () => {
+    const h = embed();
+    const p = CouchSDK.init({ manifest });
+    h.deliver(initMessage({ latencyTier: 'remote', players: seated, screen: { id: 'scr_a', isHost: true } }));
+    const couch = await p;
+
+    expect(couch.screen).toEqual({ id: 'scr_a', isHost: true });
+    expect(couch.localPlayers.map((pl) => pl.id)).toEqual(['p1']);
+    couch.broadcast({ x: 1 });
+    expect(h.posted.at(-1)).toEqual({ v: 1, type: 'couch:broadcast', state: { x: 1 } });
+    h.restore();
+  });
+
+  it('a mirror screen ignores broadcast() and gets on("state") in seq order', async () => {
+    const h = embed();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const p = CouchSDK.init({ manifest });
+    h.deliver(initMessage({ latencyTier: 'remote', players: seated, screen: { id: 'scr_b', isHost: false } }));
+    const couch = await p;
+    const seen: number[] = [];
+    couch.on('state', (e) => seen.push(e.seq));
+
+    const before = h.posted.length;
+    couch.broadcast({ x: 1 });
+    expect(h.posted.length).toBe(before);
+    expect(warn).toHaveBeenCalled();
+
+    for (const seq of [1, 3, 2, 3, 4]) h.deliver({ v: 1, type: 'couch:state', envelope: { seq, at: 0, state: { seq } } });
+    expect(seen).toEqual([1, 3, 4]);
+
+    // Becoming the host (host player moved here) is announced and resets the counter.
+    const changed = vi.fn();
+    couch.on('screenChanged', changed);
+    h.deliver({ v: 1, type: 'couch:screen', screen: { id: 'scr_b', isHost: true } });
+    expect(changed).toHaveBeenCalledWith({ id: 'scr_b', isHost: true });
+    expect(couch.screen.isHost).toBe(true);
+    warn.mockRestore();
+    h.restore();
+  });
+
+  it('a local couch (or an older host without screen info) is the host and seats everyone', async () => {
+    const h = embed();
+    const p = CouchSDK.init({ manifest });
+    h.deliver(initMessage());
+    const couch = await p;
+    expect(couch.screen).toEqual({ id: null, isHost: true });
+    expect(couch.localPlayers.map((pl) => pl.id)).toEqual(['p1', 'p2']);
+    h.restore();
+  });
+});
+
 describe('CouchSDK roster updates', () => {
   it('4. players message replaces roster + fires handler; joined/left deltas too', async () => {
     const h = embed();

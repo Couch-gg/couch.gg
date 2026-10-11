@@ -116,6 +116,7 @@ export interface SerializedLobbyRecord {
   inputSeq?: number;
   inputLog?: GameInputEnvelope[];
   controllerState?: Record<PlayerId, ControllerState>;
+  screens?: string[];
 }
 
 export interface LobbyRecord {
@@ -137,6 +138,7 @@ export interface LobbyRecord {
   inputSeq: number;
   inputLog: GameInputEnvelope[];
   controllerState: Record<PlayerId, ControllerState>;
+  screens: string[];
 }
 
 export class LobbyError extends Error {
@@ -185,7 +187,8 @@ export class LobbyStore {
       mode,
       inputSeq: 0,
       inputLog: [],
-      controllerState: {}
+      controllerState: {},
+      screens: []
     };
     this.addActivity(lobby, 'Lobby erstellt');
     this.lobbies.set(slug, lobby);
@@ -220,12 +223,15 @@ export class LobbyStore {
       lastEvent: lobby.lastEvent,
       mode: lobby.mode,
       inputLog: lobby.inputLog.slice(-INPUT_LOG_PUBLIC_LIMIT),
-      controllerState: lobby.controllerState
+      controllerState: lobby.controllerState,
+      screens: lobby.screens.slice(),
+      hostScreenId: hostScreenId(lobby)
     };
   }
 
-  joinPlayer(slug: string, name: unknown, existingToken?: string): JoinLobbyResponse {
+  joinPlayer(slug: string, name: unknown, existingToken?: string, screenId?: unknown): JoinLobbyResponse {
     const lobby = this.getLobby(slug);
+    const seat = cleanScreenId(screenId);
     const reconnect = existingToken
       ? [...lobby.players.values()].find((player) => player.token === existingToken)
       : undefined;
@@ -234,6 +240,7 @@ export class LobbyStore {
       reconnect.connected = true;
       reconnect.disconnectedAt = null;
       reconnect.name = sanitizePlayerName(name || reconnect.name);
+      if (seat) reconnect.screenId = seat;
       this.addActivity(lobby, `${reconnect.name} ist wieder verbunden`);
       return {
         lobby: this.publicLobby(lobby),
@@ -258,7 +265,8 @@ export class LobbyStore {
       connected: true,
       colorIdx: this.nextColor(lobby),
       token: createId('token'),
-      disconnectedAt: null
+      disconnectedAt: null,
+      screenId: seat
     };
     lobby.players.set(player.id, player);
     if (!lobby.hostPlayerId) {
@@ -589,8 +597,20 @@ export class LobbyStore {
       joinedAt: player.joinedAt,
       isHost: lobby.hostPlayerId === player.id,
       connected: player.connected,
-      colorIdx: player.colorIdx
+      colorIdx: player.colorIdx,
+      screenId: player.screenId ?? null
     };
+  }
+
+  // A TV showing this lobby. Remembered in join order so the host screen is
+  // stable; returns whether it was new.
+  addScreen(slug: string, screenId: unknown): boolean {
+    const lobby = this.getLobby(slug);
+    const id = cleanScreenId(screenId);
+    if (!id || lobby.screens.includes(id)) return false;
+    lobby.screens.push(id);
+    if (lobby.screens.length > MAX_LOBBY_SCREENS) lobby.screens = lobby.screens.slice(-MAX_LOBBY_SCREENS);
+    return true;
   }
 
   private nextColor(lobby: LobbyRecord): number {
@@ -656,7 +676,8 @@ export function serializeLobbyRecord(lobby: LobbyRecord): SerializedLobbyRecord 
     mode: lobby.mode,
     inputSeq: lobby.inputSeq,
     inputLog: lobby.inputLog.slice(),
-    controllerState: structuredClone(lobby.controllerState)
+    controllerState: structuredClone(lobby.controllerState),
+    screens: lobby.screens.slice()
   };
 }
 
@@ -691,8 +712,25 @@ export function deserializeLobbyRecord(serialized: SerializedLobbyRecord): Lobby
     mode: serialized.mode ?? 'local',
     inputSeq: serialized.inputSeq ?? 0,
     inputLog: serialized.inputLog ? serialized.inputLog.slice() : [],
-    controllerState: serialized.controllerState ? structuredClone(serialized.controllerState) : {}
+    controllerState: serialized.controllerState ? structuredClone(serialized.controllerState) : {},
+    screens: serialized.screens ? serialized.screens.slice() : []
   };
+}
+
+const MAX_LOBBY_SCREENS = 8;
+const SCREEN_ID_RE = /^scr_[A-Za-z0-9_-]{1,60}$/;
+
+function cleanScreenId(value: unknown): string | null {
+  return typeof value === 'string' && SCREEN_ID_RE.test(value) ? value : null;
+}
+
+// The screen that runs a host-authoritative game: wherever the host player
+// sits, else the first screen that showed up. Local lobbies have one screen,
+// so it's simply that one.
+export function hostScreenId(lobby: LobbyRecord): string | null {
+  const host = lobby.hostPlayerId ? lobby.players.get(lobby.hostPlayerId) : undefined;
+  if (host?.screenId && lobby.screens.includes(host.screenId)) return host.screenId;
+  return lobby.screens[0] ?? null;
 }
 
 const MAX_LABEL_CHARS = 16;

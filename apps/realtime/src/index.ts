@@ -7,7 +7,7 @@ import { GAME_MANIFESTS } from '@couch/game-runtime';
 import type { TrebuchetEvent } from '@couch/trebuchet';
 import type { ControllerEvent, ControllerPatch, GameId, GameManifest, PlayerId, ScreenId } from '@couch/types';
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { LobbyError, LobbyStore, RECONNECT_GRACE_MS, type LobbyRecord, type ManifestResolver } from './lobbies.js';
+import { LobbyError, LobbyStore, RECONNECT_GRACE_MS, hostScreenId, type LobbyRecord, type ManifestResolver } from './lobbies.js';
 import { mergeCatalog, parseExternalGamesJson } from './external-games.js';
 import { RateLimiter } from './rate-limit.js';
 import { createProductionGamePersistence, createProductionLobbyPersistence } from './persistence.js';
@@ -20,6 +20,10 @@ import { ScreenRegistry } from './screens.js';
 const REPORT_CAPACITY = 5;
 const REPORT_REFILL_PER_MS = 5 / 3_600_000; // 5 per 3600s
 const REPORT_IDLE_PRUNE_MS = 3_600_000;
+// Largest host-authoritative state broadcast (serialized), see game:state.
+const MAX_STATE_BYTES = 32_768;
+// How long a socket's "is this the host screen" verdict is trusted.
+const HOST_CHECK_TTL_MS = 2_000;
 
 class ReportRateLimiter {
   private readonly buckets = new Map<string, { tokens: number; lastRefill: number }>();
@@ -108,6 +112,9 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   const inputLimiter = new RateLimiter();
   // Separate budget for game -> phone controller updates, keyed per lobby.
   const controllerLimiter = new RateLimiter();
+  // Host-authoritative state broadcasts: ~30/s sustained per lobby (a 30 Hz
+  // snapshot loop), bursts to 60.
+  const stateLimiter = new RateLimiter({ playerCapacity: 60, playerRefillPerSec: 30, slugCapacity: 60, slugRefillPerSec: 30 });
   // Per-IP report throttle: 5 reports/hour. Same token-bucket shape as the input
   // limiter but with report-specific capacity/refill, keyed `report:<ip>`.
   const reportLimiter = new ReportRateLimiter();
@@ -156,7 +163,7 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   app.post(`${apiPrefix}/lobbies/:slug/players`, async (req, res) => {
     try {
       await hydrateLobby(req.params.slug);
-      const joined = store.joinPlayer(req.params.slug, req.body?.name, req.body?.playerToken);
+      const joined = store.joinPlayer(req.params.slug, req.body?.name, req.body?.playerToken, req.body?.screenId);
       await saveLobby(req.params.slug);
       res.status(201).json(joined);
     } catch (err) {
@@ -310,13 +317,18 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   io.on('connection', (socket) => {
     let ctx: SocketContext | null = null;
 
-    socket.on('screen:join', async (payload: { slug?: string }, ack?: (value: unknown) => void) => {
+    socket.on('screen:join', async (payload: { slug?: string; screenId?: string }, ack?: (value: unknown) => void) => {
       try {
         const slug = String(payload?.slug ?? '').toUpperCase();
         await hydrateLobby(slug);
         await registry.ensureFresh();
+        const screenId = typeof payload?.screenId === 'string' ? payload.screenId : undefined;
+        if (store.addScreen(slug, screenId)) {
+          await saveLobby(slug);
+          emitLobby(slug);
+        }
         const lobby = store.publicLobby(slug);
-        ctx = { role: 'screen', slug };
+        ctx = { role: 'screen', slug, screenId };
         socket.join(room(slug));
         ack?.({ ok: true, lobby, games: catalog() });
         socket.emit('lobby:snapshot', lobby);
@@ -325,12 +337,12 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
       }
     });
 
-    socket.on('controller:join', async (payload: { slug?: string; name?: string; playerToken?: string }, ack?: (value: unknown) => void) => {
+    socket.on('controller:join', async (payload: { slug?: string; name?: string; playerToken?: string; screenId?: string }, ack?: (value: unknown) => void) => {
       try {
         const slug = String(payload?.slug ?? '').toUpperCase();
         await hydrateLobby(slug);
         await registry.ensureFresh();
-        const joined = store.joinPlayer(slug, payload?.name, payload?.playerToken);
+        const joined = store.joinPlayer(slug, payload?.name, payload?.playerToken, payload?.screenId);
         await saveLobby(slug);
         ctx = { role: 'controller', slug, playerId: joined.player.id };
         socket.join(room(slug));
@@ -493,6 +505,42 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
         ack?.({ ok: true, state });
         await saveLobby(slug);
         io.to(room(slug)).emit('controller:state', { playerId, state });
+      } catch (err) {
+        ack?.(socketError(err));
+      }
+    });
+
+    // Host-authoritative mode: the host screen's game broadcasts its state and
+    // every other screen renders it. Ephemeral (never persisted): a screen that
+    // joins late simply picks up the next broadcast. The host verdict is cached
+    // per socket and re-read from persistence every HOST_CHECK_TTL_MS, so a
+    // 30 Hz loop doesn't hit Redis on every frame but still notices when the
+    // host player moves to another screen (possibly via another instance).
+    let hostCheck: { slug: string; ok: boolean; at: number } | null = null;
+    socket.on('game:state', async (payload: { slug?: string; seq?: unknown; state?: unknown }, ack?: (value: unknown) => void) => {
+      try {
+        const slug = String(payload?.slug ?? '').toUpperCase();
+        if (!ctx || ctx.role !== 'screen' || ctx.slug !== slug) {
+          throw new LobbyError('Nur ein Screen kann Spielzustand senden', 403);
+        }
+        const now = Date.now();
+        if (!hostCheck || hostCheck.slug !== slug || now - hostCheck.at > HOST_CHECK_TTL_MS) {
+          await hydrateLobby(slug);
+          const lobby = store.getLobby(slug);
+          hostCheck = { slug, ok: !!ctx.screenId && hostScreenId(lobby) === ctx.screenId, at: now };
+        }
+        if (!hostCheck.ok) {
+          throw new LobbyError('Nur der Host-Screen sendet den Spielzustand', 403);
+        }
+        if (typeof payload?.seq !== 'number') throw new LobbyError('seq fehlt');
+        const encoded = JSON.stringify(payload?.state ?? null);
+        if (encoded.length > MAX_STATE_BYTES) throw new LobbyError('Spielzustand zu groß', 413);
+        if (!stateLimiter.allow(slug, 'host')) {
+          ack?.({ ok: true, dropped: true });
+          return;
+        }
+        ack?.({ ok: true });
+        socket.to(room(slug)).emit('game:state', { seq: payload.seq, at: Date.now(), state: payload.state ?? null });
       } catch (err) {
         ack?.(socketError(err));
       }

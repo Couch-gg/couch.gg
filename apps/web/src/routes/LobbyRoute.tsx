@@ -29,6 +29,22 @@ let sfxPromise: Promise<SfxModule | null> | null = null;
 // How long an external game's winner screen stays up after the lobby ends.
 const GAME_OVER_LINGER_MS = 5_000;
 
+// This TV's screen id: the one the attract screen registered (and phones scanned),
+// or a fresh one for a TV that opened the lobby URL directly. Games use it to
+// tell which players sit here and which screen is the host.
+function ownScreenId(): string {
+  const key = 'couch:screenId';
+  try {
+    const existing = window.sessionStorage.getItem(key);
+    if (existing) return existing;
+    const created = `scr_${Math.random().toString(36).slice(2, 12)}${Date.now().toString(36)}`;
+    window.sessionStorage.setItem(key, created);
+    return created;
+  } catch {
+    return `scr_${Math.random().toString(36).slice(2, 12)}`;
+  }
+}
+
 function loadSfx(): Promise<SfxModule | null> {
   if (sfxPromise) return sfxPromise;
   sfxPromise = (async () => {
@@ -56,6 +72,7 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
   // trebuchet path never reads it, so its flow is untouched.
   const [socket, setSocket] = useState<Socket | null>(null);
   const gameHostRef = useRef<GameHostStageHandle | null>(null);
+  const screenId = useMemo(ownScreenId, []);
 
   // A shot can reach this screen via the socket (same instance, instant) or via the
   // polled/snapshot lobby state (cross-instance, ≤750ms). Dedupe by monotonic seq so
@@ -76,10 +93,17 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
         if (!active) return;
         setLobby(initialLobby);
         setGames(gameList);
-        return emitAck<{ ok: true; lobby: Lobby; games: GameManifest[] }>(socket, 'screen:join', { slug });
+        return emitAck<{ ok: true; lobby: Lobby; games: GameManifest[] }>(socket, 'screen:join', { slug, screenId });
       })
       .then((joined) => {
         if (joined?.lobby && active) setLobby(joined.lobby);
+        // After a dropped connection the server no longer has this socket in
+        // the lobby room (no inputs, no host role for broadcasts): rejoin.
+        socket.on('connect', () => {
+          void emitAck(socket, 'screen:join', { slug, screenId }).catch(() => {
+            // The poll keeps the screen going; the next reconnect retries.
+          });
+        });
       })
       .catch((err) => active && setError(err instanceof Error ? err.message : 'Lobby konnte nicht geladen werden'));
 
@@ -101,7 +125,7 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
       socket.disconnect();
       setSocket(null);
     };
-  }, [slug, applyGameEvent]);
+  }, [slug, applyGameEvent, screenId]);
 
   // Replay the latest event carried inside the polled/snapshot lobby state. This is the
   // cross-instance path: when the opponent fired on a different serverless instance the
@@ -287,6 +311,7 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
               manifest={stageManifest}
               lobby={lobby}
               socket={socket}
+              screenId={screenId}
               mode="live"
             />
           ) : lobby?.state === 'playing' ? (

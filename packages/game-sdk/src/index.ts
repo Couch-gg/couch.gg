@@ -23,7 +23,9 @@ import {
   type CouchMessage,
   type CouchMode,
   type CouchPlayer,
-  type CouchScore
+  type CouchScore,
+  type CouchScreen,
+  type CouchStateEnvelope
 } from './protocol';
 import { createSimulator, type Simulator } from './simulator';
 
@@ -46,7 +48,9 @@ export type CouchEventName =
   | 'playersChanged'
   | 'pause'
   | 'resume'
-  | 'abort';
+  | 'abort'
+  | 'state'
+  | 'screenChanged';
 
 /** Payload shape per event. */
 export interface CouchEventMap {
@@ -55,6 +59,8 @@ export interface CouchEventMap {
   pause: { reason: string };
   resume: void;
   abort: { reason: string };
+  state: CouchStateEnvelope;
+  screenChanged: CouchScreen;
 }
 
 /** Options passed to `CouchSDK.init`. */
@@ -89,6 +95,16 @@ export interface CouchGame {
   readonly manifest: CouchManifest;
   /** Highest input `seq` seen so far (or -1 before any input). */
   readonly lastSeq: number;
+  /** This screen: its id and whether it is the host screen (see `broadcast`). */
+  readonly screen: CouchScreen;
+  /** Players sitting at this screen (all players on a local couch). */
+  readonly localPlayers: CouchPlayer[];
+  /**
+   * Host-authoritative mode: on the host screen, send the game state to every
+   * other screen (they get it via `on('state')`). Ignored with a warning on a
+   * non-host screen. Keep it small (≤ 32 KB) and ≤ 30 per second.
+   */
+  broadcast(state: unknown): void;
   /** Subscribe to an event. Returns an unsubscribe function. */
   on<E extends CouchEventName>(
     event: E,
@@ -125,13 +141,17 @@ class CouchCore {
   reducedMotion = false;
   manifest: CouchManifest;
   lastSeq = -1;
+  screen: CouchScreen = { id: null, isHost: true };
+  private lastStateSeq = -1;
 
   private readonly listeners: Record<CouchEventName, Set<Listener>> = {
     input: new Set(),
     playersChanged: new Set(),
     pause: new Set(),
     resume: new Set(),
-    abort: new Set()
+    abort: new Set(),
+    state: new Set(),
+    screenChanged: new Set()
   };
 
   private gameOverSent = false;
@@ -200,6 +220,34 @@ class CouchCore {
     this.emit('abort', { reason });
   }
 
+  get localPlayers(): CouchPlayer[] {
+    if (this.latencyTier === 'local' || this.screen.id === null) return this.players;
+    return this.players.filter((p) => p.screenId === this.screen.id);
+  }
+
+  broadcast(state: unknown): void {
+    if (!this.screen.isHost) {
+      // eslint-disable-next-line no-console
+      console.warn('[couch] broadcast() on a non-host screen — ignoring. Check couch.screen.isHost.');
+      return;
+    }
+    this.send({ v: PROTOCOL_VERSION, type: 'couch:broadcast', state });
+  }
+
+  /** Deliver host state; stale or duplicate envelopes are dropped. */
+  receiveState(envelope: CouchStateEnvelope): void {
+    if (envelope.seq <= this.lastStateSeq) return;
+    this.lastStateSeq = envelope.seq;
+    this.emit('state', envelope);
+  }
+
+  setScreen(screen: CouchScreen): void {
+    this.screen = screen;
+    // A new host screen starts its own broadcast counter.
+    this.lastStateSeq = -1;
+    this.emit('screenChanged', screen);
+  }
+
   setController(playerId: string, patch: CouchControllerPatch): void {
     this.send({ v: PROTOCOL_VERSION, type: 'couch:setController', playerId: String(playerId), patch });
   }
@@ -253,6 +301,15 @@ function makeHandle(core: CouchCore): CouchGame {
     },
     get lastSeq() {
       return core.lastSeq;
+    },
+    get screen() {
+      return core.screen;
+    },
+    get localPlayers() {
+      return core.localPlayers;
+    },
+    broadcast(state) {
+      core.broadcast(state);
     },
     on(event, cb) {
       return core.on(event, cb as Listener);
@@ -334,6 +391,7 @@ function initEmbedded(opts: CouchInitOptions): Promise<CouchGame> {
           core.reducedMotion = msg.reducedMotion;
           core.latencyTier = msg.latencyTier;
           core.players = msg.players ?? [];
+          core.screen = msg.screen ?? { id: null, isHost: true };
 
           // Auto-acknowledge so the host reveals the game.
           core.send({ v: PROTOCOL_VERSION, type: 'couch:ready' });
@@ -360,6 +418,12 @@ function initEmbedded(opts: CouchInitOptions): Promise<CouchGame> {
           break;
         case 'couch:abort':
           core.abort(msg.reason);
+          break;
+        case 'couch:state':
+          core.receiveState(msg.envelope);
+          break;
+        case 'couch:screen':
+          core.setScreen(msg.screen);
           break;
         default:
           // Exhaustiveness guard.

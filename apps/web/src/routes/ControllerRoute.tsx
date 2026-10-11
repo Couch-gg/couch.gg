@@ -167,7 +167,8 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
       void emitAck<JoinLobbyResponse & { ok: true; games: GameManifest[] }>(nextSocket, 'controller:join', {
         slug,
         name: storedName,
-        playerToken: token
+        playerToken: token,
+        screenId: seatFor(slug)
       })
         .then((joined) => {
           setPlayer(joined.player);
@@ -232,7 +233,8 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
       const joined = await emitAck<JoinLobbyResponse & { ok: true; games: GameManifest[] }>(socket, 'controller:join', {
         slug,
         name: name || 'Player',
-        playerToken
+        playerToken,
+        screenId: seatFor(slug)
       });
       setPlayer(joined.player);
       setLobby(joined.lobby);
@@ -1014,4 +1016,13 @@ function arcInfo(angle: number): ArcInfo {
   const span = ELEV_MAX - ELEV_MIN || 1;
   const fillPct = clamp01((elevation - ELEV_MIN) / span) * 100;
   return { side: right ? 'right' : 'left', elevation, fillPct };
+}
+
+// The TV this phone scanned for this room (set by PairRoute), if any.
+function seatFor(slug: string): string | undefined {
+  try {
+    return window.localStorage.getItem(`couch:seat:${slug}`) ?? undefined;
+  } catch {
+    return undefined;
+  }
 }

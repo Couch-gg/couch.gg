@@ -4,6 +4,7 @@ import { getGameManifest } from '@couch/game-runtime';
 import {
   LobbyStore,
   deserializeLobbyRecord,
+  hostScreenId,
   isTrebuchetSnapshot,
   serializeLobbyRecord,
   type ManifestResolver
@@ -491,5 +492,36 @@ describe('setControllerState (couch.setController)', () => {
     store.getLobby(slug).state = 'waiting';
     store.startGame(slug, host.playerToken);
     expect(store.getLobby(slug).controllerState).toEqual({});
+  });
+});
+
+describe('screens and the host screen (host-authoritative mode)', () => {
+  it("picks the host player's screen, else the first screen that joined", () => {
+    const store = new LobbyStore(makeResolver(TAP_RACE));
+    const lobby = store.createLobby(Date.now(), 'remote');
+    expect(store.publicLobby(lobby.slug).hostScreenId).toBeNull();
+
+    store.addScreen(lobby.slug, 'scr_guest');
+    store.addScreen(lobby.slug, 'scr_host');
+    expect(store.addScreen(lobby.slug, 'scr_host')).toBe(false); // already known
+    expect(store.addScreen(lobby.slug, 'not a screen id')).toBe(false);
+    expect(store.publicLobby(lobby.slug).hostScreenId).toBe('scr_guest');
+
+    const host = store.joinPlayer(lobby.slug, 'Alex', undefined, 'scr_host');
+    const guest = store.joinPlayer(lobby.slug, 'Bea', undefined, 'scr_guest');
+    const pub = store.publicLobby(lobby.slug);
+    expect(pub.hostScreenId).toBe('scr_host');
+    expect(pub.players.map((p) => [p.name, p.screenId])).toEqual([
+      ['Alex', 'scr_host'],
+      ['Bea', 'scr_guest']
+    ]);
+    expect(hostScreenId(store.getLobby(lobby.slug))).toBe('scr_host');
+
+    // Seats survive persistence; a reconnect without a seat keeps the old one.
+    const restored = deserializeLobbyRecord(serializeLobbyRecord(store.getLobby(lobby.slug)));
+    expect(restored.screens).toEqual(['scr_guest', 'scr_host']);
+    store.joinPlayer(lobby.slug, 'Bea', guest.playerToken);
+    expect(store.getLobby(lobby.slug).players.get(guest.player.id)?.screenId).toBe('scr_guest');
+    expect(host.player.screenId).toBe('scr_host');
   });
 });

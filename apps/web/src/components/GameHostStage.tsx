@@ -7,7 +7,9 @@ import type {
   CouchInitMessage,
   CouchManifest,
   CouchPlayer,
-  CouchScore
+  CouchScore,
+  CouchScreen,
+  CouchStateEnvelope
 } from '@couch/game-sdk';
 import { emitAck } from '../socket.js';
 
@@ -50,6 +52,8 @@ export interface GameHostStageProps {
    * surfaced through `onEvent` so the test page owns the side effects.
    */
   mode: 'live' | 'test';
+  /** This TV's screen id (live mode), for host-authoritative games. */
+  screenId?: string;
   /** Lifecycle callback (fires in both modes; the only channel in test mode). */
   onEvent?: (event: GameHostEvent) => void;
 }
@@ -62,6 +66,8 @@ export interface GameHostStageProps {
 const READY_TIMEOUT_MS = 15_000;
 /** Max serialized inbound message size we accept (bytes-ish, via string length). */
 const MAX_INBOUND_BYTES = 8_192;
+/** couch:broadcast carries a whole game state, so it gets a larger cap (matches the server). */
+const MAX_BROADCAST_BYTES = 32_768;
 /** Inbound rate cap: drop messages beyond this many per rolling second. */
 const MAX_INBOUND_PER_SEC = 60;
 
@@ -89,8 +95,16 @@ function toCouchPlayer(player: Player): CouchPlayer {
     id: player.id,
     name: player.name,
     colorIdx: player.colorIdx,
-    connected: player.connected
+    connected: player.connected,
+    screenId: player.screenId ?? null
   };
+}
+
+/** This screen's role: host if it is the lobby's host screen (or the lobby has none yet). */
+function screenRole(lobby: Lobby, screenId: string | undefined): CouchScreen {
+  if (!screenId) return { id: null, isHost: true };
+  const host = lobby.hostScreenId ?? null;
+  return { id: screenId, isHost: host === null || host === screenId };
 }
 
 /** aspectRatio '16:9' | '4:3' -> numeric ratio for letterboxing math. */
@@ -118,7 +132,7 @@ function normalizeScores(raw: unknown): CouchScore[] {
 // ---------------------------------------------------------------------------
 
 export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>(function GameHostStage(
-  { manifest, lobby, socket, mode, onEvent },
+  { manifest, lobby, socket, mode, screenId, onEvent },
   ref
 ) {
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
@@ -135,6 +149,10 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
   const knownPlayersRef = useRef<Map<string, CouchPlayer>>(new Map());
 
   const modeRef = useRef(mode);
+  const screenIdRef = useRef(screenId);
+  screenIdRef.current = screenId;
+  const screenKeyRef = useRef('');
+  const broadcastSeqRef = useRef(0);
   const socketRef = useRef<Socket | null | undefined>(socket);
   const onEventRef = useRef(onEvent);
   const manifestRef = useRef(manifest);
@@ -195,8 +213,10 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
         typeof window !== 'undefined' && typeof window.matchMedia === 'function'
           ? window.matchMedia('(prefers-reduced-motion: reduce)').matches
           : false,
-      latencyTier
+      latencyTier,
+      screen: screenRole(l, screenIdRef.current)
     };
+    screenKeyRef.current = JSON.stringify(init.screen);
     initializedRef.current = true;
     post(init);
   }, [post]);
@@ -226,7 +246,7 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
       } catch {
         return;
       }
-      if (serialized.length > MAX_INBOUND_BYTES) return;
+      if (serialized.length > (data.type === 'couch:broadcast' ? MAX_BROADCAST_BYTES : MAX_INBOUND_BYTES)) return;
 
       // Rate guard: rolling 1s window.
       const now = Date.now();
@@ -270,6 +290,20 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
               /* server logs; nothing to do client-side */
             });
           }
+          break;
+        }
+        case 'couch:broadcast': {
+          if (modeRef.current === 'test') break; // one screen in /dev: nobody to tell
+          const sock = socketRef.current;
+          if (!sock) break;
+          broadcastSeqRef.current += 1;
+          // Fire-and-forget at frame rate: no ack wait; the server rejects a
+          // non-host screen, which the SDK already prevents.
+          sock.emit('game:state', {
+            slug: lobbyRef.current.slug,
+            seq: broadcastSeqRef.current,
+            state: (msg as { state?: unknown }).state ?? null
+          });
           break;
         }
         case 'couch:setController': {
@@ -334,7 +368,13 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
     if (!changed) {
       for (const [id, p] of next) {
         const before = prev.get(id);
-        if (!before || before.connected !== p.connected || before.name !== p.name || before.colorIdx !== p.colorIdx) {
+        if (
+          !before ||
+          before.connected !== p.connected ||
+          before.name !== p.name ||
+          before.colorIdx !== p.colorIdx ||
+          before.screenId !== p.screenId
+        ) {
           changed = true;
           break;
         }
@@ -352,6 +392,29 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
     }
     knownPlayersRef.current = next;
   }, [lobby.players, post]);
+
+  // --- Host screen changes (host player moved, first screen left) -> couch:screen. ---
+  useEffect(() => {
+    if (!initializedRef.current) return;
+    const screen = screenRole(lobby, screenId);
+    const key = JSON.stringify(screen);
+    if (key === screenKeyRef.current) return;
+    screenKeyRef.current = key;
+    post({ v: 1, type: 'couch:screen', screen });
+  }, [lobby, screenId, post]);
+
+  // --- Host-authoritative state from the host screen -> couch:state. ---
+  useEffect(() => {
+    if (mode !== 'live' || !socket) return;
+    const onState = (envelope: CouchStateEnvelope) => {
+      if (typeof envelope?.seq !== 'number') return;
+      post({ v: 1, type: 'couch:state', envelope });
+    };
+    socket.on('game:state', onState);
+    return () => {
+      socket.off('game:state', onState);
+    };
+  }, [mode, socket, post]);
 
   // --- visibilitychange -> pause/resume. ---
   useEffect(() => {

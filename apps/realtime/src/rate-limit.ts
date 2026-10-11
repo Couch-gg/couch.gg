@@ -28,9 +28,25 @@ const SLUG_CAPACITY = 120;
 const SLUG_REFILL_PER_SEC = 60;
 const IDLE_PRUNE_MS = 60_000;
 
+export interface RateLimiterLimits {
+  playerCapacity: number;
+  playerRefillPerSec: number;
+  slugCapacity: number;
+  slugRefillPerSec: number;
+}
+
 export class RateLimiter {
   private readonly buckets = new Map<string, Bucket>();
   private lastPrune = 0;
+
+  constructor(
+    private readonly limits: RateLimiterLimits = {
+      playerCapacity: PLAYER_CAPACITY,
+      playerRefillPerSec: PLAYER_REFILL_PER_SEC,
+      slugCapacity: SLUG_CAPACITY,
+      slugRefillPerSec: SLUG_REFILL_PER_SEC
+    }
+  ) {}
 
   private refill(bucket: Bucket, capacity: number, refillPerSec: number, now: number): void {
     const elapsedMs = now - bucket.lastRefill;
@@ -67,11 +83,12 @@ export class RateLimiter {
   allow(slug: string, playerId: string, now = Date.now()): boolean {
     this.pruneIdle(now);
 
-    const playerBucket = this.getBucket(`${slug}:${playerId}`, PLAYER_CAPACITY, now);
-    const slugBucket = this.getBucket(slug, SLUG_CAPACITY, now);
+    const { playerCapacity, playerRefillPerSec, slugCapacity, slugRefillPerSec } = this.limits;
+    const playerBucket = this.getBucket(`${slug}:${playerId}`, playerCapacity, now);
+    const slugBucket = this.getBucket(slug, slugCapacity, now);
 
-    this.refill(playerBucket, PLAYER_CAPACITY, PLAYER_REFILL_PER_SEC, now);
-    this.refill(slugBucket, SLUG_CAPACITY, SLUG_REFILL_PER_SEC, now);
+    this.refill(playerBucket, playerCapacity, playerRefillPerSec, now);
+    this.refill(slugBucket, slugCapacity, slugRefillPerSec, now);
 
     if (playerBucket.tokens < 1 || slugBucket.tokens < 1) return false;
 

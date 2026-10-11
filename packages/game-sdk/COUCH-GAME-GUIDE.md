@@ -184,10 +184,13 @@ interface CouchGame {
   readonly reducedMotion: boolean;   // true if the player prefers reduced motion — honour it
   readonly manifest: CouchManifest;  // the manifest the host echoed back (may be enriched)
   readonly lastSeq: number;          // highest input seq seen so far, or -1 before any input
+  readonly screen: { id: string | null; isHost: boolean }; // this TV (section 6, host mode)
+  readonly localPlayers: CouchPlayer[]; // players sitting at this screen
 
   on<E>(event: E, cb: (payload) => void): () => void;  // returns an unsubscribe fn
   gameOver(scores: CouchScore[] | Record<string, number>): void;  // call ONCE
   setController(playerId: string, patch: CouchControllerPatch): void;  // section 4.6
+  broadcast(state: unknown): void;   // host screen only (section 6, host mode)
 }
 ```
 
@@ -212,6 +215,8 @@ interface CouchGame {
 | `pause`          | `{ reason: string }`           | Host tab hidden (`reason: 'host-hidden'`). |
 | `resume`         | `void`                         | Host tab visible again. |
 | `abort`          | `{ reason: string }`           | Session torn down (`reason: 'host-unmounted'`). |
+| `state`          | `{ seq, at, state }`           | Non-host screens: a snapshot from the host screen (section 6). |
+| `screenChanged`  | `{ id, isHost }`               | This screen became (or stopped being) the host screen. |
 
 ```ts
 const off = couch.on('input', (e) => { /* ... */ });
@@ -386,6 +391,46 @@ If you set `supportsRemote: true` in your manifest, you are promising your game 
   animation-frame timing for anything that determines the result. Use `seq`
   ordering and the seed.
 
+### Host-authoritative mode (action games in a remote couch)
+
+Determinism is the only way to run a game on several screens if every screen
+simulates. An action game can instead let **one** screen simulate and the others
+just draw what it sends:
+
+```ts
+const couch = await CouchSDK.init({ manifest });
+
+if (couch.screen.isHost) {
+  // Simulate everything from every player's inputs, then share the result.
+  couch.on('input', applyInput);
+  setInterval(() => {
+    step();
+    couch.broadcast(snapshot()); // ≤ 32 KB, ≤ 30 per second
+  }, 33);
+} else {
+  // Render the host's snapshots; inputs still arrive here too, ignore them.
+  couch.on('state', ({ state }) => render(state));
+}
+
+// Who sits in front of this screen (split-screen, camera follow, HUD):
+const mine = couch.localPlayers;
+```
+
+- `couch.screen` is `{ id, isHost }`. Exactly one screen per lobby is the host:
+  the screen the host player scanned, else the first screen that opened the
+  lobby. On a local couch it is the only screen. If the host moves, you get
+  `on('screenChanged', screen)`.
+- Every player carries `screenId`: the TV whose QR code they scanned (`null` if
+  they joined by invite link). `couch.localPlayers` filters to this screen.
+- `on('state')` gets `{ seq, at, state }`; older or duplicate snapshots are
+  dropped for you. The host never receives its own broadcast. Broadcasts are
+  not stored: a screen that joins late gets the next one.
+- Latency is one hop from the host screen through the server to the others,
+  so the non-host screens see the game slightly behind the host. Inputs from
+  players at a non-host screen travel phone → server → host screen first.
+- Set `supportsRemote: true` when your game handles both roles; you don't have
+  to be deterministic in this mode.
+
 If your game needs twitch timing, **omit `supportsRemote`** (or set it `false`).
 The platform will then refuse to select your game in a remote lobby (it throws
 "Dieses Spiel unterstützt Remote Couch nicht"), which is the correct outcome —
@@ -541,6 +586,8 @@ From `rate-limit.ts`, `lobbies.ts`, and `GameHostStage.tsx`:
   number, a short string).
 - **Inbound message size (game → host)**: messages you post to the host are
   capped at **8192 bytes** (serialized); oversized messages are dropped.
+- **State broadcasts (`broadcast`)**: **32 KB** per snapshot, **30 per second**
+  sustained per lobby (burst 60); extra snapshots are dropped.
 - **Controller updates (`setController`)**: capacity **40**, refill **20 per
   second** per lobby; extra updates are dropped.
 - **Inbound message rate (game → host)**: **60 messages per rolling second**;

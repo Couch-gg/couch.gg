@@ -168,3 +168,58 @@ test('the game labels each phone and runs cooldowns on it (couch.setController)'
   await alex.close();
   await bea.close();
 });
+
+test('REMOTE host mode: the host screen broadcasts, the other screen renders it', async ({ browser }) => {
+  test.setTimeout(150_000);
+  const desktop = () =>
+    browser.newPage({ viewport: { width: 1440, height: 960 }, isMobile: false, hasTouch: false, userAgent: DESKTOP_UA });
+  const screenOf = async (tv: Page) => {
+    await tv.goto('/');
+    await expect
+      .poll(() => tv.evaluate(() => window.sessionStorage.getItem('couch:screenId')), { timeout: 15_000 })
+      .toBeTruthy();
+    return (await tv.evaluate(() => window.sessionStorage.getItem('couch:screenId')))!;
+  };
+
+  // Alex hosts from TV 1, Bea joins the room from TV 2 in another place.
+  const hostTv = await desktop();
+  const alex = await phonePage(browser, 'Alex');
+  await alex.goto('/s/' + (await screenOf(hostTv)) + '?mode=remote');
+  await alex.getByRole('button', { name: /Host Game/i }).click();
+  await expect(alex).toHaveURL(/\/c\/[A-Z0-9]+/, { timeout: 15_000 });
+  const slug = alex.url().split('/').pop()!;
+  await alex.getByRole('button', { name: /^Done$/i }).click();
+
+  const guestTv = await desktop();
+  const bea = await phonePage(browser, 'Bea');
+  await bea.goto('/s/' + (await screenOf(guestTv)) + '?mode=remote');
+  await bea.getByRole('button', { name: /Join Game/i }).click();
+  await bea.getByLabel(/Room number/i).fill(slug);
+  await bea.getByRole('button', { name: /Join Game/i }).click();
+  await expect(guestTv).toHaveURL(new RegExp('/l/' + slug), { timeout: 15_000 });
+  await expect(hostTv.locator('.player-name', { hasText: 'Bea' })).toBeVisible({ timeout: 15_000 });
+
+  await alex
+    .locator('.game-card')
+    .filter({ has: alex.locator('.game-card-title', { hasText: /^Input Lab$/ }) })
+    .click();
+  await alex.getByRole('button', { name: /Input Lab starten/i }).click();
+
+  const hostFrame = hostTv.frameLocator('iframe[title="Input Lab"]');
+  const guestFrame = guestTv.frameLocator('iframe[title="Input Lab"]');
+  // Alex's TV is the host screen and seats Alex; Bea's TV mirrors and seats Bea.
+  await expect(hostFrame.locator('[data-testid="screen-role"]')).toHaveText('host', { timeout: 20_000 });
+  await expect(guestFrame.locator('[data-testid="screen-role"]')).toHaveText('mirror', { timeout: 20_000 });
+  await expect(hostFrame.locator('[data-testid="local-players"]')).toHaveText('Alex');
+  await expect(guestFrame.locator('[data-testid="local-players"]')).toHaveText('Bea');
+
+  // Bea presses JUMP twice: the host simulates, the guest TV shows the broadcast.
+  const jump = bea.locator('[data-control="jump"]');
+  await jump.click();
+  await jump.click();
+  await expect(guestFrame.locator('[data-testid="mirror"]')).toHaveText('inputs:2', { timeout: 10_000 });
+  // The host never receives its own broadcast.
+  await expect(hostFrame.locator('[data-testid="mirror"]')).toHaveText('');
+
+  for (const page of [hostTv, guestTv, alex, bea]) await page.close();
+});
