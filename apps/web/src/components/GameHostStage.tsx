@@ -54,6 +54,11 @@ export interface GameHostStageProps {
   mode: 'live' | 'test';
   /** This TV's screen id (live mode), for host-authoritative games. */
   screenId?: string;
+  /**
+   * The secret this TV's screen id was bound to on its first join. The probe
+   * result only counts with it: it must come from the lobby's host screen.
+   */
+  screenToken?: string;
   /** Lifecycle callback (fires in both modes; the only channel in test mode). */
   onEvent?: (event: GameHostEvent) => void;
 }
@@ -132,7 +137,7 @@ function normalizeScores(raw: unknown): CouchScore[] {
 // ---------------------------------------------------------------------------
 
 export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>(function GameHostStage(
-  { manifest, lobby, socket, mode, screenId, onEvent },
+  { manifest, lobby, socket, mode, screenId, screenToken, onEvent },
   ref
 ) {
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
@@ -154,6 +159,8 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
   const modeRef = useRef(mode);
   const screenIdRef = useRef(screenId);
   screenIdRef.current = screenId;
+  const screenTokenRef = useRef(screenToken);
+  screenTokenRef.current = screenToken;
   const screenKeyRef = useRef('');
   // One run of this screen's broadcasts: receivers restart their seq check
   // when it changes, so a reloaded host isn't ignored until it passes its old
@@ -182,6 +189,8 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
   }, []);
 
   // --- probe-result: fire-and-forget, swallow ALL errors (endpoint may 404). ---
+  // The server counts it only from the lobby's host screen, so it carries this
+  // TV's screen id and token; any other screen's result is simply not counted.
   const sendProbeResult = useCallback((ok: boolean) => {
     if (modeRef.current === 'test') return; // /dev harness reports via onEvent
     if (probedRef.current) return;
@@ -190,7 +199,12 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
       void fetch(`${API_BASE}/games/${manifestRef.current.id}/probe-result`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ slug: lobbyRef.current.slug, ok })
+        body: JSON.stringify({
+          slug: lobbyRef.current.slug,
+          ok,
+          screenId: screenIdRef.current,
+          screenToken: screenTokenRef.current
+        })
       }).catch(() => {
         /* endpoint arrives a later wave; ignore */
       });

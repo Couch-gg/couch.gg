@@ -444,6 +444,7 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
               lobby={lobby}
               socket={socket}
               screenId={screenId}
+              screenToken={readScreenToken(slug, screenId)}
               mode="live"
             />
           ) : lobby?.state === 'playing' ? (
