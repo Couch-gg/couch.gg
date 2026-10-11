@@ -14,7 +14,7 @@
     "test": "pnpm test:unit && pnpm test:e2e",
     "test:unit": "pnpm build:packages && pnpm --filter @couch/trebuchet test && pnpm --filter @couch/game-runtime test && pnpm --filter @couch/game-sdk test && pnpm --filter @couch/realtime test",
     "test:e2e": "pnpm exec playwright test",
-    "typecheck": "pnpm build:packages && pnpm --filter @couch/realtime typecheck && pnpm --filter @couch/web typecheck"
+    "typecheck": "pnpm build:packages && pnpm --filter @couch/realtime typecheck && pnpm --filter @couch/web typecheck && tsc -p api/tsconfig.json"
   },
   "devDependencies": {
     "@playwright/test": "^1.56.1",
