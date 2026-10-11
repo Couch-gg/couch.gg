@@ -498,10 +498,10 @@ From `rate-limit.ts`, `lobbies.ts`, and `GameHostStage.tsx`:
 
 - **Per-player input rate**: token bucket, capacity **40** (burst), refill **20
   tokens/second**. Inputs beyond this from one player are silently dropped
-  (not an error) — the controller stream stays healthy. `release` inputs are
-  exempt and always delivered.
-- **Per-lobby aggregate input rate**: capacity **120** (burst), refill **60
-  tokens/second** across all players.
+  (not an error) — the controller stream stays healthy. The `release` of a
+  control the phone is holding is exempt and always delivered.
+- **Per-lobby aggregate input rate**: capacity **320** (burst), refill **160
+  tokens/second** across all players (the per-player budget times 8 players).
 - **Input `value` size**: the `data` payload is JSON-encoded and capped at
   **1024 bytes**; larger is rejected with a 413. Keep control values tiny (a
   number, a short string).

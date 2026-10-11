@@ -307,6 +307,9 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
 
   io.on('connection', (socket) => {
     let ctx: SocketContext | null = null;
+    // Controls this socket has pressed/moved (relayed) and not yet released,
+    // keyed `${slug}:${playerId}:${control}`. Only these releases skip the limiter.
+    const held = new Set<string>();
 
     socket.on('screen:join', async (payload: { slug?: string }, ack?: (value: unknown) => void) => {
       try {
@@ -405,17 +408,21 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
           // Derive the player from the token for rate-limiting; recordGameInput
           // re-derives and throws 401 if the token is unknown.
           const derivedId = derivePlayerId(store.getLobby(slug), playerToken);
-          // Releases are never rate-limited: a dropped release leaves a button
-          // (or stick) held on the screen and the character keeps running. Each
-          // release follows a press/change that did pass, so this can't flood.
+          // A release of a control this socket holds is never rate-limited: a
+          // dropped release leaves a button (or stick) held on the screen and
+          // the character keeps running. Only the first release after a relayed
+          // press/change is exempt, so releases alone can't flood the relay.
           const isRelease = (controllerEvent.value as { action?: unknown } | undefined)?.action === 'release';
-          if (derivedId && !isRelease && !inputLimiter.allow(slug, derivedId)) {
+          const heldKey = `${slug}:${derivedId}:${String(controllerEvent.control)}`;
+          const exempt = isRelease && held.delete(heldKey);
+          if (derivedId && !exempt && !inputLimiter.allow(slug, derivedId)) {
             // Rate-limited drops are not errors — acking success keeps the
             // controller stream healthy; the input is simply not relayed.
             ack?.({ ok: true, dropped: true });
             return;
           }
           const envelope = store.recordGameInput(slug, playerToken, controllerEvent);
+          if (derivedId && !isRelease) held.add(heldKey);
           ack?.({ ok: true, seq: envelope.seq });
           await saveLobby(slug);
           io.to(room(slug)).emit('game:input', envelope);
