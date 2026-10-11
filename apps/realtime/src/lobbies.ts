@@ -118,8 +118,15 @@ export interface SerializedLobbyRecord {
   inputLog?: GameInputEnvelope[];
   controllerState?: Record<PlayerId, ControllerState>;
   screens?: string[];
-  screenSecrets?: Record<string, string>;
+  // A bare hash: a binding persisted before its bind time was kept.
+  screenSecrets?: Record<string, ScreenSecret | string>;
   screenPresence?: Record<string, ScreenPresence>;
+}
+
+// The hashed secret a screen id is bound to, and when it was bound.
+export interface ScreenSecret {
+  hash: string;
+  at: number;
 }
 
 // The socket a listed screen last joined with, and when that socket dropped
@@ -150,7 +157,7 @@ export interface LobbyRecord {
   controllerState: Record<PlayerId, ControllerState>;
   screens: string[];
   // sha256 of each screen id's secret token (see joinScreen). Never public.
-  screenSecrets: Record<string, string>;
+  screenSecrets: Record<string, ScreenSecret>;
   // Whether each listed screen is still connected, kept in the record so any
   // instance can tell (see markScreenLeft). Never public.
   screenPresence: Record<string, ScreenPresence>;
@@ -630,22 +637,23 @@ export class LobbyStore {
     slug: string,
     screenId: unknown,
     screenToken: unknown,
-    socketId?: string
+    socketId?: string,
+    now = Date.now()
   ): { screenId: string | null; changed: boolean; screenToken?: string } {
     const lobby = this.getLobby(slug);
     const id = cleanScreenId(screenId);
     if (!id) return { screenId: null, changed: false };
     const listed = lobby.screens.includes(id);
     const bound = lobby.screenSecrets[id];
-    if (bound && (typeof screenToken !== 'string' || !sameHash(hashScreenToken(screenToken), bound))) {
+    if (bound && (typeof screenToken !== 'string' || !sameHash(hashScreenToken(screenToken), bound.hash))) {
       throw new LobbyError('Dieser Screen gehört zu einem anderen Gerät', 403);
     }
     if (!listed && lobby.screens.length >= MAX_LOBBY_SCREENS) throw new LobbyError('Diese Lobby hat schon genug Screens', 409);
     let minted: string | undefined;
     if (!bound) {
-      if (Object.keys(lobby.screenSecrets).length >= MAX_SCREEN_SECRETS) throw new LobbyError('Diese Lobby hat schon genug Screens', 409);
+      this.forgetOldScreenSecrets(lobby);
       minted = randomBytes(24).toString('base64url');
-      lobby.screenSecrets[id] = hashScreenToken(minted);
+      lobby.screenSecrets[id] = { hash: hashScreenToken(minted), at: now };
     }
     if (!listed) lobby.screens.push(id);
     let present = false;
@@ -689,6 +697,26 @@ export class LobbyStore {
     lobby.screens = lobby.screens.filter((id) => id !== screenId);
     delete lobby.screenPresence[screenId];
     return true;
+  }
+
+  // Make room for one more screen binding by forgetting the oldest ones of
+  // ids that are neither listed nor a player's seat. Such a TV left long ago;
+  // if it comes back it is simply bound anew. So ids that joined and left
+  // can't lock new TVs out, and a seat id can't be freed up for someone else.
+  private forgetOldScreenSecrets(lobby: LobbyRecord): void {
+    const ids = Object.keys(lobby.screenSecrets);
+    if (ids.length < MAX_SCREEN_SECRETS) return;
+    const kept = new Set<string>(lobby.screens);
+    for (const player of lobby.players.values()) if (player.screenId) kept.add(player.screenId);
+    const stale = ids
+      .filter((id) => !kept.has(id))
+      .sort((a, b) => lobby.screenSecrets[a].at - lobby.screenSecrets[b].at)
+      .slice(0, ids.length - MAX_SCREEN_SECRETS + 1);
+    if (ids.length - stale.length >= MAX_SCREEN_SECRETS) throw new LobbyError('Diese Lobby hat schon genug Screens', 409);
+    for (const id of stale) {
+      delete lobby.screenSecrets[id];
+      delete lobby.screenPresence[id];
+    }
   }
 
   private nextColor(lobby: LobbyRecord): number {
@@ -756,7 +784,7 @@ export function serializeLobbyRecord(lobby: LobbyRecord): SerializedLobbyRecord 
     inputLog: lobby.inputLog.slice(),
     controllerState: structuredClone(lobby.controllerState),
     screens: lobby.screens.slice(),
-    screenSecrets: { ...lobby.screenSecrets },
+    screenSecrets: structuredClone(lobby.screenSecrets),
     screenPresence: structuredClone(lobby.screenPresence)
   };
 }
@@ -794,18 +822,28 @@ export function deserializeLobbyRecord(serialized: SerializedLobbyRecord): Lobby
     inputLog: serialized.inputLog ? serialized.inputLog.slice() : [],
     controllerState: serialized.controllerState ? structuredClone(serialized.controllerState) : {},
     screens: serialized.screens ? serialized.screens.slice() : [],
-    screenSecrets: serialized.screenSecrets ? { ...serialized.screenSecrets } : {},
+    screenSecrets: readScreenSecrets(serialized.screenSecrets),
     screenPresence: serialized.screenPresence ? structuredClone(serialized.screenPresence) : {}
   };
 }
 
 const MAX_LOBBY_SCREENS = 8;
-// Screen ids ever bound in one lobby (screens that left keep their binding).
+// Screen ids bound in one lobby at a time (screens that left keep their
+// binding until room is needed, see forgetOldScreenSecrets).
 const MAX_SCREEN_SECRETS = 32;
 const SCREEN_ID_RE = /^scr_[A-Za-z0-9_-]{1,60}$/;
 
 function cleanScreenId(value: unknown): string | null {
   return typeof value === 'string' && SCREEN_ID_RE.test(value) ? value : null;
+}
+
+// Bindings persisted as a bare hash count as the oldest.
+function readScreenSecrets(raw: SerializedLobbyRecord['screenSecrets']): Record<string, ScreenSecret> {
+  const out: Record<string, ScreenSecret> = {};
+  for (const [id, value] of Object.entries(raw ?? {})) {
+    out[id] = typeof value === 'string' ? { hash: value, at: 0 } : { hash: value.hash, at: value.at };
+  }
+  return out;
 }
 
 function hashScreenToken(token: string): string {

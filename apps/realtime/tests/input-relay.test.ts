@@ -589,7 +589,7 @@ describe('screens and the host screen (host-authoritative mode)', () => {
     expect(Object.values(record.screenSecrets)).not.toContain(first.screenToken);
     const restored = deserializeLobbyRecord(serializeLobbyRecord(record));
     expect(restored.screenSecrets).toEqual(record.screenSecrets);
-    expect(JSON.stringify(store.publicLobby(slug))).not.toContain(record.screenSecrets.scr_tv);
+    expect(JSON.stringify(store.publicLobby(slug))).not.toContain(record.screenSecrets.scr_tv.hash);
   });
 
   it('refuses a new screen once the lobby is full instead of evicting one', () => {
@@ -674,5 +674,56 @@ describe('screens and the host screen (host-authoritative mode)', () => {
     expect(() => store.joinScreen(slug, 'scr_a', undefined, 'sock-x')).toThrow(/anderen Gerät/);
     expect(store.joinScreen(slug, 'scr_a', a.screenToken, 'sock-a2').changed).toBe(true);
     expect(store.publicLobby(slug).hostScreenId).toBe('scr_a');
+  });
+
+  it('forgets the oldest bindings of screens that left, so throwaway ids cannot lock new TVs out', () => {
+    const store = new LobbyStore(makeResolver(TAP_RACE));
+    const { slug } = store.createLobby(Date.now(), 'remote');
+    const tv = store.joinScreen(slug, 'scr_tv', undefined, 'sock-tv', 1);
+    // Alex sat at a TV that left: its id is still his seat.
+    const seat = store.joinScreen(slug, 'scr_seat', undefined, 'sock-seat', 2);
+    store.joinPlayer(slug, 'Alex', undefined, 'scr_seat');
+    store.removeScreen(slug, 'scr_seat');
+
+    // 40 throwaway ids join and leave (one after another, newest last).
+    for (let i = 0; i < 40; i++) {
+      store.joinScreen(slug, `scr_junk${i}`, undefined, `sock-junk${i}`, 10 + i);
+      store.removeScreen(slug, `scr_junk${i}`);
+    }
+    const fresh = store.joinScreen(slug, 'scr_new', undefined, 'sock-new', 100);
+    expect(typeof fresh.screenToken).toBe('string');
+    const secrets = store.getLobby(slug).screenSecrets;
+    expect(Object.keys(secrets).length).toBeLessThanOrEqual(32);
+    expect(secrets.scr_junk0).toBeUndefined();
+    expect(secrets.scr_junk39).toBeDefined();
+    expect(store.getLobby(slug).screens).toEqual(['scr_tv', 'scr_new']);
+
+    // Listed screens and seats keep their binding.
+    expect(() => store.joinScreen(slug, 'scr_tv', undefined)).toThrow(/anderen Gerät/);
+    expect(() => store.joinScreen(slug, 'scr_seat', undefined)).toThrow(/anderen Gerät/);
+    expect(store.joinScreen(slug, 'scr_tv', tv.screenToken).screenId).toBe('scr_tv');
+    expect(store.joinScreen(slug, 'scr_seat', seat.screenToken).screenId).toBe('scr_seat');
+
+    // A forgotten TV that comes back is simply bound anew.
+    const back = store.joinScreen(slug, 'scr_junk0', 'its-old-token', 'sock-back');
+    expect(typeof back.screenToken).toBe('string');
+  });
+
+  it('reads screen bindings stored as a bare hash (before bind times were kept)', () => {
+    const store = new LobbyStore(makeResolver(TAP_RACE));
+    const { slug } = store.createLobby(Date.now(), 'remote');
+    const tv = store.joinScreen(slug, 'scr_tv', undefined);
+    const serialized = serializeLobbyRecord(store.getLobby(slug));
+    const legacy = {
+      ...serialized,
+      screenSecrets: { scr_tv: (serialized.screenSecrets!.scr_tv as { hash: string }).hash },
+      screenPresence: undefined
+    };
+    const restored = deserializeLobbyRecord(legacy);
+    expect(restored.screenSecrets.scr_tv).toEqual({ hash: legacy.screenSecrets.scr_tv, at: 0 });
+    expect(restored.screenPresence).toEqual({});
+    store.lobbies.set(slug, restored);
+    expect(store.joinScreen(slug, 'scr_tv', tv.screenToken).screenId).toBe('scr_tv');
+    expect(() => store.joinScreen(slug, 'scr_tv', 'wrong')).toThrow(/anderen Gerät/);
   });
 });
