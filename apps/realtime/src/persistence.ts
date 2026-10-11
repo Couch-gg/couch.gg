@@ -72,7 +72,6 @@ const disabledPersistence: LobbyPersistence = {
 
 class RedisLobbyPersistence implements LobbyPersistence {
   enabled = true;
-  private clientPromise: Promise<RedisClientType> | null = null;
 
   constructor(private readonly redisUrl: string) {}
 
@@ -150,15 +149,8 @@ class RedisLobbyPersistence implements LobbyPersistence {
     await client.del(screenKey(id));
   }
 
-  private async client(): Promise<RedisClientType> {
-    if (!this.clientPromise) {
-      const client = createClient({ url: this.redisUrl });
-      client.on('error', (err: unknown) => {
-        console.error('Redis lobby persistence error', err);
-      });
-      this.clientPromise = client.connect() as Promise<RedisClientType>;
-    }
-    return this.clientPromise;
+  private client(): Promise<RedisClientType> {
+    return commandClient(this.redisUrl);
   }
 }
 
@@ -337,7 +329,6 @@ class InMemoryGamePersistence implements GamePersistence {
 
 class RedisGamePersistence implements GamePersistence {
   enabled = true;
-  private clientPromise: Promise<RedisClientType> | null = null;
 
   constructor(private readonly redisUrl: string) {}
 
@@ -383,16 +374,28 @@ class RedisGamePersistence implements GamePersistence {
     return out;
   }
 
-  private async client(): Promise<RedisClientType> {
-    if (!this.clientPromise) {
-      const client = createClient({ url: this.redisUrl });
-      client.on('error', (err: unknown) => {
-        console.error('Redis games persistence error', err);
-      });
-      this.clientPromise = client.connect() as Promise<RedisClientType>;
-    }
-    return this.clientPromise;
+  private client(): Promise<RedisClientType> {
+    return commandClient(this.redisUrl);
   }
+}
+
+// One command connection per Redis URL for the whole process, shared by lobby
+// and games persistence. Connections count against the Redis plan's cap on every
+// serverless instance, and both only send single commands and EVAL (nothing that
+// blocks or changes connection state), so they can share one.
+const commandClients = new Map<string, Promise<RedisClientType>>();
+
+function commandClient(redisUrl: string): Promise<RedisClientType> {
+  let pending = commandClients.get(redisUrl);
+  if (!pending) {
+    const client = createClient({ url: redisUrl });
+    client.on('error', (err: unknown) => {
+      console.error('Redis persistence error', err);
+    });
+    pending = client.connect() as Promise<RedisClientType>;
+    commandClients.set(redisUrl, pending);
+  }
+  return pending;
 }
 
 function clone<T>(value: T): T {

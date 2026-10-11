@@ -11,7 +11,8 @@ const redisUrl = process.env.TEST_REDIS_URL;
 
 describe.skipIf(!redisUrl)('Redis input log (appendNextInput)', () => {
   const raw = createClient({ url: redisUrl });
-  // Two persistence objects = two connections, like two serverless instances.
+  // Two persistence objects, like two serverless instances. In one process they
+  // share a connection; the concurrent appends still race at the request level.
   let instanceA: LobbyPersistence;
   let instanceB: LobbyPersistence;
 
