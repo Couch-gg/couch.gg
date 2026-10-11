@@ -13,6 +13,7 @@ import { RateLimiter } from './rate-limit.js';
 import { createProductionGamePersistence, createProductionLobbyPersistence } from './persistence.js';
 import { GamesRegistry, RegistryError, adminGameView, publicGame } from './games-registry.js';
 import { ScreenRegistry } from './screens.js';
+import { attachFanout, type Fanout } from './fanout.js';
 
 // Per-key token bucket for report throttling: capacity 5, refill 5 tokens/hour.
 // Same shape as RateLimiter but with report-specific constants; kept local so
@@ -70,6 +71,7 @@ export interface RealtimeServerInstance {
   io: Server;
   server: http.Server;
   store: LobbyStore;
+  fanout: Fanout;
 }
 
 export function createRealtimeServer(options: RealtimeServerOptions = {}): RealtimeServerInstance {
@@ -115,11 +117,11 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   app.use(express.json());
 
   app.get('/health', (_req, res) => {
-    res.json({ ok: true, lobbies: store.lobbies.size });
+    res.json({ ok: true, lobbies: store.lobbies.size, fanout: fanout.mode() });
   });
 
   app.get(`${apiPrefix}/health`, (_req, res) => {
-    res.json({ ok: true, lobbies: store.lobbies.size });
+    res.json({ ok: true, lobbies: store.lobbies.size, fanout: fanout.mode() });
   });
 
   app.get(`${apiPrefix}/games`, async (_req, res) => {
@@ -304,9 +306,16 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   };
   if (options.websocketOnly) socketOptions.transports = ['websocket'];
   const io = new Server(server, socketOptions);
+  const fanout = attachFanout(io);
 
   io.on('connection', (socket) => {
     let ctx: SocketContext | null = null;
+
+    // Clock probe for measured latency: the screen times the round trip and uses
+    // serverNow to put the server's input timestamps on its own clock.
+    socket.on('latency:ping', (_payload: unknown, ack?: (value: unknown) => void) => {
+      ack?.({ ok: true, serverNow: Date.now() });
+    });
 
     socket.on('screen:join', async (payload: { slug?: string }, ack?: (value: unknown) => void) => {
       try {
@@ -381,7 +390,7 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
           await dispatchGameEvent(slug, event);
           armTurnTimer(slug);
         } else {
-          await saveLobby(slug);
+          await saveStartedExternalGame(slug);
           emitLobby(slug);
         }
       } catch (err) {
@@ -411,9 +420,17 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
             ack?.({ ok: true, dropped: true });
             return;
           }
-          const envelope = store.recordGameInput(slug, playerToken, controllerEvent);
+          // Validate first, then take the seq: from Redis INCR when available so
+          // two instances can't stamp the same seq, else the lobby's counter.
+          const prepared = store.prepareGameInput(slug, playerToken, controllerEvent);
+          const seq = persistence.nextInputSeq ? await persistence.nextInputSeq(slug) : undefined;
+          const envelope = store.commitGameInput(slug, prepared, seq);
           ack?.({ ok: true, seq: envelope.seq });
-          await saveLobby(slug);
+          if (persistence.appendInput) {
+            await persistence.appendInput(slug, envelope, store.getLobby(slug).expiresAt);
+          } else {
+            await saveLobby(slug);
+          }
           io.to(room(slug)).emit('game:input', envelope);
           return;
         }
@@ -649,7 +666,7 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
         await dispatchGameEvent(slug, event);
         armTurnTimer(slug);
       } else {
-        await saveLobby(slug);
+        await saveStartedExternalGame(slug);
         emitLobby(slug);
       }
     } catch {
@@ -697,6 +714,14 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
     await persistence.save(lobby);
   }
 
+  // A new external game starts its seq stream at 1, so the shared counter and
+  // list from the previous round go before the fresh lobby is saved.
+  async function saveStartedExternalGame(slug: string): Promise<void> {
+    if (!persistence.enabled) return;
+    await persistence.resetInputs?.(slug);
+    await saveLobby(slug);
+  }
+
   async function deleteLobby(slug: string): Promise<void> {
     if (!persistence.enabled) return;
     await persistence.delete(slug);
@@ -715,7 +740,7 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
     if (rec) await persistence.saveScreen(rec);
   }
 
-  return { app, io, server, store };
+  return { app, io, server, store, fanout };
 }
 
 export function startRealtimeServer(options: RealtimeServerOptions = {}): http.Server {

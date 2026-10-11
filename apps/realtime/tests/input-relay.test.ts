@@ -121,6 +121,24 @@ describe('external startGame', () => {
   });
 });
 
+describe('commitGameInput (externally allocated seq)', () => {
+  it('keeps the log sorted when seqs from other instances land out of order', () => {
+    const { store, slug, tokens } = startedExternal();
+    const first = store.prepareGameInput(slug, tokens[0].token, tapEvent());
+    const second = store.prepareGameInput(slug, tokens[1].token, tapEvent());
+    store.commitGameInput(slug, second, 2);
+    store.commitGameInput(slug, first, 1);
+    expect(store.getLobby(slug).inputLog.map((e) => e.seq)).toEqual([1, 2]);
+    expect(store.getLobby(slug).inputSeq).toBe(2);
+  });
+
+  it('rejects before a seq is taken', () => {
+    const { store, slug, tokens } = startedExternal();
+    expect(() => store.prepareGameInput(slug, tokens[0].token, tapEvent('bogus' as never))).toThrow(/Aktion/);
+    expect(store.getLobby(slug).inputSeq).toBe(0);
+  });
+});
+
 describe('recordGameInput', () => {
   it('stamps monotonically increasing seq starting at 1', () => {
     const { store, slug, tokens } = startedExternal();

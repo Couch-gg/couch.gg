@@ -1,6 +1,8 @@
 import { PollingQueueClient } from '@vercel/queue';
 import { createClient, type RedisClientType } from 'redis';
+import type { GameInputEnvelope } from '@couch/types';
 import {
+  INPUT_LOG_LIMIT,
   deserializeLobbyRecord,
   serializeLobbyRecord,
   type LobbyRecord,
@@ -28,6 +30,13 @@ export interface LobbyPersistence {
   loadScreen(id: string): Promise<ScreenRecord | null>;
   saveScreen(record: ScreenRecord): Promise<void>;
   deleteScreen(id: string): Promise<void>;
+  // Optional atomic input log (Redis only). Inputs for the same lobby can hit
+  // different serverless instances at the same moment; a load-modify-save of the
+  // lobby blob would hand both the same seq and one would overwrite the other.
+  // With these, the seq is an INCR and the log is a list the blob never touches.
+  nextInputSeq?(slug: string): Promise<number>;
+  appendInput?(slug: string, envelope: GameInputEnvelope, expiresAt: number): Promise<void>;
+  resetInputs?(slug: string): Promise<void>;
 }
 
 // A claimed screen lives until claimedAt + grace; an unclaimed one until expiresAt.
@@ -68,14 +77,46 @@ class RedisLobbyPersistence implements LobbyPersistence {
 
   async load(slug: string): Promise<LobbyRecord | null> {
     const client = await this.client();
-    const raw = await client.get(key(slug));
+    const [raw, rawInputs, rawSeq] = await Promise.all([
+      client.get(key(slug)),
+      client.lRange(inputsKey(slug), -INPUT_LOG_LIMIT, -1),
+      client.get(inputSeqKey(slug))
+    ]);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as SerializedLobbyRecord;
     if (parsed.expiresAt <= Date.now()) {
       await this.delete(slug);
       return null;
     }
-    return deserializeLobbyRecord(parsed);
+    const lobby = deserializeLobbyRecord(parsed);
+    // The input list is the authority for the running game. An empty list with no
+    // counter means no input has gone through it yet, so the blob's log stands.
+    if (rawInputs.length || rawSeq) {
+      lobby.inputLog = rawInputs.map((entry) => JSON.parse(entry) as GameInputEnvelope).sort((a, b) => a.seq - b.seq);
+      lobby.inputSeq = Math.max(Number(rawSeq ?? 0), lobby.inputLog.at(-1)?.seq ?? 0);
+    }
+    return lobby;
+  }
+
+  async nextInputSeq(slug: string): Promise<number> {
+    const client = await this.client();
+    return client.incr(inputSeqKey(slug));
+  }
+
+  async appendInput(slug: string, envelope: GameInputEnvelope, expiresAt: number): Promise<void> {
+    const client = await this.client();
+    await client
+      .multi()
+      .rPush(inputsKey(slug), JSON.stringify(envelope))
+      .lTrim(inputsKey(slug), -INPUT_LOG_LIMIT, -1)
+      .pExpireAt(inputsKey(slug), expiresAt)
+      .pExpireAt(inputSeqKey(slug), expiresAt)
+      .exec();
+  }
+
+  async resetInputs(slug: string): Promise<void> {
+    const client = await this.client();
+    await client.del([inputsKey(slug), inputSeqKey(slug)]);
   }
 
   async save(lobby: LobbyRecord): Promise<void> {
@@ -87,7 +128,7 @@ class RedisLobbyPersistence implements LobbyPersistence {
 
   async delete(slug: string): Promise<void> {
     const client = await this.client();
-    await client.del(key(slug));
+    await client.del([key(slug), inputsKey(slug), inputSeqKey(slug)]);
   }
 
   async loadScreen(id: string): Promise<ScreenRecord | null> {
@@ -371,6 +412,14 @@ const GAMES_INDEX_KEY = 'couch:games:index';
 
 function key(slug: string): string {
   return `couch:lobby:${slug.toUpperCase()}`;
+}
+
+function inputsKey(slug: string): string {
+  return `couch:lobby:${slug.toUpperCase()}:inputs`;
+}
+
+function inputSeqKey(slug: string): string {
+  return `couch:lobby:${slug.toUpperCase()}:inputseq`;
 }
 
 function screenKey(id: string): string {

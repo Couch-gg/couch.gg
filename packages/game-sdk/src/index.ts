@@ -17,6 +17,7 @@ import {
   PROTOCOL_VERSION,
   isHostMessage,
   type CouchInputEnvelope,
+  type CouchLatency,
   type CouchLatencyTier,
   type CouchManifest,
   type CouchMessage,
@@ -45,7 +46,8 @@ export type CouchEventName =
   | 'playersChanged'
   | 'pause'
   | 'resume'
-  | 'abort';
+  | 'abort'
+  | 'latency';
 
 /** Payload shape per event. */
 export interface CouchEventMap {
@@ -54,6 +56,7 @@ export interface CouchEventMap {
   pause: { reason: string };
   resume: void;
   abort: { reason: string };
+  latency: CouchLatency;
 }
 
 /** Options passed to `CouchSDK.init`. */
@@ -78,8 +81,10 @@ export interface CouchGame {
   readonly seed: string;
   /** 'live' | 'dev' | 'test'. */
   readonly mode: CouchMode;
-  /** 'local' | 'remote'. */
+  /** 'local' | 'remote': the lobby's mode, fixed at init. */
   readonly latencyTier: CouchLatencyTier;
+  /** Latest measured latency from the host screen, or null before the first measurement. */
+  readonly latency: CouchLatency | null;
   /** BCP-47 locale hint. */
   readonly locale: string;
   /** Whether the player prefers reduced motion. */
@@ -113,6 +118,7 @@ class CouchCore {
   seed = '';
   mode: CouchMode = 'live';
   latencyTier: CouchLatencyTier = 'local';
+  latency: CouchLatency | null = null;
   locale = 'en';
   reducedMotion = false;
   manifest: CouchManifest;
@@ -123,7 +129,8 @@ class CouchCore {
     playersChanged: new Set(),
     pause: new Set(),
     resume: new Set(),
-    abort: new Set()
+    abort: new Set(),
+    latency: new Set()
   };
 
   private gameOverSent = false;
@@ -192,6 +199,11 @@ class CouchCore {
     this.emit('abort', { reason });
   }
 
+  setLatency(latency: CouchLatency): void {
+    this.latency = latency;
+    this.emit('latency', latency);
+  }
+
   gameOver(scores: CouchScoreInput): void {
     if (this.gameOverSent) {
       // eslint-disable-next-line no-console
@@ -229,6 +241,9 @@ function makeHandle(core: CouchCore): CouchGame {
     },
     get latencyTier() {
       return core.latencyTier;
+    },
+    get latency() {
+      return core.latency;
     },
     get locale() {
       return core.locale;
@@ -345,6 +360,9 @@ function initEmbedded(opts: CouchInitOptions): Promise<CouchGame> {
           break;
         case 'couch:abort':
           core.abort(msg.reason);
+          break;
+        case 'couch:latency':
+          core.setLatency(msg.latency);
           break;
         default:
           // Exhaustiveness guard.

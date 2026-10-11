@@ -180,6 +180,7 @@ interface CouchGame {
   readonly seed: string;             // deterministic per-session seed — derive ALL randomness from it
   readonly mode: 'live' | 'dev' | 'test';
   readonly latencyTier: 'local' | 'remote';
+  readonly latency: CouchLatency | null; // measured by the host screen; null until the first sample
   readonly locale: string;           // BCP-47 hint, e.g. 'en-US'
   readonly reducedMotion: boolean;   // true if the player prefers reduced motion — honour it
   readonly manifest: CouchManifest;  // the manifest the host echoed back (may be enriched)
@@ -197,6 +198,8 @@ interface CouchGame {
   - `'dev'` — running standalone (you opened the file at top level); the built-in
     simulator is active.
 - `latencyTier` — see section 6. Treat `'remote'` as a design constraint.
+- `latency` — what the host screen actually measures, refreshed at most every 2 s
+  (also delivered as the `latency` event). See section 6.
 - `lastSeq` — the highest `seq` your game has received. Useful for reconnection /
   replay checks. `-1` means no input yet.
 
@@ -211,6 +214,7 @@ interface CouchGame {
 | `pause`          | `{ reason: string }`           | Host tab hidden (`reason: 'host-hidden'`). |
 | `resume`         | `void`                         | Host tab visible again. |
 | `abort`          | `{ reason: string }`           | Session torn down (`reason: 'host-unmounted'`). |
+| `latency`        | `CouchLatency`                 | New measurement from the host screen (section 6). |
 
 ```ts
 const off = couch.on('input', (e) => { /* ... */ });
@@ -311,15 +315,31 @@ production.
 
 `couch.latencyTier` tells you how the lobby is wired:
 
-| Tier      | How inputs travel | Typical latency | Design implication |
-|-----------|-------------------|-----------------|--------------------|
-| `local`   | Same server instance, socket broadcast | ~50 ms | Real-time reflexes are fine. |
-| `remote`  | Persisted input log + client poll across serverless instances | up to ~750 ms + RTT | **No twitch gameplay.** Turn-based / discrete only. |
+| Tier      | Screens | Design implication |
+|-----------|---------|--------------------|
+| `local`   | One big screen, phones in the same room | Real-time reflexes are fine. |
+| `remote`  | Several screens in different places | **No twitch gameplay.** Turn-based / discrete only. |
 
-Remote couches exist because the production deployment (Vercel serverless) has no
-cross-instance socket adapter — inputs are written to a persisted, ordered log and
-other instances **poll** for them. That poll window is why remote latency is high
-and variable.
+`latencyTier` is the lobby's mode and never changes during a game. What the link
+actually delivers is measured by the host screen and handed to you as
+`couch.latency` and the `latency` event:
+
+```ts
+interface CouchLatency {
+  rttMs: number;                 // screen <-> server round trip
+  deliveryMs: number | null;     // median server -> screen delay of the last 20 inputs
+  transport: 'socket' | 'poll';  // how most recent inputs arrived
+  measuredTier: 'local' | 'remote'; // 'local' = socket and deliveryMs < 100
+}
+couch.on('latency', (l) => { if (l.measuredTier === 'remote') showLagHint(); });
+```
+
+Inputs are pushed to every screen over a socket. In production the server runs
+on several serverless instances and shares pushes between them over Redis
+pub/sub, so a phone and a TV on different instances still get socket delivery.
+Every input is also written to an ordered log that screens poll every 750 ms;
+that poll is the fallback when a push is lost, and `transport: 'poll'` tells you
+you are running on it.
 
 ### The `supportsRemote: true` contract
 

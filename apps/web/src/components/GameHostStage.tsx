@@ -5,11 +5,13 @@ import type {
   CouchGameToHostMessage,
   CouchHostToGameMessage,
   CouchInitMessage,
+  CouchLatency,
   CouchManifest,
   CouchPlayer,
   CouchScore
 } from '@couch/game-sdk';
 import { emitAck } from '../socket.js';
+import type { InputSource } from '../hooks/useExternalGameInputs.js';
 
 // ---------------------------------------------------------------------------
 // Public prop surface
@@ -31,7 +33,7 @@ export interface GameHostEvent {
  */
 export interface GameHostStageHandle {
   /** Forward one already-ordered input envelope into the iframe. */
-  forwardInput: (envelope: GameInputEnvelope) => void;
+  forwardInput: (envelope: GameInputEnvelope, source?: InputSource) => void;
 }
 
 export interface GameHostStageProps {
@@ -60,6 +62,14 @@ export interface GameHostStageProps {
 
 /** How long to wait for `couch:ready` before showing the "didn't respond" overlay. */
 const READY_TIMEOUT_MS = 15_000;
+/** How often the screen times a round trip to the server. */
+const LATENCY_PING_MS = 5_000;
+/** How often a changed latency measurement is pushed to the game. */
+const LATENCY_REPORT_MS = 2_000;
+/** Inputs kept for the delivery median / transport share. */
+const LATENCY_WINDOW = 20;
+/** Delivery median under this (with socket transport) counts as a local couch. */
+const LOCAL_DELIVERY_MS = 100;
 /** Max serialized inbound message size we accept (bytes-ish, via string length). */
 const MAX_INBOUND_BYTES = 8_192;
 /** Inbound rate cap: drop messages beyond this many per rolling second. */
@@ -96,6 +106,12 @@ function toCouchPlayer(player: Player): CouchPlayer {
 /** aspectRatio '16:9' | '4:3' -> numeric ratio for letterboxing math. */
 function ratioValue(aspectRatio: ExternalGameManifest['aspectRatio']): number {
   return aspectRatio === '4:3' ? 4 / 3 : 16 / 9;
+}
+
+function median(values: number[]): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
 /** Normalize whatever the game reported as scores into CouchScore[]. */
@@ -357,11 +373,70 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
     };
   }, [post]);
 
+  // --- Measured latency: clock probe + delivery samples -> couch:latency. ---
+  // The ping keeps the lowest-RTT sample of the recent window: its offset (server
+  // clock minus screen clock) is the least distorted by queueing.
+  const clockRef = useRef<{ rtt: number; offset: number; at: number } | null>(null);
+  const deliveriesRef = useRef<Array<{ ms: number; source: InputSource }>>([]);
+  const lastLatencyRef = useRef<string>('');
+  useEffect(() => {
+    if (mode !== 'live' || !socket) return;
+    let active = true;
+    const ping = () => {
+      const sent = Date.now();
+      void emitAck<{ ok: true; serverNow: number }>(socket, 'latency:ping', {})
+        .then(({ serverNow }) => {
+          if (!active) return;
+          const now = Date.now();
+          const rtt = now - sent;
+          const offset = serverNow - (sent + rtt / 2);
+          const prev = clockRef.current;
+          if (!prev || rtt <= prev.rtt || now - prev.at > LATENCY_PING_MS * 6) {
+            clockRef.current = { rtt, offset, at: now };
+          }
+        })
+        .catch(() => {
+          /* the next ping retries */
+        });
+    };
+    ping();
+    const pingTimer = window.setInterval(ping, LATENCY_PING_MS);
+    const reportTimer = window.setInterval(() => {
+      const clock = clockRef.current;
+      if (!clock || !readyRef.current) return;
+      const samples = deliveriesRef.current;
+      const viaSocket = samples.filter((sample) => sample.source === 'socket').length;
+      const transport = samples.length === 0 || viaSocket * 2 >= samples.length ? 'socket' : 'poll';
+      const deliveryMs = samples.length ? Math.round(median(samples.map((sample) => sample.ms))) : null;
+      const latency: CouchLatency = {
+        rttMs: Math.round(clock.rtt),
+        deliveryMs,
+        transport,
+        measuredTier: transport === 'socket' && (deliveryMs ?? clock.rtt / 2) < LOCAL_DELIVERY_MS ? 'local' : 'remote'
+      };
+      const key = JSON.stringify(latency);
+      if (key === lastLatencyRef.current) return;
+      lastLatencyRef.current = key;
+      post({ v: 1, type: 'couch:latency', latency });
+    }, LATENCY_REPORT_MS);
+    return () => {
+      active = false;
+      window.clearInterval(pingTimer);
+      window.clearInterval(reportTimer);
+    };
+  }, [mode, socket, post]);
+
   // --- Imperative input forwarding, called by the parent hook via ref. ---
   // The SDK expects `at` as a ms NUMBER, so convert the envelope's ISO string
   // via Date.parse before posting the couch:input message.
   const forwardInput = useCallback(
-    (envelope: GameInputEnvelope) => {
+    (envelope: GameInputEnvelope, source: InputSource = 'socket') => {
+      const clock = clockRef.current;
+      if (clock) {
+        const samples = deliveriesRef.current;
+        samples.push({ ms: Math.max(0, Date.now() + clock.offset - Date.parse(envelope.at)), source });
+        if (samples.length > LATENCY_WINDOW) samples.shift();
+      }
       post({
         v: 1,
         type: 'couch:input',

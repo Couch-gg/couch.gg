@@ -6,9 +6,9 @@ import type { GameInputEnvelope, Lobby } from '@couch/types';
  * Strict-ordered input forwarding for external (iframe-hosted) games.
  *
  * Two sources feed the same monotonic `seq` stream:
- *   (a) socket `'game:input'` events — instant, same-instance, but can arrive
- *       out of order or be dropped entirely (cross-instance, Vercel has no
- *       Socket.IO adapter).
+ *   (a) socket `'game:input'` events — instant. With the Redis adapter they
+ *       reach every instance; without it (local dev, no REDIS_URL) only
+ *       sockets on the emitting instance. Can arrive out of order.
  *   (b) `lobby.inputLog` from each poll snapshot — the AUTHORITY. Persisted
  *       server-side (last 64 envelopes in the public view), so any socket gap
  *       that never fills is resolved on the next 750ms poll.
@@ -31,7 +31,16 @@ import type { GameInputEnvelope, Lobby } from '@couch/types';
  * is not a realistic path for a freshly-started session but is handled for
  * robustness. The buffer is reset whenever the game session restarts so a new
  * round always begins its own seq stream from scratch.
+ *
+ * GAP SKIP: seqs are allocated before they are written, so an instance that dies
+ * between the two leaves a hole that never fills. When the authoritative log
+ * already holds later inputs but still not the missing seq for GAP_SKIP_MS, we
+ * give up on it and deliver from the next available seq instead of stalling.
  */
+
+export type InputSource = 'socket' | 'poll';
+
+const GAP_SKIP_MS = 1_500;
 
 export interface UseExternalGameInputsOptions {
   /** The lobby socket (may be null before it connects). */
@@ -39,7 +48,7 @@ export interface UseExternalGameInputsOptions {
   /** Latest lobby snapshot (its `inputLog` is the authority + poll fallback). */
   lobby: Lobby | null;
   /** Called once per input, strictly in ascending `seq` order, exactly once. */
-  onInput: (input: GameInputEnvelope) => void;
+  onInput: (input: GameInputEnvelope, source: InputSource) => void;
 }
 
 /**
@@ -55,7 +64,9 @@ function sessionKey(lobby: Lobby | null): string {
 export function useExternalGameInputs({ socket, lobby, onInput }: UseExternalGameInputsOptions): void {
   const lastForwardedSeqRef = useRef(0);
   // Out-of-order socket arrivals held until the sequence fills in.
-  const pendingRef = useRef<Map<number, GameInputEnvelope>>(new Map());
+  const pendingRef = useRef<Map<number, { input: GameInputEnvelope; source: InputSource }>>(new Map());
+  // The missing seq we are waiting on, and since when the log has shown it lost.
+  const gapRef = useRef<{ seq: number; since: number } | null>(null);
   const sessionKeyRef = useRef<string>(sessionKey(lobby));
   // Keep the latest onInput without re-subscribing the socket listener.
   const onInputRef = useRef(onInput);
@@ -66,6 +77,7 @@ export function useExternalGameInputs({ socket, lobby, onInput }: UseExternalGam
   const resetCursor = useCallback(() => {
     lastForwardedSeqRef.current = 0;
     pendingRef.current.clear();
+    gapRef.current = null;
   }, []);
 
   /**
@@ -76,9 +88,9 @@ export function useExternalGameInputs({ socket, lobby, onInput }: UseExternalGam
     const pending = pendingRef.current;
     let next = pending.get(lastForwardedSeqRef.current + 1);
     while (next) {
-      pending.delete(next.seq);
-      lastForwardedSeqRef.current = next.seq;
-      onInputRef.current(next);
+      pending.delete(next.input.seq);
+      lastForwardedSeqRef.current = next.input.seq;
+      onInputRef.current(next.input, next.source);
       next = pending.get(lastForwardedSeqRef.current + 1);
     }
   }, []);
@@ -89,7 +101,7 @@ export function useExternalGameInputs({ socket, lobby, onInput }: UseExternalGam
       if (typeof input?.seq !== 'number') return;
       // Already forwarded (duplicate from socket + log, or a late replay).
       if (input.seq <= lastForwardedSeqRef.current) return;
-      pendingRef.current.set(input.seq, input);
+      pendingRef.current.set(input.seq, { input, source: 'socket' });
       drainPending();
     },
     [drainPending]
@@ -122,7 +134,7 @@ export function useExternalGameInputs({ socket, lobby, onInput }: UseExternalGam
     for (const envelope of log) {
       if (typeof envelope?.seq !== 'number') continue;
       if (envelope.seq <= lastForwardedSeqRef.current) continue;
-      pendingRef.current.set(envelope.seq, envelope);
+      if (!pendingRef.current.has(envelope.seq)) pendingRef.current.set(envelope.seq, { input: envelope, source: 'poll' });
     }
 
     // FIRST-DELIVERY / TRIM fast-forward: if we've forwarded nothing yet and the
@@ -140,6 +152,22 @@ export function useExternalGameInputs({ socket, lobby, onInput }: UseExternalGam
     }
 
     drainPending();
+
+    // GAP SKIP (see module doc): the log is past the hole and still lacks it.
+    const missing = lastForwardedSeqRef.current + 1;
+    const logHasLater = log.some((envelope) => envelope.seq > missing);
+    if (pendingRef.current.size > 0 && logHasLater) {
+      const now = Date.now();
+      if (gapRef.current?.seq !== missing) {
+        gapRef.current = { seq: missing, since: now };
+      } else if (now - gapRef.current.since >= GAP_SKIP_MS) {
+        lastForwardedSeqRef.current = Math.min(...pendingRef.current.keys()) - 1;
+        gapRef.current = null;
+        drainPending();
+      }
+    } else {
+      gapRef.current = null;
+    }
     // Depend on the newest seq (and length) so identical repeated snapshots
     // don't re-run needlessly, but every genuinely-new input triggers a scan.
   }, [lobby?.inputLog, drainPending]);

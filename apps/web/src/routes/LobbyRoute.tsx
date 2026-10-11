@@ -155,8 +155,8 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
   // Strict seq-ordered relay: socket 'game:input' + polled inputLog -> iframe.
   // Always mounted (hooks can't be conditional); it no-ops until an external
   // game is playing and the ref is attached.
-  const forwardInput = useCallback((input: Parameters<GameHostStageHandle['forwardInput']>[0]) => {
-    gameHostRef.current?.forwardInput(input);
+  const forwardInput = useCallback((...args: Parameters<GameHostStageHandle['forwardInput']>) => {
+    gameHostRef.current?.forwardInput(...args);
   }, []);
   useExternalGameInputs({ socket, lobby, onInput: forwardInput });
 
