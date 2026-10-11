@@ -50,7 +50,9 @@ export function App() {
     return { kind: 'home' };
   }, [path]);
 
-  if (route.kind === 'lobby') return <LobbyRoute slug={route.slug!} navigate={navigate} />;
+  // Keyed by room: another room (Neue Lobby, history navigation) starts from
+  // a clean screen, not from the last room's seqs and events.
+  if (route.kind === 'lobby') return <LobbyRoute key={route.slug} slug={route.slug!} navigate={navigate} />;
   if (route.kind === 'controller') return <ControllerRoute slug={route.slug!} navigate={navigate} />;
   if (route.kind === 'trebuchet') return <TrebuchetStandaloneRoute navigate={navigate} />;
   if (route.kind === 'pair') return <PairRoute screenId={route.screenId!} navigate={navigate} />;

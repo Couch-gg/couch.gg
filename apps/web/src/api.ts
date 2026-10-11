@@ -29,7 +29,8 @@ export async function createLobby(mode?: 'local' | 'remote'): Promise<Lobby> {
 
 export async function fetchLobby(slug: string): Promise<Lobby> {
   const response = await fetch(`${REALTIME_URL}${REALTIME_API_PREFIX}/lobbies/${slug}`);
-  if (!response.ok) throw new Error('Lobby nicht gefunden');
+  // Keep the status: only 404/410 mean the lobby is gone.
+  if (!response.ok) throw Object.assign(new Error('Lobby nicht gefunden'), { status: response.status });
   const body = (await response.json()) as { lobby: Lobby };
   return body.lobby;
 }

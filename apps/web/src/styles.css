@@ -505,6 +505,12 @@ button:disabled {
   padding: 16px;
 }
 
+/* A running game the TV can't show yet (its catalog entry is still loading). */
+.stage-pending {
+  display: grid;
+  place-items: center;
+}
+
 .surface-topline {
   display: flex;
   justify-content: space-between;
