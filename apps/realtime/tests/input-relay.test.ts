@@ -366,18 +366,32 @@ describe('RateLimiter', () => {
     expect(allowed).toBe(40);
   });
 
-  it('enforces the per-slug aggregate capacity of 120 across players', () => {
+  it('enforces the per-slug aggregate capacity of 320 across players', () => {
     const rl = new RateLimiter();
     const now = 3_000_000;
     let allowed = 0;
-    // 8 players each firing 20 instantly = 160 attempts. Per-player cap (40) never
-    // binds here; the slug aggregate cap (120) does.
-    for (let p = 0; p < 8; p++) {
-      for (let i = 0; i < 20; i++) {
+    // 10 player ids each firing 40 instantly = 400 attempts. Per-player cap (40)
+    // never binds here; the slug aggregate cap (8 x 40 = 320) does.
+    for (let p = 0; p < 10; p++) {
+      for (let i = 0; i < 40; i++) {
         if (rl.allow('ROOM', `p${p}`, now)) allowed++;
       }
     }
-    expect(allowed).toBe(120);
+    expect(allowed).toBe(320);
+  });
+
+  it('fits a full lobby of 8 sticks at 15 changes/s plus buttons without drops', () => {
+    const rl = new RateLimiter();
+    let now = 3_500_000;
+    let dropped = 0;
+    // 10 s of 8 players each sending 20 inputs/s (a stick at ~15/s plus taps).
+    for (let tick = 0; tick < 200; tick++) {
+      for (let p = 0; p < 8; p++) {
+        if (!rl.allow('ROOM', `p${p}`, now)) dropped++;
+      }
+      now += 50;
+    }
+    expect(dropped).toBe(0);
   });
 
   it('refills tokens over time', () => {

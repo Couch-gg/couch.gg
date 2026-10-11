@@ -21,7 +21,7 @@ const PAD: ExternalGameManifest = {
   thumbnail: { kind: 'css', gradient: 'linear-gradient(#000,#111)', icon: 'Zap' }
 };
 
-describe('rate limit never drops a release', () => {
+describe('rate limit never drops the release of a held control', () => {
   let instance: RealtimeServerInstance;
   let url = '';
   const sockets: Socket[] = [];
@@ -47,7 +47,7 @@ describe('rate limit never drops a release', () => {
     );
   }
 
-  it('relays the release after the press budget is exhausted', async () => {
+  async function startedPad() {
     const created = await fetch(`${url}/api/lobbies`, { method: 'POST' }).then((r) => r.json());
     const slug: string = created.lobby.slug;
     const phone = connect(url, { transports: ['websocket'], forceNew: true });
@@ -62,6 +62,11 @@ describe('rate limit never drops a release', () => {
         playerToken: host.playerToken,
         event: { playerId: 'x', type: 'game', control: 'run', value: { action }, timestamp: Date.now() }
       });
+    return { send };
+  }
+
+  it('relays the release after the press budget is exhausted', async () => {
+    const { send } = await startedPad();
 
     const presses = [];
     for (let i = 0; i < 60; i++) presses.push(await send('press'));
@@ -71,5 +76,19 @@ describe('rate limit never drops a release', () => {
     const release = await send('release');
     expect(release.dropped).toBeUndefined();
     expect(typeof release.seq).toBe('number');
+
+    // The control is no longer held: a second release pays like a press.
+    expect((await send('release')).dropped).toBe(true);
+  });
+
+  it('rate-limits releases that follow no relayed press', async () => {
+    const { send } = await startedPad();
+
+    const releases = [];
+    for (let i = 0; i < 60; i++) releases.push(await send('release'));
+    const relayed = releases.filter((res) => !res.dropped).length;
+    // Only the burst budget (40 per player) gets through; the rest are dropped.
+    expect(relayed).toBeLessThanOrEqual(42);
+    expect(releases.filter((res) => res.dropped).length).toBeGreaterThanOrEqual(18);
   });
 });

@@ -501,6 +501,8 @@ function vectorFrom(el: HTMLElement, clientX: number, clientY: number): { x: num
 function StickControl({ control, label, enabled, onEvent }: ControlBaseProps) {
   const baseRef = useRef<HTMLDivElement | null>(null);
   const activeRef = useRef(false);
+  // The finger that grabbed the stick; a second finger landing on it is ignored.
+  const pointerRef = useRef<number | null>(null);
   const [knob, setKnob] = useState({ x: 0, y: 0 });
   const sentRef = useRef({ x: 0, y: 0 });
   const lastSendRef = useRef(0);
@@ -539,6 +541,7 @@ function StickControl({ control, label, enabled, onEvent }: ControlBaseProps) {
   const release = () => {
     if (!activeRef.current) return;
     activeRef.current = false;
+    pointerRef.current = null;
     clearTrailing();
     setKnob({ x: 0, y: 0 });
     latestRef.current = { x: 0, y: 0 };
@@ -547,6 +550,10 @@ function StickControl({ control, label, enabled, onEvent }: ControlBaseProps) {
   };
   useReleaseOnHide(release);
   useReleaseOnDisable(enabled, release);
+  // Only the owning finger lifting (or being cancelled) lets go of the control.
+  const releasePointer = (event: PointerEvent<HTMLDivElement>) => {
+    if (event.pointerId === pointerRef.current) release();
+  };
 
   return (
     <div className="generic-stick-wrap">
@@ -557,7 +564,7 @@ function StickControl({ control, label, enabled, onEvent }: ControlBaseProps) {
         aria-label={label}
         data-control={control}
         onPointerDown={(event) => {
-          if (!enabled) return;
+          if (!enabled || activeRef.current) return;
           event.preventDefault();
           try {
             event.currentTarget.setPointerCapture(event.pointerId);
@@ -565,17 +572,18 @@ function StickControl({ control, label, enabled, onEvent }: ControlBaseProps) {
             // ignore stale pointer ids
           }
           activeRef.current = true;
+          pointerRef.current = event.pointerId;
           haptic(10);
           move(event.clientX, event.clientY);
         }}
         onPointerMove={(event) => {
-          if (!activeRef.current) return;
+          if (!activeRef.current || event.pointerId !== pointerRef.current) return;
           event.preventDefault();
           move(event.clientX, event.clientY);
         }}
-        onPointerUp={release}
-        onPointerCancel={release}
-        onLostPointerCapture={release}
+        onPointerUp={releasePointer}
+        onPointerCancel={releasePointer}
+        onLostPointerCapture={releasePointer}
         onContextMenu={(e) => e.preventDefault()}
       >
         <span
@@ -602,6 +610,8 @@ function dpadDirection(v: { x: number; y: number }): DpadDir {
 function DpadControl({ control, label, enabled, onEvent }: ControlBaseProps) {
   const padRef = useRef<HTMLDivElement | null>(null);
   const activeRef = useRef(false);
+  // The finger that pressed the d-pad; a second finger landing on it is ignored.
+  const pointerRef = useRef<number | null>(null);
   const dirRef = useRef<DpadDir>('none');
   const [dir, setDir] = useState<DpadDir>('none');
 
@@ -625,10 +635,15 @@ function DpadControl({ control, label, enabled, onEvent }: ControlBaseProps) {
   const release = () => {
     if (!activeRef.current) return;
     activeRef.current = false;
+    pointerRef.current = null;
     apply('none');
   };
   useReleaseOnHide(release);
   useReleaseOnDisable(enabled, release);
+  // Only the owning finger lifting (or being cancelled) lets go of the control.
+  const releasePointer = (event: PointerEvent<HTMLDivElement>) => {
+    if (event.pointerId === pointerRef.current) release();
+  };
 
   return (
     <div className="generic-stick-wrap">
@@ -640,7 +655,7 @@ function DpadControl({ control, label, enabled, onEvent }: ControlBaseProps) {
         data-control={control}
         data-dir={dir}
         onPointerDown={(event) => {
-          if (!enabled) return;
+          if (!enabled || activeRef.current) return;
           event.preventDefault();
           try {
             event.currentTarget.setPointerCapture(event.pointerId);
@@ -648,16 +663,17 @@ function DpadControl({ control, label, enabled, onEvent }: ControlBaseProps) {
             // ignore stale pointer ids
           }
           activeRef.current = true;
+          pointerRef.current = event.pointerId;
           track(event.clientX, event.clientY);
         }}
         onPointerMove={(event) => {
-          if (!activeRef.current) return;
+          if (!activeRef.current || event.pointerId !== pointerRef.current) return;
           event.preventDefault();
           track(event.clientX, event.clientY);
         }}
-        onPointerUp={release}
-        onPointerCancel={release}
-        onLostPointerCapture={release}
+        onPointerUp={releasePointer}
+        onPointerCancel={releasePointer}
+        onLostPointerCapture={releasePointer}
         onContextMenu={(e) => e.preventDefault()}
       >
         {(['up', 'right', 'down', 'left'] as const).map((arm) => (

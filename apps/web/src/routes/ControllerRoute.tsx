@@ -54,6 +54,9 @@ interface SfxModule {
 
 let sfxPromise: Promise<SfxModule | null> | null = null;
 const REMOTE_SHARE_KEY_PREFIX = 'couch:share-room:';
+// Resend a rate-limited generic 'change' after this long, at most this often.
+const GENERIC_RESEND_MS = 100;
+const GENERIC_RESEND_MAX = 10;
 const DEFAULT_AIM_ELEVATION = 72;
 
 function loadSfx(): Promise<SfxModule | null> {
@@ -108,6 +111,10 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   const lastChargeSendRef = useRef(0);
   const rememberedAnglesRef = useRef<Record<string, number>>({});
   const lastTurnAimKeyRef = useRef<string | null>(null);
+  // Newest generic-controller input per control, and pending resend timers for
+  // rate-limited changes (see sendGenericEvent).
+  const latestGenericRef = useRef(new Map<string, { action: InputAction; data?: unknown }>());
+  const resendTimersRef = useRef(new Set<number>());
 
   // Retro button sounds. Loaded once on mount into a ref (not state) so input
   // handlers can fire it synchronously without triggering re-renders; null until
@@ -217,6 +224,8 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
         window.clearTimeout(shareTimerRef.current);
         shareTimerRef.current = null;
       }
+      for (const timer of resendTimersRef.current) window.clearTimeout(timer);
+      resendTimersRef.current.clear();
     };
   }, []);
 
@@ -412,23 +421,41 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   // gating here (external games do their own turn logic per the manifest), and
   // no preview/final split: every interaction is sent as-is via the same
   // controller:event message the trebuchet pad already uses.
+  //
+  // A rate-limited 'change' is acked {ok:true, dropped:true}. If it is still the
+  // newest value for its control, it is resent shortly after, so a held stick,
+  // d-pad, slider or hold can't stay on a stale value until the next move.
   const sendGenericEvent = useCallback(
     (control: string, action: InputAction, data?: unknown) => {
       if (!socket) return;
-      void emitAck(socket, 'controller:event', {
-        slug,
-        playerToken,
-        event: {
-          playerId: player?.id,
-          type: 'game',
-          control,
-          value: { action, data },
-          timestamp: Date.now()
-        }
-      }).catch(() => {
-        // Best-effort like the trebuchet preview path; a dropped/rate-limited
-        // ack ({ok:true, dropped:true}) resolves fine and never reaches here.
-      });
+      const sent = { action, data };
+      latestGenericRef.current.set(control, sent);
+      const emit = (attempt: number) => {
+        void emitAck<{ dropped?: boolean }>(socket, 'controller:event', {
+          slug,
+          playerToken,
+          event: {
+            playerId: player?.id,
+            type: 'game',
+            control,
+            value: { action, data },
+            timestamp: Date.now()
+          }
+        })
+          .then((res) => {
+            if (!res?.dropped || action !== 'change' || attempt >= GENERIC_RESEND_MAX) return;
+            if (latestGenericRef.current.get(control) !== sent) return;
+            const timer = window.setTimeout(() => {
+              resendTimersRef.current.delete(timer);
+              if (latestGenericRef.current.get(control) === sent) emit(attempt + 1);
+            }, GENERIC_RESEND_MS);
+            resendTimersRef.current.add(timer);
+          })
+          .catch(() => {
+            // Best-effort like the trebuchet preview path.
+          });
+      };
+      emit(0);
     },
     [player?.id, playerToken, slug, socket]
   );
