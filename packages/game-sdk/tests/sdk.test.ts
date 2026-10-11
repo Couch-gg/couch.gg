@@ -297,13 +297,14 @@ describe('CouchSDK listener isolation', () => {
     const couch = await p;
     const on = couch.on as (event: string, cb: () => void) => () => void;
 
-    for (const name of ['latency', 'toString', 'constructor']) {
+    // A typo (never a name a future SDK might add) and two Object.prototype names.
+    for (const name of ['inptu', 'toString', 'constructor']) {
       const off = on(name, () => {});
       expect(typeof off).toBe('function');
       expect(() => off()).not.toThrow();
     }
     expect(warn).toHaveBeenCalledTimes(3);
-    expect(String(warn.mock.calls[0][0])).toContain("on('latency'): unknown event");
+    expect(String(warn.mock.calls[0][0])).toContain("on('inptu'): unknown event");
     warn.mockRestore();
     h.restore();
   });
