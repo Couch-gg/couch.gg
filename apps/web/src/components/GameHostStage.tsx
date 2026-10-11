@@ -145,8 +145,9 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
   const initializedRef = useRef(false); // sent couch:init at least once
   const readyRef = useRef(false);
   const finishedRef = useRef(false); // game:finish sent (idempotent guard)
-  // Scores waiting for this screen to be the host screen (only it may finish).
-  const pendingFinishRef = useRef<CouchScore[] | null>(null);
+  // Scores (and the round they belong to) waiting for this screen to be the
+  // host screen, which alone may finish the game.
+  const pendingFinishRef = useRef<{ scores: CouchScore[]; session: string } | null>(null);
   const probedRef = useRef(false); // probe-result sent (once)
   const knownPlayersRef = useRef<Map<string, CouchPlayer>>(new Map());
 
@@ -202,13 +203,17 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
   // others). A screen that isn't the host keeps the scores and sends them if
   // it becomes the host while the game is still running (the host TV left).
   const sendFinish = useCallback(() => {
-    const scores = pendingFinishRef.current;
+    const pending = pendingFinishRef.current;
     const sock = socketRef.current;
     const l = lobbyRef.current;
-    if (!scores || !sock || finishedRef.current || l.state !== 'playing') return;
+    if (!pending || !sock || finishedRef.current) return;
+    if (pending.session !== (l.gameSession?.id ?? '') || l.state !== 'playing') {
+      pendingFinishRef.current = null; // that round is over (or a new one started)
+      return;
+    }
     if (!screenRole(l, screenIdRef.current).isHost) return;
     finishedRef.current = true;
-    void emitAck(sock, 'game:finish', { slug: l.slug, scores })
+    void emitAck(sock, 'game:finish', { slug: l.slug, scores: pending.scores })
       .then(() => {
         pendingFinishRef.current = null;
       })
@@ -308,7 +313,7 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
           onEventRef.current?.({ kind: 'gameOver', detail: { scores } });
           if (modeRef.current === 'test') break; // /dev owns the finish
           if (finishedRef.current || pendingFinishRef.current) break;
-          pendingFinishRef.current = scores;
+          pendingFinishRef.current = { scores, session: lobbyRef.current.gameSession?.id ?? '' };
           sendFinish();
           break;
         }
