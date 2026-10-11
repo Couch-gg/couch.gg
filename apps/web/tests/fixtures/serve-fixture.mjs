@@ -2,7 +2,7 @@
 //
 // Serves apps/web/tests/fixtures/ (the "tap-race" fixture game + manifest) on
 // http://127.0.0.1:4180, plus a special route that serves the built
-// @couch/game-sdk IIFE bundle at /tap-race/couch-sdk.js by reading it straight
+// @couch/game-sdk IIFE bundle at /<fixture>/couch-sdk.js by reading it straight
 // off disk from packages/game-sdk/dist — mirroring copy-sdk.mjs's approach
 // (paths resolved relative to THIS script, not the cwd; clear error if the
 // SDK hasn't been built yet).
@@ -59,8 +59,9 @@ const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', `http://127.0.0.1:${PORT}`);
     const pathname = decodeURIComponent(url.pathname);
 
-    // Special route: serve the built SDK IIFE bundle read live from disk.
-    if (pathname === '/tap-race/couch-sdk.js') {
+    // Special route: serve the built SDK IIFE bundle read live from disk, next to
+    // every fixture game (tap-race, input-lab).
+    if (/^\/[a-z0-9-]+\/couch-sdk\.js$/.test(pathname)) {
       const body = await readSdkBundle();
       send(res, 200, body, CONTENT_TYPES['.js']);
       return;

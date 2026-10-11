@@ -1,8 +1,10 @@
 // Per-instance token-bucket rate limiter for relayed external game inputs.
 //
 // Two buckets are checked on every input:
-//   - per-player: capacity 20, refill 10 tokens/s (keyed `${slug}:${playerId}`)
-//   - per-slug aggregate: capacity 60, refill 30 tokens/s (keyed `${slug}`)
+//   - per-player: capacity 40, refill 20 tokens/s (keyed `${slug}:${playerId}`)
+//   - per-slug aggregate: capacity 120, refill 60 tokens/s (keyed `${slug}`)
+// Sized so a thumbstick (~15 changes/s) plus button presses fits per player.
+// Releases bypass the limiter entirely (see the controller:event handler).
 // Both must have a token available for the input to be allowed; the token is
 // only consumed from each when both pass, so a rejected input never drains the
 // other bucket. This bounds a single controller's burst while also capping the
@@ -20,10 +22,10 @@ interface Bucket {
   lastTouched: number;
 }
 
-const PLAYER_CAPACITY = 20;
-const PLAYER_REFILL_PER_SEC = 10;
-const SLUG_CAPACITY = 60;
-const SLUG_REFILL_PER_SEC = 30;
+const PLAYER_CAPACITY = 40;
+const PLAYER_REFILL_PER_SEC = 20;
+const SLUG_CAPACITY = 120;
+const SLUG_REFILL_PER_SEC = 60;
 const IDLE_PRUNE_MS = 60_000;
 
 export class RateLimiter {

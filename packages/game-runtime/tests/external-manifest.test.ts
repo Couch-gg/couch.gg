@@ -511,3 +511,35 @@ describe('multi-error collection', () => {
     }
   });
 });
+
+describe('stick / dpad controls and the landscape layout hint', () => {
+  it('accepts stick and dpad controls with zones and a landscape orientation, and keeps them', () => {
+    const res = check((m) => {
+      m.controllerLayout.orientation = 'landscape';
+      m.controllerLayout.controls = [
+        { control: 'move', type: 'stick', label: 'Move' },
+        { control: 'aim', type: 'dpad', label: 'Aim', zone: 'right' },
+        { control: 'jump', type: 'button', label: 'Jump', zone: 'left' }
+      ];
+    });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.value.controllerLayout.orientation).toBe('landscape');
+    expect(res.value.controllerLayout.controls.map((c) => [c.type, c.zone])).toEqual([
+      ['stick', undefined],
+      ['dpad', 'right'],
+      ['button', 'left']
+    ]);
+  });
+
+  it('rejects an unknown zone or orientation', () => {
+    const badZone = check((m) => {
+      m.controllerLayout.controls[0].zone = 'middle';
+    });
+    expect(badZone.ok).toBe(false);
+    const badOrientation = check((m) => {
+      m.controllerLayout.orientation = 'sideways';
+    });
+    expect(badOrientation.ok).toBe(false);
+  });
+});

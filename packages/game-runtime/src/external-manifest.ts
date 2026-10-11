@@ -42,10 +42,12 @@ export interface ExternalManifestInput {
   maxPlayers: number;
   controllerLayout: {
     kind: 'generic-buttons';
+    orientation?: 'portrait' | 'landscape';
     controls: Array<{
       control: string;
-      type: 'button' | 'hold' | 'slider' | 'select';
+      type: 'button' | 'hold' | 'slider' | 'select' | 'stick' | 'dpad';
       label: string;
+      zone?: 'left' | 'right';
       min?: number;
       max?: number;
       step?: number;
@@ -72,7 +74,9 @@ export type ValidateExternalManifestResult =
 
 const ID_RE = /^[a-z0-9][a-z0-9-]{2,31}$/;
 const CONTROL_NAME_RE = /^[a-z0-9._-]{1,32}$/;
-const CONTROL_TYPES = ['button', 'hold', 'slider', 'select'] as const;
+const CONTROL_TYPES = ['button', 'hold', 'slider', 'select', 'stick', 'dpad'] as const;
+const ZONES = ['left', 'right'] as const;
+const ORIENTATIONS = ['portrait', 'landscape'] as const;
 const ASPECT_RATIOS = ['16:9', '4:3'] as const;
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -213,6 +217,9 @@ export function validateExternalManifestInput(
     if (layout.kind !== 'generic-buttons') {
       errors.push("controllerLayout.kind must be 'generic-buttons'");
     }
+    if (layout.orientation !== undefined && !(ORIENTATIONS as readonly unknown[]).includes(layout.orientation)) {
+      errors.push("controllerLayout.orientation must be 'portrait' or 'landscape' when present");
+    }
     const controls = layout.controls;
     if (!Array.isArray(controls)) {
       errors.push('controllerLayout.controls must be an array');
@@ -243,7 +250,10 @@ export function validateExternalManifestInput(
         const type = ctrl.type;
         const typeOk = typeof type === 'string' && (CONTROL_TYPES as readonly string[]).includes(type);
         if (!typeOk) {
-          errors.push(`controllerLayout.controls[${i}].type must be one of button|hold|slider|select`);
+          errors.push(`controllerLayout.controls[${i}].type must be one of button|hold|slider|select|stick|dpad`);
+        }
+        if (ctrl.zone !== undefined && !(ZONES as readonly unknown[]).includes(ctrl.zone)) {
+          errors.push(`controllerLayout.controls[${i}].zone must be 'left' or 'right' when present`);
         }
         // label
         if (typeof ctrl.label !== 'string') {
@@ -448,6 +458,7 @@ export function validateExternalManifestInput(
     maxPlayers: maxPlayers as number,
     controllerLayout: {
       kind: 'generic-buttons',
+      ...(normalizedLayout.orientation !== undefined ? { orientation: normalizedLayout.orientation } : {}),
       controls: normalizedLayout.controls.map((ctrl) => {
         const out: ExternalManifestInput['controllerLayout']['controls'][number] = {
           control: ctrl.control,
@@ -458,6 +469,7 @@ export function validateExternalManifestInput(
         if (ctrl.max !== undefined) out.max = ctrl.max;
         if (ctrl.step !== undefined) out.step = ctrl.step;
         if (ctrl.options !== undefined) out.options = ctrl.options.slice();
+        if (ctrl.zone !== undefined) out.zone = ctrl.zone;
         return out;
       })
     },

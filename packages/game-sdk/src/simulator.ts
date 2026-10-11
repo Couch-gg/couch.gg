@@ -271,6 +271,9 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
         return renderSlider(player, control);
       case 'select':
         return renderSelect(player, control);
+      case 'stick':
+      case 'dpad':
+        return renderDirectional(player, control);
       default:
         return renderButton(player, control);
     }
@@ -404,6 +407,69 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
     return wrap;
   }
 
+  // Stick and d-pad share one 3x3 grid in the sim: each cell is a direction.
+  // A d-pad sends { dir }; a stick sends the matching full-tilt { x, y }.
+  function emitDirection(pid: string, control: CouchControl, dir: string): void {
+    if (dir === 'none') {
+      emitInput(pid, control.control, 'release', control.type === 'stick' ? { x: 0, y: 0 } : { dir: 'none' });
+      return;
+    }
+    if (control.type === 'dpad') {
+      emitInput(pid, control.control, 'change', { dir });
+      return;
+    }
+    const x = dir.includes('right') ? 1 : dir.includes('left') ? -1 : 0;
+    const y = dir.includes('up') ? 1 : dir.includes('down') ? -1 : 0;
+    const len = Math.hypot(x, y) || 1;
+    emitInput(pid, control.control, 'change', {
+      x: Math.round((x / len) * 100) / 100,
+      y: Math.round((y / len) * 100) / 100
+    });
+  }
+
+  function renderDirectional(player: CouchPlayer, control: CouchControl): HTMLElement {
+    const wrap = document.createElement('div');
+    wrap.className = 'couch-sim-pad couch-sim-pad-select';
+    const label = document.createElement('span');
+    label.className = 'couch-sim-pad-label';
+    label.textContent = (control.label || control.control) + (control.type === 'stick' ? ' (stick)' : '');
+    wrap.appendChild(label);
+    const grid = document.createElement('div');
+    grid.style.display = 'grid';
+    grid.style.gridTemplateColumns = 'repeat(3, 1fr)';
+    grid.style.gap = '3px';
+    const cells = ['up-left', 'up', 'up-right', 'left', '', 'right', 'down-left', 'down', 'down-right'];
+    const arrows: Record<string, string> = {
+      'up-left': '↖', up: '↑', 'up-right': '↗', left: '←', right: '→', 'down-left': '↙', down: '↓', 'down-right': '↘'
+    };
+    for (const dir of cells) {
+      const cell = document.createElement('button');
+      cell.type = 'button';
+      cell.className = 'couch-sim-seg-btn';
+      cell.textContent = dir ? arrows[dir] : '·';
+      cell.dataset.control = control.control;
+      cell.dataset.dir = dir || 'none';
+      if (dir) {
+        let down = false;
+        cell.addEventListener('pointerdown', (e) => {
+          e.preventDefault();
+          down = true;
+          emitDirection(player.id, control, dir);
+        });
+        const up = (): void => {
+          if (!down) return;
+          down = false;
+          emitDirection(player.id, control, 'none');
+        };
+        cell.addEventListener('pointerup', up);
+        cell.addEventListener('pointerleave', up);
+      }
+      grid.appendChild(cell);
+    }
+    wrap.appendChild(grid);
+    return wrap;
+  }
+
   // ---- keyboard bindings (player 1) ------------------------------------
   const keyState = new Set<string>();
   const buttonControls = (): CouchControl[] =>
@@ -413,10 +479,28 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
   const firstHold = (): CouchControl | undefined => controls.find((c) => c.type === 'hold');
 
   const primaryId = (): string | undefined => core.players[0]?.id;
+  const firstDirectional = (): CouchControl | undefined =>
+    controls.find((c) => c.type === 'stick' || c.type === 'dpad');
+  const WASD: Record<string, string> = { KeyW: 'up', KeyA: 'left', KeyS: 'down', KeyD: 'right' };
+  const heldDirs = new Set<string>();
+  // Combine the held WASD keys into one of the 8 directions (or 'none').
+  function wasdDirection(): string {
+    const v = (heldDirs.has('up') ? 'up' : heldDirs.has('down') ? 'down' : '');
+    const h = (heldDirs.has('left') ? 'left' : heldDirs.has('right') ? 'right' : '');
+    return v && h ? `${v}-${h}` : v || h || 'none';
+  }
 
   const onKeyDown = (e: KeyboardEvent): void => {
     const pid = primaryId();
     if (!pid) return;
+    const wasd = WASD[e.code];
+    const directional = firstDirectional();
+    if (wasd && directional) {
+      if (heldDirs.has(wasd)) return;
+      heldDirs.add(wasd);
+      emitDirection(pid, directional, wasdDirection());
+      return;
+    }
     // Digit1..9 -> nth button press.
     const digit = /^Digit([1-9])$/.exec(e.code);
     if (digit) {
@@ -450,6 +534,13 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
   const onKeyUp = (e: KeyboardEvent): void => {
     const pid = primaryId();
     if (!pid) return;
+    const wasd = WASD[e.code];
+    const directional = firstDirectional();
+    if (wasd && directional && heldDirs.has(wasd)) {
+      heldDirs.delete(wasd);
+      emitDirection(pid, directional, wasdDirection());
+      return;
+    }
     const digit = /^Digit([1-9])$/.exec(e.code);
     if (digit && keyState.has(e.code)) {
       keyState.delete(e.code);

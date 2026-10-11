@@ -1,0 +1,26 @@
+{
+  "id": "input-lab",
+  "title": "Input Lab",
+  "description": "Fixture game that logs every input it receives, for controller e2e tests.",
+  "minPlayers": 1,
+  "maxPlayers": 4,
+  "controllerLayout": {
+    "kind": "generic-buttons",
+    "orientation": "landscape",
+    "controls": [
+      { "control": "move", "type": "stick", "label": "Move" },
+      { "control": "aim", "type": "dpad", "label": "Aim" },
+      { "control": "fire", "type": "button", "label": "FIRE" }
+    ]
+  },
+  "aspectRatio": "16:9",
+  "estimatedDurationMinutes": 2,
+  "thumbnail": {
+    "kind": "css",
+    "gradient": "linear-gradient(160deg,#3b1d4d,#be2d8f)",
+    "icon": "gamepad"
+  },
+  "entryUrl": "http://127.0.0.1:4180/input-lab/index.html",
+  "sdkProtocol": 1,
+  "supportsRemote": true
+}
