@@ -262,7 +262,7 @@ interface CouchPlayer {
 
 interface CouchInputEnvelope {
   seq: number;        // monotonic per-lobby sequence — host guarantees strict order
-  at: number;         // ms since epoch when the realtime SERVER accepted it — compare only with other inputs' `at`
+  at: number;         // ms since epoch when the realtime SERVER accepted it — for intervals between inputs; order by `seq`
   playerId: string;   // authoritative; derived server-side from the player's token
   control: string;    // matches a manifest controllerLayout.controls[].control
   action: 'press' | 'release' | 'change';
@@ -390,14 +390,18 @@ production — from its fake phones and from the keyboard alike.
 ### 5.3 Ordering and timestamps
 
 - `seq` is a **strict monotonic per-lobby** counter. The host guarantees order.
-  Use it to break ties or to ignore stale inputs; `couch.lastSeq` tracks the
-  latest.
+  It is the order the platform accepted the inputs in, so use it to see who
+  buzzed first, to break ties or to ignore stale inputs; `couch.lastSeq` tracks
+  the latest.
 - `at` is a **millisecond** timestamp (ms since epoch) taken by the realtime
   **server** when it accepted the input. (The wire format inside the platform is
-  an ISO string, but the SDK hands you a number — do not re-parse it.) Compare it
-  only with other inputs' `at`, e.g. to see who buzzed first; `at - Date.now()`
-  on the big screen is off by however far that screen's clock is from the
-  server's. In the dev simulator it is the local clock.
+  an ISO string, but the SDK hands you a number — do not re-parse it.) Use it for
+  the time between inputs: reaction times, double-tap timing. Not for their
+  order: it comes from whichever server instance took the input, and their
+  clocks can differ slightly, so two close inputs can carry `at` values in the
+  opposite order of their `seq`. Compare it only with other inputs' `at`;
+  `at - Date.now()` on the big screen is off by however far that screen's clock
+  is from the server's. In the dev simulator it is the local clock.
 - `playerId` is authoritative and server-derived. Never trust a client-supplied
   player id; use the envelope's `playerId`.
 

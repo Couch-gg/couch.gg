@@ -82,8 +82,10 @@ export interface CouchInputEnvelope {
   seq: number;
   /**
    * When the realtime server accepted the input (ms since epoch, server clock;
-   * the local clock in the dev simulator). Compare it only with other inputs'
-   * `at`, not with `Date.now()`: the screen's clock can be off by seconds.
+   * the local clock in the dev simulator). For the time between inputs, not
+   * their order (that is `seq`: server instances' clocks differ slightly).
+   * Compare it only with other inputs' `at`, not with `Date.now()`: the
+   * screen's clock can be off by seconds.
    */
   at: number;
   /** Which player produced the input. */
