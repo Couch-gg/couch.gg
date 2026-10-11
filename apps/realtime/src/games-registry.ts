@@ -10,8 +10,9 @@
 // the stored record and writes it back conditionally (see GamePersistence), so
 // a stale cache can't undo a takedown or bring back a deleted game.
 //
-// Reports and probe failures count once per client (a hashed IP, see index.ts):
-// one person can't hide a game alone. Served thumbnails are sanitized, so a
+// Reports and probe failures count once per client (a keyed hash of the IP,
+// see client-id.ts): one person can't hide a game alone. Those ids stay in the
+// store; no API payload carries them. Served thumbnails are sanitized, so a
 // record stored before the thumbnail rules still renders in the catalog.
 //
 // Security invariants (grep-enforced by the task):
@@ -413,7 +414,9 @@ export function publicGame(record: PublishedGameRecord): ExternalGameManifest {
 }
 
 // Admin view of a record: everything the operator needs to triage, minus the
-// token hash (an operator can take down / feature by id; they never need the hash).
+// token hash (an operator can take down / feature by id; they never need the
+// hash) and the client ids behind reports and probe failures (the counts say
+// enough, and the ids are personal data).
 export function adminGameView(record: PublishedGameRecord): {
   manifest: ExternalGameManifest;
   createdAt: number;
@@ -421,7 +424,7 @@ export function adminGameView(record: PublishedGameRecord): {
   featured: boolean;
   hidden: boolean;
   reports: number;
-  probe: PublishedGameRecord['probe'];
+  probe: Omit<PublishedGameRecord['probe'], 'failedBy'>;
 } {
   return {
     manifest: record.manifest,
@@ -430,7 +433,11 @@ export function adminGameView(record: PublishedGameRecord): {
     featured: record.featured,
     hidden: record.hidden,
     reports: record.reports,
-    probe: record.probe
+    probe: {
+      status: record.probe.status,
+      lastCheckedAt: record.probe.lastCheckedAt,
+      failCount: record.probe.failCount
+    }
   };
 }
 

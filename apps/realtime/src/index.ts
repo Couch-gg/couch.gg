@@ -13,6 +13,7 @@ import { RateLimiter } from './rate-limit.js';
 import { createProductionGamePersistence, createProductionLobbyPersistence } from './persistence.js';
 import { GamesRegistry, RegistryError, adminGameView, publicGame } from './games-registry.js';
 import { ScreenRegistry } from './screens.js';
+import { clientId, clientIdKey } from './client-id.js';
 
 // Largest host-authoritative state broadcast (serialized), see game:state.
 const MAX_STATE_BYTES = 32_768;
@@ -65,6 +66,8 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   // from other serverless instances within the 30s window.
   const gamesPersistence = createProductionGamePersistence();
   const registry = new GamesRegistry(gamesPersistence);
+  // Keys the client ids that reports and probe results are counted by.
+  const clientKey = clientIdKey();
 
   // Resolver the store uses instead of the throwing getGameManifest: built-ins
   // first, then env-registered externals, then the durable registry (sync cache
@@ -193,12 +196,12 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
     }
   });
 
-  // Community report. Each client (hashed IP) counts once per game and has a
-  // budget of 5 reports/hour shared by every instance; at 3 clients the game
-  // auto-hides.
+  // Community report. Each client (a keyed hash of its IP, see client-id.ts)
+  // counts once per game and has a budget of 5 reports/hour shared by every
+  // instance; at 3 clients the game auto-hides.
   app.post(`${apiPrefix}/games/:id/report`, async (req, res) => {
     try {
-      const client = clientId(req);
+      const client = clientId(clientIp(req), clientKey);
       if (!(await registry.allowRequest('report', client))) {
         res.status(429).json({ error: 'too many reports' });
         return;
@@ -222,7 +225,7 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
       const gameId = req.params.id;
       const slug = String(req.body?.slug ?? '').toUpperCase();
       const ok = req.body?.ok === true;
-      const client = clientId(req);
+      const client = clientId(clientIp(req), clientKey);
       if (!(await registry.allowRequest('probe', client))) {
         res.status(429).json({ error: 'too many probe results' });
         return;
@@ -928,30 +931,6 @@ function clientIp(req: express.Request): string {
     if (first) return first;
   }
   return req.socket.remoteAddress ?? 'unknown';
-}
-
-// Who is calling, for counting reports / probe results once per client and for
-// their rate limits: a hash, so raw IPs are never stored. IPv6 counts per /64,
-// the block one connection usually gets, so hopping addresses in it doesn't
-// make a caller look like several.
-function clientId(req: express.Request): string {
-  return createHash('sha256').update(`couch-client:${ipBlock(clientIp(req))}`).digest('hex').slice(0, 32);
-}
-
-function ipBlock(ip: string): string {
-  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(ip);
-  if (mapped) return mapped[1];
-  if (!ip.includes(':')) return ip;
-  const [head, tail = ''] = ip.toLowerCase().split('::');
-  const headParts = head ? head.split(':') : [];
-  const tailParts = tail ? tail.split(':') : [];
-  const groups = ip.includes('::')
-    ? [...headParts, ...Array(Math.max(0, 8 - headParts.length - tailParts.length)).fill('0'), ...tailParts]
-    : headParts;
-  return `${groups
-    .slice(0, 4)
-    .map((group) => (Number.parseInt(group, 16) || 0).toString(16))
-    .join(':')}::/64`;
 }
 
 // Resolve a player id from a controller token for rate-limit keying. Returns null

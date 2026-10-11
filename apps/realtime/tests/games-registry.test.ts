@@ -396,6 +396,19 @@ describe('admin ops', () => {
     await expect(registry.setHidden('nope', true)).rejects.toMatchObject({ status: 404 });
     await expect(registry.setFeatured('nope', true)).rejects.toMatchObject({ status: 404 });
   });
+
+  it('shows the counts but not the client ids behind reports and probe failures', async () => {
+    const registry = new GamesRegistry(makePersistence());
+    await submitTapRace(registry);
+    await registry.report('tap-race', 'reporter-id-a');
+    const record = await registry.probeResult('tap-race', false, 'failing-tv-id-b');
+    const view = adminGameView(record);
+    expect(view).toMatchObject({ reports: 1, probe: { status: 'unverified', failCount: 1 } });
+    expect(view.probe).not.toHaveProperty('failedBy');
+    const serialized = JSON.stringify(view);
+    expect(serialized).not.toContain('reporter-id-a');
+    expect(serialized).not.toContain('failing-tv-id-b');
+  });
 });
 
 describe('ensureFresh single-flight', () => {

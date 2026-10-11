@@ -1,8 +1,11 @@
+import { createHash } from 'node:crypto';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { io as connect, type Socket } from 'socket.io-client';
+import { clientId, clientIdKey } from '../src/client-id.js';
 import { createRealtimeServer, type RealtimeServerInstance } from '../src/index.js';
+import { createProductionGamePersistence } from '../src/persistence.js';
 
 // The published-games REST surface end to end: probe-result only counts from
 // the host screen of a lobby playing the game, once per game session; reports
@@ -202,7 +205,7 @@ describe('published games over REST', () => {
     const restore = () => post(`${api}/admin/games/${gameId}/restore`, {}, { 'x-admin-key': ADMIN_KEY });
     const admin = async () =>
       ((await (await fetch(`${api}/admin/games`, { headers: { 'x-admin-key': ADMIN_KEY } })).json()) as {
-        games: Array<{ manifest: { id: string }; probe: { status: string } }>;
+        games: Array<{ manifest: { id: string }; probe: { status: string; failCount: number } }>;
       }).games.find((g) => g.manifest.id === gameId);
 
     // Three sessions on three TVs (clients) fail to load it.
@@ -226,7 +229,11 @@ describe('published games over REST', () => {
       );
       expect(result.body.counted).toBe(true);
     }
-    expect((await admin())?.probe.status).toBe('failed');
+    const failed = await admin();
+    expect(failed?.probe).toMatchObject({ status: 'failed', failCount: 3 });
+    // The admin sees how many TVs failed, not who they were.
+    expect(failed?.probe).not.toHaveProperty('failedBy');
+    expect(failed).not.toHaveProperty('reporters');
     expect((await restore()).status).toBe(200);
     expect((await admin())?.probe.status).toBe('unverified');
     const games = ((await (await fetch(`${api}/games`)).json()) as { games: Array<{ id: string }> }).games;
@@ -277,6 +284,20 @@ describe.skipIf(!redisUrl)('published games across instances on one Redis', () =
       { 'x-forwarded-for': ip }
     );
     expect(again.body.counted).toBe(false);
+  });
+
+  it('counts a client once on every instance, by an id its IP alone does not give', async () => {
+    const gameId = uniqueId('reporter');
+    expect((await post(`${api(0)}/games`, { manifest: manifest(gameId) })).status).toBe(201);
+    const ip = randomIp();
+    const report = (at: number) => post(`${api(at)}/games/${gameId}/report`, {}, { 'x-forwarded-for': ip });
+    expect((await report(0)).body).toMatchObject({ counted: true });
+    expect((await report(1)).body).toMatchObject({ counted: false });
+    const stored = await createProductionGamePersistence(redisUrl).loadGame(gameId);
+    // Keyed by the deployment's secret (here derived from REDIS_URL and ADMIN_KEY).
+    expect(stored?.reporters).toEqual([clientId(ip, clientIdKey())]);
+    const unsalted = createHash('sha256').update(`couch-client:${ip}`).digest('hex').slice(0, 32);
+    expect(stored?.reporters).not.toContain(unsalted);
   });
 
   it('keeps a takedown made on another instance while this one has the game cached', async () => {
