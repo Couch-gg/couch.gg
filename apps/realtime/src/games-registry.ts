@@ -11,7 +11,8 @@
 // a stale cache can't undo a takedown or bring back a deleted game.
 //
 // Reports and probe failures count once per client (a hashed IP, see index.ts):
-// one person can't hide a game alone.
+// one person can't hide a game alone. Served thumbnails are sanitized, so a
+// record stored before the thumbnail rules still renders in the catalog.
 //
 // Security invariants (grep-enforced by the task):
 //   - the plaintext management token is returned exactly once, from submit(),
@@ -22,6 +23,7 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import {
   RESERVED_GAME_IDS,
+  sanitizeThumbnail,
   validateExternalManifestInput,
   type ExternalManifestInput
 } from '@couch/game-runtime';
@@ -403,9 +405,11 @@ export class GamesRegistry {
 }
 
 // Serialize a record for a public payload: the served manifest with the record's
-// featured flag folded in. NEVER includes managementTokenHash.
+// featured flag folded in and a thumbnail the catalog can render (a record
+// stored before the thumbnail rules gets the fallback look instead of leaving
+// the catalog). NEVER includes managementTokenHash.
 export function publicGame(record: PublishedGameRecord): ExternalGameManifest {
-  return { ...record.manifest, featured: record.featured };
+  return { ...record.manifest, thumbnail: sanitizeThumbnail(record.manifest.thumbnail), featured: record.featured };
 }
 
 // Admin view of a record: everything the operator needs to triage, minus the

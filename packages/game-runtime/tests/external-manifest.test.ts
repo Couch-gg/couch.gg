@@ -71,7 +71,7 @@ describe('validateExternalManifestInput — accept path', () => {
       },
       aspectRatio: '4:3',
       estimatedDurationMinutes: 1,
-      thumbnail: { kind: 'css', gradient: 'g', icon: 'i' },
+      thumbnail: { kind: 'css', gradient: 'linear-gradient(#000,#111)', icon: 'zap' },
       entryUrl: 'https://x.example.com',
       sdkProtocol: 1
     });
@@ -381,6 +381,54 @@ describe('thumbnail rules', () => {
   it('rejects empty / over-long icon', () => {
     expect(check((m) => (m.thumbnail.icon = '')).ok).toBe(false);
     expect(check((m) => (m.thumbnail.icon = 'x'.repeat(41))).ok).toBe(false);
+  });
+  it('accepts catalog icons in any case, with or without hyphens', () => {
+    for (const icon of ['zap', 'Zap', 'Gamepad2', 'gamepad-2', ' castle ']) {
+      expect(check((m) => (m.thumbnail.icon = icon)).ok).toBe(true);
+    }
+  });
+  it('rejects icon names outside the catalog list, like lucide internals', () => {
+    for (const icon of ['Icon', 'icons', 'createLucideIcon', 'default', '__proto__', 'ZapIcon']) {
+      const res = check((m) => (m.thumbnail.icon = icon));
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect(res.errors.join(' ')).toMatch(/thumbnail\.icon/);
+    }
+  });
+  it('rejects a gradient that would load something or add a layer', () => {
+    for (const gradient of [
+      'url(https://tracker.example/p.gif?x=1) center/cover',
+      'linear-gradient(red, blue), url(https://tracker.example/p.gif)',
+      'linear-gradient(red, blue) url(x)',
+      'image-set(url(x) 1x)',
+      'linear-gradient(var(--x), red)',
+      'linear-gradient(red, blue); color: red',
+      'linear-gradient("red", blue)',
+      'linear-gradient(\\75 rl(x), red)',
+      '#123456'
+    ]) {
+      const res = check((m) => (m.thumbnail.gradient = gradient));
+      expect(res.ok, gradient).toBe(false);
+      if (!res.ok) expect(res.errors.join(' ')).toMatch(/thumbnail\.gradient/);
+    }
+  });
+  it('accepts plain gradients with color functions', () => {
+    for (const gradient of [
+      'linear-gradient(160deg, #2a1b3d 0%, #5a2c42 60%, #e8554d 135%)',
+      'radial-gradient(circle at 30% 30%, rgba(255, 255, 255, 0.4), #101820)',
+      'conic-gradient(from 90deg, hsl(200 80% 50%), oklch(70% 0.1 30 / 50%), red)',
+      'repeating-linear-gradient(45deg, #000 0 10px, #222 10px 20px)'
+    ]) {
+      expect(check((m) => (m.thumbnail.gradient = gradient)).ok, gradient).toBe(true);
+    }
+  });
+  it('checks the optional accent color and keeps it trimmed', () => {
+    expect(check((m) => (m.thumbnail.accent = 'url(https://tracker.example/p)')).ok).toBe(false);
+    expect(check((m) => (m.thumbnail.accent = 42)).ok).toBe(false);
+    const res = check((m) => (m.thumbnail.accent = ' #f1cf6a '));
+    expect(res.ok).toBe(true);
+    if (res.ok) expect(res.value.thumbnail.accent).toBe('#f1cf6a');
+    expect(check((m) => (m.thumbnail.accent = 'gold')).ok).toBe(true);
+    expect(check((m) => (m.thumbnail.accent = 'rgb(255, 200, 0)')).ok).toBe(true);
   });
 });
 

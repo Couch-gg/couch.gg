@@ -487,9 +487,9 @@ numeric string is a type error, not a number. Strings are trimmed.
 | `aspectRatio` | string | `'16:9'` or `'4:3'`. |
 | `estimatedDurationMinutes` | integer | 1–60. |
 | `thumbnail.kind` | string | Must be `'css'`. |
-| `thumbnail.gradient` | string | 1–120 chars (a CSS gradient string). |
-| `thumbnail.icon` | string | 1–40 chars (an icon name). |
-| `thumbnail.accent` | string | Optional. |
+| `thumbnail.gradient` | string | 1–120 chars: one CSS `linear-`, `radial-` or `conic-gradient(...)` of colors, angles and stops. See 7.5. |
+| `thumbnail.icon` | string | One of the catalog icon names in 7.5 (case-insensitive). |
+| `thumbnail.accent` | string | Optional. The icon color: a hex color, a color name or an `rgb()`/`hsl()` color. |
 | `entryUrl` | string | See 7.2. |
 | `sdkProtocol` | number | Must be exactly `1`. |
 | `supportsRemote` | boolean | Optional; must be a boolean if present. See section 6. |
@@ -548,6 +548,35 @@ s, c, l, j, new, test
 
 `origin`, `status`, and `publishedAt` are stamped by the server on publish — do
 **not** include them yourself.
+
+### 7.5 Thumbnail icons and gradients
+
+Your catalog card is drawn on every TV and phone in the lobby, so the thumbnail
+only accepts known values.
+
+`thumbnail.icon` must be one of these names. Case and hyphens don't matter
+(`Gamepad2`, `gamepad2` and `gamepad-2` are the same icon):
+
+```
+atom, bike, bird, blocks, bomb, bot, brain, brush, bug, cake, car, castle,
+cat, coins, compass, crosshair, crown, dice5, dices, dog, drum, fish, flag,
+flame, gamepad, gamepad2, gem, ghost, globe, guitar, heart, joystick, key,
+laugh, lightbulb, magnet, map, medal, mic, moon, mountain, music, orbit,
+palette, partypopper, pencil, pizza, plane, puzzle, rabbit, rocket, shapes,
+shield, ship, skull, smile, snowflake, sparkles, star, sun, sword, swords,
+target, timer, trophy, turtle, wandsparkles, zap
+```
+
+`thumbnail.gradient` must be a single `linear-gradient(...)`,
+`radial-gradient(...)` or `conic-gradient(...)` (a `repeating-` one works too)
+built from colors, angles, positions and stops. Inside it, only the color
+functions `rgb()`, `rgba()`, `hsl()`, `hsla()`, `hwb()`, `lab()`, `lch()`,
+`oklab()` and `oklch()` are allowed: no `url()`, `image-set()`, `var()`, quotes
+or backslashes, and nothing after the closing parenthesis.
+
+Submitting or updating a manifest that breaks these rules fails with a 422. A
+game published before these rules keeps its catalog card, drawn with the
+`gamepad2` icon and a plain gradient in place of the values that aren't allowed.
 
 ---
 

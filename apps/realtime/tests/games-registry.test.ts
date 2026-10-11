@@ -1,11 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
+import { FALLBACK_THUMBNAIL_GRADIENT, FALLBACK_THUMBNAIL_ICON } from '@couch/game-runtime';
 import { InMemoryGamePersistence, type GamePersistence } from '../src/persistence.js';
 import {
   GamesRegistry,
   RegistryError,
+  adminGameView,
   publicGame,
-  type ProbeFn
+  type ProbeFn,
+  type PublishedGameRecord
 } from '../src/games-registry.js';
 
 // The shipped in-memory store, built directly so the suite is independent of
@@ -526,6 +529,53 @@ describe('request budget', () => {
     // Separate per client and per kind.
     expect(await a.allowRequest('report', 'client-b')).toBe(true);
     expect(await a.allowRequest('probe', 'client-a')).toBe(true);
+  });
+});
+
+describe('thumbnails', () => {
+  it('serves a record stored before the thumbnail rules with the fallback look', async () => {
+    const persistence = makePersistence();
+    const registry = new GamesRegistry(persistence);
+    const { record } = await submitTapRace(registry);
+    // As if published before icons and gradients were checked.
+    const legacy: PublishedGameRecord = structuredClone(record);
+    legacy.manifest.id = 'old-thumb';
+    legacy.manifest.thumbnail = {
+      kind: 'css',
+      gradient: 'url(https://tracker.example/p.gif?x=1) center/cover',
+      icon: 'createLucideIcon'
+    };
+    await persistence.createGame(legacy);
+    const fresh = new GamesRegistry(persistence);
+    await fresh.ensureFresh(30_000, 10_000_000);
+
+    const served = fresh.listPublic().find((game) => game.id === 'old-thumb');
+    expect(served?.thumbnail).toEqual({ kind: 'css', gradient: FALLBACK_THUMBNAIL_GRADIENT, icon: FALLBACK_THUMBNAIL_ICON });
+    expect(fresh.resolveById('old-thumb')?.thumbnail.icon).toBe(FALLBACK_THUMBNAIL_ICON);
+    expect(publicGame(legacy).thumbnail.gradient).toBe(FALLBACK_THUMBNAIL_GRADIENT);
+    // The admin view shows what is really stored.
+    expect(adminGameView(legacy).manifest.thumbnail.icon).toBe('createLucideIcon');
+  });
+
+  it('rejects a thumbnail the catalog cannot render on update', async () => {
+    const registry = new GamesRegistry(makePersistence());
+    const { managementToken } = await submitTapRace(registry);
+    await expect(
+      registry.update(
+        'tap-race',
+        managementToken,
+        manifestInput({ thumbnail: { kind: 'css', gradient: 'linear-gradient(#000,#111)', icon: 'Icon' } })
+      )
+    ).rejects.toMatchObject({ status: 422 });
+    await expect(
+      registry.submit(
+        manifestInput({
+          id: 'tracker',
+          thumbnail: { kind: 'css', gradient: 'url(https://tracker.example/p.gif)', icon: 'zap' }
+        }),
+        { probeFn: okProbe }
+      )
+    ).rejects.toMatchObject({ status: 422 });
   });
 });
 

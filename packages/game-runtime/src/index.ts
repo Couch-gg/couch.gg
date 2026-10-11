@@ -5,6 +5,16 @@ export {
   validateExternalManifestInput
 } from './external-manifest.js';
 export type { ExternalManifestInput } from './external-manifest.js';
+export {
+  FALLBACK_THUMBNAIL_GRADIENT,
+  FALLBACK_THUMBNAIL_ICON,
+  THUMBNAIL_ICONS,
+  isSafeThumbnailAccent,
+  isSafeThumbnailGradient,
+  sanitizeThumbnail,
+  thumbnailIconName
+} from './thumbnail.js';
+export type { ThumbnailIcon } from './thumbnail.js';
 
 export const TREBUCHET_MANIFEST: GameManifest = {
   id: 'trebuchet',

@@ -10,6 +10,8 @@
 // correct up front — there is NO coercion (a numeric string is a type error, not
 // a number). The returned value is normalized: strings are trimmed.
 
+import { isSafeThumbnailAccent, isSafeThumbnailGradient, thumbnailIconName } from './thumbnail.js';
+
 // Slugs a creator may not claim: the built-in games plus reserved route/API
 // segments that would collide with platform paths.
 export const RESERVED_GAME_IDS: readonly string[] = [
@@ -333,15 +335,23 @@ export function validateExternalManifestInput(
     if (thumbnail.kind !== 'css') {
       errors.push("thumbnail.kind must be 'css'");
     }
+    // The catalog renders these on every TV and phone, see ./thumbnail.ts.
     if (typeof thumbnail.gradient !== 'string') {
       errors.push('thumbnail.gradient must be a string');
-    } else if (thumbnail.gradient.length === 0 || thumbnail.gradient.length > 120) {
+    } else if (thumbnail.gradient.trim().length === 0 || thumbnail.gradient.trim().length > 120) {
       errors.push('thumbnail.gradient must be 1-120 characters');
+    } else if (!isSafeThumbnailGradient(thumbnail.gradient)) {
+      errors.push(
+        'thumbnail.gradient must be one linear-, radial- or conic-gradient(...) of colors, angles and stops (no url(), var() or image-set())'
+      );
     }
     if (typeof thumbnail.icon !== 'string') {
       errors.push('thumbnail.icon must be a string');
-    } else if (thumbnail.icon.length === 0 || thumbnail.icon.length > 40) {
-      errors.push('thumbnail.icon must be 1-40 characters');
+    } else if (thumbnailIconName(thumbnail.icon) === null) {
+      errors.push('thumbnail.icon must be a catalog icon such as "zap" or "gamepad2" (all names: guide section 7.5)');
+    }
+    if (thumbnail.accent !== undefined && !isSafeThumbnailAccent(thumbnail.accent)) {
+      errors.push('thumbnail.accent must be a hex color, a color name or an rgb()/hsl() color when present');
     }
   }
 
@@ -483,7 +493,7 @@ export function validateExternalManifestInput(
       kind: 'css',
       gradient: (normalizedThumb.gradient as string).trim(),
       icon: (normalizedThumb.icon as string).trim(),
-      ...(typeof normalizedThumb.accent === 'string' ? { accent: normalizedThumb.accent } : {})
+      ...(typeof normalizedThumb.accent === 'string' ? { accent: normalizedThumb.accent.trim() } : {})
     },
     entryUrl,
     sdkProtocol: 1
