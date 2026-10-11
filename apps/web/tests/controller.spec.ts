@@ -76,7 +76,7 @@ test('stick and d-pad send directions and always end with a release', async ({ b
   // Landscape hint: stick + d-pad in the left zone, FIRE in the right zone.
   await expect(alex.locator('.generic-zone-left [data-control="move"]')).toBeVisible();
   await expect(alex.locator('.generic-zone-left [data-control="aim"]')).toBeVisible();
-  await expect(alex.locator('.generic-zone-right').getByRole('button', { name: 'FIRE' })).toBeVisible();
+  await expect(alex.locator('.generic-zone-right [data-control="fire"]')).toBeVisible();
 
   await alex.screenshot({ path: test.info().outputPath('landscape-controller.png') });
 
@@ -124,17 +124,44 @@ test('a held button is released when the phone is backgrounded', async ({ browse
   test.setTimeout(120_000);
   const { tv, alex, bea, log } = await startInputLab(browser);
 
-  const fire = alex.getByRole('button', { name: 'FIRE' });
-  const box = (await fire.boundingBox())!;
+  const jump = alex.locator('[data-control="jump"]');
+  const box = (await jump.boundingBox())!;
   await alex.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
   await alex.mouse.down();
-  await expect.poll(async () => (await logLines(log)).filter((l) => l.control === 'fire').length).toBe(1);
+  await expect.poll(async () => (await logLines(log)).filter((l) => l.control === 'jump').length).toBe(1);
 
   // The phone locks mid-press: no pointerup ever arrives.
   await alex.evaluate(() => window.dispatchEvent(new Event('blur')));
 
   await expect
-    .poll(async () => (await logLines(log)).filter((l) => l.control === 'fire').map((l) => l.action), { timeout: 10_000 })
+    .poll(async () => (await logLines(log)).filter((l) => l.control === 'jump').map((l) => l.action), { timeout: 10_000 })
+    .toEqual(['press', 'release']);
+
+  await tv.close();
+  await alex.close();
+  await bea.close();
+});
+
+test('the game labels each phone and runs cooldowns on it (couch.setController)', async ({ browser }) => {
+  test.setTimeout(120_000);
+  const { tv, alex, bea, log } = await startInputLab(browser);
+
+  // Each hero gets its own label for the same control.
+  const alexFire = alex.locator('[data-control="fire"]');
+  const beaFire = bea.locator('[data-control="fire"]');
+  await expect(alexFire).toHaveText('SHIELD', { timeout: 10_000 });
+  await expect(beaFire).toHaveText('ROLL', { timeout: 10_000 });
+
+  // Firing starts a 1.5s cooldown on that player's phone only.
+  await alexFire.click();
+  await expect(alexFire).toBeDisabled({ timeout: 5_000 });
+  await expect(alex.locator('[data-control="fire"] .generic-cooldown')).toBeVisible();
+  await expect(beaFire).toBeEnabled();
+  await expect(alexFire).toBeEnabled({ timeout: 5_000 });
+
+  // The press and its release both reached the game.
+  await expect
+    .poll(async () => (await logLines(log)).filter((l) => l.control === 'fire').map((l) => l.action))
     .toEqual(['press', 'release']);
 
   await tv.close();

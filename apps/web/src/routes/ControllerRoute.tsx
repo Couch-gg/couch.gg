@@ -14,7 +14,7 @@ import {
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState, type FormEvent, type MutableRefObject, type PointerEvent } from 'react';
 import type { Socket } from 'socket.io-client';
-import type { GameManifest, InputAction, JoinLobbyResponse, Lobby, Player, RenamePlayerResponse } from '@couch/types';
+import type { ControllerState, GameManifest, InputAction, JoinLobbyResponse, Lobby, Player, RenamePlayerResponse } from '@couch/types';
 import {
   CHARGE_TIME_MS,
   ELEV_MAX,
@@ -142,6 +142,15 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     const nextSocket = createSocket();
     setSocket(nextSocket);
     nextSocket.on('lobby:snapshot', (next: Lobby) => setLobby(next));
+    // A game updated one player's controller (couch.setController). Merge it in
+    // right away; the next snapshot/poll carries the same state.
+    nextSocket.on('controller:state', ({ playerId, state }: { playerId: string; state: ControllerState }) =>
+      setLobby((prev) =>
+        prev && (prev.controllerState?.[playerId]?.seq ?? 0) < state.seq
+          ? { ...prev, controllerState: { ...prev.controllerState, [playerId]: state } }
+          : prev
+      )
+    );
     nextSocket.on('game:event', (p: { seq: number; event: TrebuchetEvent }) => applyGameEvent(p.seq, p.event));
 
     // Re-register this controller on every (re)connect. A phone that locks or sleeps
@@ -761,7 +770,12 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
             </div>
           </div>
         ) : isGenericLayout && currentManifest ? (
-          <GenericController layout={currentManifest.controllerLayout} enabled onEvent={sendGenericEvent} />
+          <GenericController
+            layout={currentManifest.controllerLayout}
+            enabled
+            onEvent={sendGenericEvent}
+            state={player ? lobby?.controllerState?.[player.id] : undefined}
+          />
         ) : (
           <div className="trebuchet-controls retro-pad" style={{ ['--team' as never]: teamHex }}>
             <div className="retro-pad-shell">

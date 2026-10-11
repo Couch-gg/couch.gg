@@ -187,6 +187,7 @@ interface CouchGame {
 
   on<E>(event: E, cb: (payload) => void): () => void;  // returns an unsubscribe fn
   gameOver(scores: CouchScore[] | Record<string, number>): void;  // call ONCE
+  setController(playerId: string, patch: CouchControllerPatch): void;  // section 4.6
 }
 ```
 
@@ -255,6 +256,39 @@ couch.gameOver({ p1: 30, p2: 12 });
 - **Call it exactly once.** A second call logs a warning and is ignored.
 - After this, the platform shows your winner screen for ~5 seconds, then returns
   to the catalog (section 9).
+
+### 4.6 `setController` — talk back to a player's phone
+
+Every phone starts with the labels from your manifest. When players have
+different roles, tell each phone what its buttons do:
+
+```ts
+// Co-op: the knight blocks and bashes, the ranger fires and rolls.
+couch.setController(knight.id, { labels: { a: 'SHIELD', b: 'BASH' } });
+couch.setController(ranger.id, { labels: { a: 'FIRE', b: 'ROLL' } });
+
+// After BASH: grey it out for 3 s and buzz the phone.
+couch.setController(knight.id, { cooldowns: { b: 3000 }, vibrate: 60 });
+
+// Out of arrows: disable FIRE until further notice; [] re-enables everything.
+couch.setController(ranger.id, { disabled: ['a'] });
+```
+
+| Field | Type | Behaviour |
+|-------|------|-----------|
+| `labels` | `Record<control, string>` | Replaces this player's labels (1–16 chars each). Persists until you change it. |
+| `disabled` | `control[]` | Replaces the set of greyed-out controls. Persists. |
+| `cooldowns` | `Record<control, ms>` | Starts a cooldown now (≤ 60 000 ms); the button drains and ignores presses until it ends. One-shot. |
+| `vibrate` | `ms` or `ms[]` | Vibrates once (≤ 10 steps of ≤ 1000 ms), where the phone supports it. One-shot. |
+
+- Omitted fields keep their current value; control names must be ones your
+  manifest declares, or the platform rejects the patch (the reason is logged in
+  the TV's console).
+- A control that becomes disabled while held sends its `release`, so you never
+  get a stuck input from it.
+- Everything resets when a new round starts. In the dev simulator the fake
+  phones show labels, disabled controls and cooldowns too.
+- Budget: about 20 updates per second per lobby. Send changes, not every frame.
 
 ---
 
@@ -507,6 +541,8 @@ From `rate-limit.ts`, `lobbies.ts`, and `GameHostStage.tsx`:
   number, a short string).
 - **Inbound message size (game → host)**: messages you post to the host are
   capped at **8192 bytes** (serialized); oversized messages are dropped.
+- **Controller updates (`setController`)**: capacity **40**, refill **20 per
+  second** per lobby; extra updates are dropped.
 - **Inbound message rate (game → host)**: **60 messages per rolling second**;
   beyond that they are dropped.
 - **Handshake / ready timeout**: **15 seconds**. If the host does not receive

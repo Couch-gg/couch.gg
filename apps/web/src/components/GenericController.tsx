@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type PointerEvent, type ReactElement } from 'react';
-import type { ControllerLayout, InputAction } from '@couch/types';
+import type { ControllerLayout, ControllerState, InputAction } from '@couch/types';
 
 // Manifest-driven phone controller for external games. Renders whatever
 // controls the game's manifest declares (button/hold/slider/select) with zero
@@ -23,14 +23,25 @@ interface GenericControllerProps {
   layout: ControllerLayout;
   enabled: boolean;
   onEvent: (control: string, action: InputAction, data?: unknown) => void;
+  /** What the running game set for this player (couch.setController). */
+  state?: ControllerState;
 }
 
-export function GenericController({ layout, enabled, onEvent }: GenericControllerProps) {
+export function GenericController({ layout, enabled, onEvent, state }: GenericControllerProps) {
   const controls = layout.controls ?? [];
+  const cooldowns = useGameCooldowns(state);
+  const disabled = new Set(state?.disabled ?? []);
 
   const render = (control: LayoutControl) => {
     const key = control.control;
-    const base = { control: control.control, label: control.label, enabled, onEvent };
+    const cooldown = cooldowns[control.control];
+    const base = {
+      control: control.control,
+      label: state?.labels[control.control] ?? control.label,
+      enabled: enabled && !disabled.has(control.control) && !cooldown,
+      cooldown,
+      onEvent
+    };
     switch (control.type) {
       case 'stick':
         return <StickControl key={key} {...base} />;
@@ -107,6 +118,60 @@ function PortraitLayout({ controls, render }: { controls: LayoutControl[]; rende
   );
 }
 
+// One-shot effects from couch.setController: each new `seq` starts its cooldowns
+// (counted from now) and plays its vibration once. The seq present at mount is
+// treated as already played, so a phone that reloads mid-game doesn't replay it.
+// Returns the remaining fraction (1 -> 0) per cooling control.
+function useGameCooldowns(state: ControllerState | undefined): Record<string, number> {
+  const appliedSeqRef = useRef(state?.seq ?? 0);
+  const [timers, setTimers] = useState<Record<string, { until: number; total: number }>>({});
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!state || state.seq <= appliedSeqRef.current) return;
+    appliedSeqRef.current = state.seq;
+    const start = Date.now();
+    const entries = Object.entries(state.cooldowns ?? {}).filter(([, ms]) => ms > 0);
+    if (entries.length) {
+      setTimers((prev) => {
+        const next = { ...prev };
+        for (const [control, ms] of entries) next[control] = { until: start + ms, total: ms };
+        return next;
+      });
+      setNow(start);
+    }
+    if (state.vibrate?.length) haptic(state.vibrate);
+  }, [state]);
+
+  const active = Object.values(timers).some((timer) => timer.until > now);
+  useEffect(() => {
+    if (!active) return;
+    const tick = window.setInterval(() => setNow(Date.now()), 100);
+    return () => window.clearInterval(tick);
+  }, [active]);
+
+  const remaining: Record<string, number> = {};
+  for (const [control, timer] of Object.entries(timers)) {
+    if (timer.until > now) remaining[control] = (timer.until - now) / timer.total;
+  }
+  return remaining;
+}
+
+// A control that gets disabled mid-press (a cooldown starts, the game greys it
+// out) stops receiving pointer events, so release it ourselves.
+function useReleaseOnDisable(enabled: boolean, release: () => void): void {
+  const releaseRef = useRef(release);
+  releaseRef.current = release;
+  useEffect(() => {
+    if (!enabled) releaseRef.current();
+  }, [enabled]);
+}
+
+function CooldownFill({ fraction }: { fraction?: number }) {
+  if (!fraction) return null;
+  return <span className="generic-cooldown" style={{ height: `${fraction * 100}%` }} aria-hidden="true" />;
+}
+
 // Calls `release` when the phone stops being usable mid-press: screen lock, app
 // switch, tab hidden, window blur. Without this a pointer that never gets its
 // pointerup leaves the control held on the TV.
@@ -146,10 +211,12 @@ interface ControlBaseProps {
   control: string;
   label: string;
   enabled: boolean;
+  /** Remaining cooldown fraction (1 -> 0) while a game cooldown runs. */
+  cooldown?: number;
   onEvent: (control: string, action: InputAction, data?: unknown) => void;
 }
 
-function ButtonControl({ control, label, enabled, onEvent }: ControlBaseProps) {
+function ButtonControl({ control, label, enabled, cooldown, onEvent }: ControlBaseProps) {
   const activeRef = useRef(false);
 
   const press = (event: PointerEvent<HTMLButtonElement>) => {
@@ -166,11 +233,13 @@ function ButtonControl({ control, label, enabled, onEvent }: ControlBaseProps) {
     onEvent(control, 'release');
   };
   useReleaseOnHide(release);
+  useReleaseOnDisable(enabled, release);
 
   return (
     <button
       type="button"
       className="generic-btn"
+      data-control={control}
       disabled={!enabled}
       onPointerDown={press}
       onPointerUp={release}
@@ -179,12 +248,13 @@ function ButtonControl({ control, label, enabled, onEvent }: ControlBaseProps) {
       onContextMenu={(e) => e.preventDefault()}
       aria-label={label}
     >
+      <CooldownFill fraction={cooldown} />
       <span className="generic-btn-label">{label}</span>
     </button>
   );
 }
 
-function HoldControl({ control, label, enabled, onEvent }: ControlBaseProps) {
+function HoldControl({ control, label, enabled, cooldown, onEvent }: ControlBaseProps) {
   const [charging, setCharging] = useState(false);
   const [progress, setProgress] = useState(0);
   const startRef = useRef<number | null>(null);
@@ -236,11 +306,13 @@ function HoldControl({ control, label, enabled, onEvent }: ControlBaseProps) {
     onEvent(control, 'release', { heldMs });
   };
   useReleaseOnHide(end);
+  useReleaseOnDisable(enabled, end);
 
   return (
     <button
       type="button"
       className={`generic-btn generic-hold${charging ? ' charging' : ''}`}
+      data-control={control}
       disabled={!enabled}
       onPointerDown={begin}
       onPointerUp={end}
@@ -250,6 +322,7 @@ function HoldControl({ control, label, enabled, onEvent }: ControlBaseProps) {
       aria-label={label}
     >
       <span className="generic-hold-fill" style={{ width: `${progress * 100}%` }} aria-hidden="true" />
+      <CooldownFill fraction={cooldown} />
       <span className="generic-btn-label">{label}</span>
     </button>
   );
@@ -473,6 +546,7 @@ function StickControl({ control, label, enabled, onEvent }: ControlBaseProps) {
     onEvent(control, 'release', { x: 0, y: 0 });
   };
   useReleaseOnHide(release);
+  useReleaseOnDisable(enabled, release);
 
   return (
     <div className="generic-stick-wrap">
@@ -554,6 +628,7 @@ function DpadControl({ control, label, enabled, onEvent }: ControlBaseProps) {
     apply('none');
   };
   useReleaseOnHide(release);
+  useReleaseOnDisable(enabled, release);
 
   return (
     <div className="generic-stick-wrap">
