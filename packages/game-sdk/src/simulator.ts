@@ -1,9 +1,10 @@
 /**
  * Dev simulator — the built-in overlay shown when a game runs standalone
- * (top-level, `mode: 'dev'`). Vanilla DOM only; styles are injected via one
- * inline <style> (no CSS imports, so it works from file:// and inside LLM
- * sandboxes). Every fake input is stamped with an incrementing `seq` and
- * dispatched through the SAME core funnel as live `couch:input` messages.
+ * (top-level, `mode: 'dev'`, or in an iframe no couch.gg host answers). Vanilla
+ * DOM only; styles are injected via one inline <style> (no CSS imports, so it
+ * works from file:// and inside LLM sandboxes). Every fake input is stamped with
+ * an incrementing `seq` and dispatched through the SAME core funnel as live
+ * `couch:input` messages.
  */
 
 import type {
@@ -24,7 +25,8 @@ export interface SimulatorCore {
   readonly seed: string;
   setSeed(seed: string): void;
   dispatchInput(input: CouchInputEnvelope): void;
-  setPlayers(players: CouchPlayer[]): void;
+  /** Set the starting roster without a playersChanged, like couch:init. */
+  seedPlayers(players: CouchPlayer[]): void;
   addPlayer(player: CouchPlayer): void;
   removePlayer(playerId: string): void;
   pause(reason: string): void;
@@ -123,7 +125,7 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
     colorIdx: idx,
     connected: true
   });
-  core.setPlayers([makePlayer(0), makePlayer(1)]);
+  core.seedPlayers([makePlayer(0), makePlayer(1)]);
 
   // ---- root overlay -----------------------------------------------------
   const root = document.createElement('div');
