@@ -80,7 +80,11 @@ export type CouchInputAction = 'press' | 'release' | 'change';
 export interface CouchInputEnvelope {
   /** Monotonic per-lobby sequence number. Host guarantees strict ordering. */
   seq: number;
-  /** Milliseconds timestamp (host clock) when the input was recorded. */
+  /**
+   * When the realtime server accepted the input (ms since epoch, server clock;
+   * the local clock in the dev simulator). Compare it only with other inputs'
+   * `at`, not with `Date.now()`: the screen's clock can be off by seconds.
+   */
   at: number;
   /** Which player produced the input. */
   playerId: string;

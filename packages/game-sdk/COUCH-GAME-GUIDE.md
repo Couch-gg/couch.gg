@@ -100,8 +100,10 @@ non-negotiable, and it has hard consequences:
 
    You can avoid the fetch entirely by inlining the manifest as a JS object and
    passing it straight to `CouchSDK.init({ manifest })` — the SDK never fetches
-   it for you. The starter template fetches it (with the CORS note) to keep one
-   source of truth, but inlining is a valid choice.
+   it for you. The quick start below does that. The starter template fetches
+   `couch.game.json` (with the CORS note) to keep one source of truth, and falls
+   back to a copy inside `index.html` when the fetch fails, because browsers
+   refuse `fetch()` on a page opened from disk (`file://`).
 
 5. **Autoplay audio is allowed** (`allow="autoplay"`), but start muted or on the
    first input to respect browser policies.
@@ -119,8 +121,15 @@ skeleton:
 <body>
   <script src="https://couch-gg.vercel.app/sdk/v1/couch-sdk.js"></script>
   <script>
+    // Inlined, not fetched, so the page also runs when opened from disk
+    // (browsers refuse fetch() on file://). Keep it in step with couch.game.json.
+    const manifest = {
+      id: 'tap-race', title: 'Tap Race', description: 'First to 30 taps wins.',
+      minPlayers: 1, maxPlayers: 8, aspectRatio: '16:9', estimatedDurationMinutes: 2,
+      controllerLayout: { kind: 'generic-buttons', controls: [{ control: 'tap', type: 'button', label: 'TAP!' }] },
+      entryUrl: 'https://your-host.example.com/index.html', sdkProtocol: 1
+    };
     async function main() {
-      const manifest = await (await fetch('./couch.game.json')).json();
       const couch = await CouchSDK.init({
         manifest,
         onInput(input) {
@@ -128,9 +137,10 @@ skeleton:
           console.log(input.playerId, 'pressed', input.control);
         },
         onPlayersChanged(players) {
-          console.log('roster:', players.map((p) => p.name));
+          console.log('roster now:', players.map((p) => p.name));
         }
       });
+      console.log('starting roster:', couch.players.map((p) => p.name));
       // ... render your game using couch.players, couch.seed, etc.
     }
     main();
@@ -141,10 +151,16 @@ skeleton:
 
 `CouchSDK.init` **resolves when the platform host has finished the handshake**
 (embedded) or **immediately with the built-in dev simulator** (when you open the
-file directly at top level). It never rejects — the host owns timeout UX.
+file directly at top level). It never rejects — the host owns timeout UX. In an
+iframe that no couch.gg host answers (an online code playground, an AI chat's
+preview pane), it waits about 10 seconds for one, logs a warning and then starts
+the dev simulator inside that frame.
 
 The SDK global is `CouchSDK` (an IIFE bundle). The URL
-`https://couch-gg.vercel.app/sdk/v1/couch-sdk.js` is stable.
+`https://couch-gg.vercel.app/sdk/v1/couch-sdk.js` is stable: `/sdk/v1/` is
+updated in place with backward-compatible changes, so a game that hot-links it
+gets SDK fixes without redeploying. A copy you download and serve yourself stays
+at the version you copied.
 
 ---
 
@@ -168,6 +184,8 @@ interface CouchInitOptions {
 ```
 
 The convenience callbacks are exactly equivalent to subscribing via `couch.on(...)`.
+Like every event, they only report what happens after `init` resolves: the
+starting roster is `couch.players`, not an `onPlayersChanged` call.
 
 ### 4.2 The `CouchGame` handle
 
@@ -211,10 +229,10 @@ interface CouchGame {
 | Event            | Payload                        | When |
 |------------------|--------------------------------|------|
 | `input`          | `CouchInputEnvelope`           | A player used a control. |
-| `playersChanged` | `CouchPlayer[]` (full roster)  | Any join/leave/rename/connect change. |
+| `playersChanged` | `CouchPlayer[]` (full roster)  | Any join/leave/rename/connect change after init. Not fired for the starting roster: read `couch.players` once `init` resolves. |
 | `pause`          | `{ reason: string }`           | Host tab hidden (`reason: 'host-hidden'`). |
 | `resume`         | `void`                         | Host tab visible again. |
-| `abort`          | `{ reason: string }`           | Session torn down (`reason: 'host-unmounted'`). |
+| `abort`          | `{ reason: string }`           | Session torn down (`reason: 'host-unmounted'`), once, as your frame is removed (section 8). |
 | `state`          | `{ epoch, seq, at, state }`    | Non-host screens: a snapshot from the host screen (section 6). |
 | `screenChanged`  | `{ id, isHost }`               | This screen became (or stopped being) the host screen. |
 
@@ -225,6 +243,10 @@ const off = couch.on('input', (e) => { /* ... */ });
 
 Note: `pause`/`resume`/`abort` have no convenience-callback slot except pause and
 resume — subscribe to `abort` explicitly via `on('abort', ...)` if you need it.
+
+A listener that throws is logged with `console.error` and does not stop the
+other listeners of that event. `on()` with an event name this SDK doesn't know
+logs a warning and returns an unsubscribe function that does nothing.
 
 ### 4.4 Types
 
@@ -238,7 +260,7 @@ interface CouchPlayer {
 
 interface CouchInputEnvelope {
   seq: number;        // monotonic per-lobby sequence — host guarantees strict order
-  at: number;         // host-clock timestamp in MILLISECONDS
+  at: number;         // ms since epoch when the realtime SERVER accepted it — compare only with other inputs' `at`
   playerId: string;   // authoritative; derived server-side from the player's token
   control: string;    // matches a manifest controllerLayout.controls[].control
   action: 'press' | 'release' | 'change';
@@ -296,6 +318,11 @@ couch.setController(ranger.id, { disabled: ['a'] });
   get a stuck input from it.
 - Everything resets when a new round starts. In the dev simulator the fake
   phones show labels, disabled controls and cooldowns too.
+- The dev simulator and the `/dev` test harness check each patch with the same
+  rules as the platform (known control names, labels 1–16 characters, the limits
+  in the table, a player id from `couch.players`). A patch that breaks one is
+  rejected whole, and the reason shows in the browser console (simulator) or
+  under the test stage (`/dev`).
 - Budget: about 20 updates per second per lobby. Send changes, not every frame.
 - In a remote couch every screen may run your code; the platform only forwards
   the host screen's `setController` calls (`couch.screen.isHost`), so each one
@@ -356,16 +383,19 @@ games: the phone then shows a left and a right thumb zone. Sticks and d-pads go
 left and everything else right, unless a control sets `zone: 'left' | 'right'`.
 
 The dev simulator emits the **same** shapes, so what you test locally matches
-production.
+production — from its fake phones and from the keyboard alike.
 
 ### 5.3 Ordering and timestamps
 
 - `seq` is a **strict monotonic per-lobby** counter. The host guarantees order.
   Use it to break ties or to ignore stale inputs; `couch.lastSeq` tracks the
   latest.
-- `at` is a **millisecond** timestamp on the host clock. (The wire format inside
-  the platform is an ISO string, but the SDK hands you a number — do not
-  re-parse it.)
+- `at` is a **millisecond** timestamp (ms since epoch) taken by the realtime
+  **server** when it accepted the input. (The wire format inside the platform is
+  an ISO string, but the SDK hands you a number — do not re-parse it.) Compare it
+  only with other inputs' `at`, e.g. to see who buzzed first; `at - Date.now()`
+  on the big screen is off by however far that screen's clock is from the
+  server's. In the dev simulator it is the local clock.
 - `playerId` is authoritative and server-derived. Never trust a client-supplied
   player id; use the envelope's `playerId`.
 
@@ -553,8 +583,11 @@ s, c, l, j, new, test
 
 ## 8. Player lifecycle
 
-- **1–8 players**, bounded by your `minPlayers`/`maxPlayers`. The platform will
-  not start below `minPlayers` and will not admit above `maxPlayers`.
+- **1–8 players**, bounded by your `minPlayers`/`maxPlayers`. The host can start
+  your game once `minPlayers` players have joined, and the platform will not
+  admit more than `maxPlayers`.
+- The starting roster is `couch.players` when `init` resolves; `playersChanged`
+  does not fire for it.
 - Players **join and leave mid-game**. You are notified via `playersChanged`
   (full roster) every time the roster changes. Re-read `couch.players` or use the
   payload — do not assume the roster you saw at init is final.
@@ -564,13 +597,16 @@ s, c, l, j, new, test
 - **`pause` / `resume`**: the host fires `pause` (`reason: 'host-hidden'`) when
   the big-screen tab is backgrounded and `resume` when it returns. Pause your
   animation loop and timers so nothing advances while nobody can see it.
-- **`abort`** (`reason: 'host-unmounted'`) fires when the session is torn down
-  (lobby closed, game switched). Stop everything; do not call `gameOver` after an
-  abort.
+- **`abort`** (`reason: 'host-unmounted'`) fires once when the session is torn
+  down (lobby closed, game switched, or the stage closing after your game-over
+  screen). Stop everything; do not call `gameOver` after an abort. The SDK fires
+  it from your page's `pagehide` as the frame is removed, so keep the handler
+  short and synchronous: timers or requests it starts may never complete.
 
 Design guidance: key every bit of per-player state off `player.id` (never array
 index — indices shift when someone leaves). Handle a player count of 1 gracefully
-(solo play against the clock or a target), since `minPlayers` can be 1.
+(solo play against the clock or a target): with `minPlayers: 1` the host can
+start alone, and in any game the others can leave until one player remains.
 
 ---
 
@@ -637,11 +673,28 @@ server) so it runs **at the top level** (not inside an iframe). Because
 overlay with fake phones, add/remove-player buttons, pause/resume, and a seed
 box. `CouchSDK.init` resolves immediately with `mode: 'dev'`.
 
-- The simulator seeds **2 fake players** and renders one fake phone per player
-  with your declared controls.
+Browsers refuse `fetch()` on a page opened from disk, so a game that fetches
+`couch.game.json` stays blank there. Inline the manifest (as the quick start
+does), fall back to an inline copy when the fetch fails (as the starter
+template does), or serve the folder with any static server (`npx serve .`).
+
+Inside an iframe that is not a couch.gg screen (an online playground, an AI
+chat's preview), the SDK first waits about 10 seconds for a couch.gg host, then
+logs a warning and starts the same simulator in the frame. Open the page
+top-level to skip the wait.
+
+- The simulator starts with **2 fake players** (in `couch.players` when `init`
+  resolves) and renders one fake phone per player with your declared controls.
 - Player 1 also takes **keyboard** input: number keys `1`–`9` press the Nth
   button/hold control, `Space` holds the first hold control, `Arrow Up/Down`
-  nudge the first slider, `W`/`A`/`S`/`D` steer the first stick or d-pad.
+  nudge the first slider, `W`/`A`/`S`/`D` steer the first stick or d-pad. A
+  hold sends the same `change` ticks and `release` `{ heldMs }` from the
+  keyboard as from its fake phone.
+- The seed box: type a seed and press Enter to set `couch.seed`. Your game sees
+  it the next time it reads `couch.seed` (e.g. when it starts a new round);
+  reload for a new random seed.
+- `couch.setController` is checked as on the platform (section 4.6): a patch the
+  platform would reject logs the reason with `console.error` and changes nothing.
 - Calling `couch.gameOver(scores)` shows a game-over toast in the simulator.
 
 This is the fastest loop and the one your coding agent should use to iterate.
@@ -735,7 +788,8 @@ So the practical rule: keep your `entryUrl` live and make sure `init()` reaches
       manifest).
 - [ ] No `localStorage` / `cookie` / `alert` / `window.open` anywhere.
 - [ ] All per-player state keyed off `player.id`.
-- [ ] `playersChanged` handled (join/leave mid-game).
+- [ ] The starting roster is drawn from `couch.players` after `init`, and
+      `playersChanged` handled (join/leave mid-game).
 - [ ] A winner/results screen is drawn, and it reads well for ~5 s after
       `gameOver`.
 - [ ] `gameOver(scores)` called exactly once, higher score = better.
@@ -751,6 +805,13 @@ So the practical rule: keep your `entryUrl` live and make sure `init()` reaches
   `Access-Control-Allow-Origin: *`.
   Fix: add the wildcard CORS header (section 2), or inline the manifest and skip
   the fetch.
+
+- **Blank page when you open `index.html` from disk; the console says the `file`
+  URL scheme is not supported (Chrome/Edge) or "CORS request not HTTP" (Firefox).**
+  Cause: browsers refuse `fetch()` on `file://` pages, so fetching
+  `couch.game.json` throws before `CouchSDK.init` runs.
+  Fix: inline the manifest, fall back to an inline copy (the starter template
+  does), or serve the folder with a static server (`npx serve .`).
 
 - **Game throws immediately, often `SecurityError`.**
   Cause: something touched `localStorage` / `sessionStorage` / `document.cookie`
