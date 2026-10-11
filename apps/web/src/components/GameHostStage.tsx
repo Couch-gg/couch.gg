@@ -154,6 +154,10 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
   const screenIdRef = useRef(screenId);
   screenIdRef.current = screenId;
   const screenKeyRef = useRef('');
+  // One run of this screen's broadcasts: receivers restart their seq check
+  // when it changes, so a reloaded host isn't ignored until it passes its old
+  // counter. Random per mount; never derived from the clock (TVs disagree).
+  const epochRef = useRef(Math.random().toString(36).slice(2, 12));
   const broadcastSeqRef = useRef(0);
   const socketRef = useRef<Socket | null | undefined>(socket);
   const onEventRef = useRef(onEvent);
@@ -312,11 +316,16 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
           if (modeRef.current === 'test') break; // one screen in /dev: nobody to tell
           const sock = socketRef.current;
           if (!sock) break;
+          // Only other screens receive it: nobody to tell on a one-screen couch.
+          if ((lobbyRef.current.screens?.length ?? 0) < 2) break;
           broadcastSeqRef.current += 1;
           // Fire-and-forget at frame rate: no ack wait; the server rejects a
-          // non-host screen, which the SDK already prevents.
-          sock.emit('game:state', {
+          // non-host screen, which the SDK already prevents. Volatile: each
+          // snapshot replaces the last, so while the socket is down frames are
+          // dropped instead of buffered and flushed all at once on reconnect.
+          sock.volatile.emit('game:state', {
             slug: lobbyRef.current.slug,
+            epoch: epochRef.current,
             seq: broadcastSeqRef.current,
             state: (msg as { state?: unknown }).state ?? null
           });

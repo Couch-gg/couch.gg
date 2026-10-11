@@ -218,9 +218,22 @@ test('REMOTE host mode: the host screen broadcasts, the other screen renders it'
   const jump = bea.locator('[data-control="jump"]');
   await jump.click();
   await jump.click();
-  await expect(guestFrame.locator('[data-testid="mirror"]')).toHaveText('inputs:2', { timeout: 10_000 });
+  const mirror = guestFrame.locator('[data-testid="mirror"]');
+  await expect(mirror).toHaveText('inputs:2', { timeout: 10_000 });
   // The host never receives its own broadcast.
   await expect(hostFrame.locator('[data-testid="mirror"]')).toHaveText('');
+
+  // The host TV reloads mid-game (same screen id and token). Its new broadcast
+  // run starts again at seq 1; the mirror must take it right away instead of
+  // dropping everything until the new counter passes the old one.
+  await expect.poll(async () => Number(await mirror.getAttribute('data-seq')), { timeout: 15_000 }).toBeGreaterThan(40);
+  const epochBefore = await mirror.getAttribute('data-epoch');
+  const seqBefore = Number(await mirror.getAttribute('data-seq'));
+  await hostTv.reload();
+  await expect(hostFrame.locator('[data-testid="screen-role"]')).toHaveText('host', { timeout: 20_000 });
+  await expect.poll(() => mirror.getAttribute('data-epoch'), { timeout: 10_000 }).not.toBe(epochBefore);
+  expect(Number(await mirror.getAttribute('data-first-seq'))).toBeLessThan(seqBefore);
+  await expect(guestFrame.locator('[data-testid="screen-role"]')).toHaveText('mirror');
 
   for (const page of [hostTv, guestTv, alex, bea]) await page.close();
 });

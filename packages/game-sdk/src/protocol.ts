@@ -57,7 +57,12 @@ export interface CouchScreen {
 
 /** A state broadcast from the host screen, as a non-host screen receives it. */
 export interface CouchStateEnvelope<TState = unknown> {
-  /** The host's broadcast counter; strictly increasing, older ones are dropped. */
+  /**
+   * Identifies one run of the host screen's game: it changes when the host TV
+   * reloads or another screen becomes the host, and `seq` restarts with it.
+   */
+  epoch: string;
+  /** The host's broadcast counter within `epoch`; strictly increasing, older ones are dropped. */
   seq: number;
   /** Server time (ms) the broadcast passed through. */
   at: number;

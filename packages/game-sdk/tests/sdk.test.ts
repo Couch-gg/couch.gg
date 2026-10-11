@@ -255,6 +255,39 @@ describe('CouchSDK host-authoritative mode', () => {
     h.restore();
   });
 
+  it('restarts the seq check when the epoch changes (host reloaded or moved)', async () => {
+    const h = embed();
+    const p = CouchSDK.init({ manifest });
+    h.deliver(initMessage({ latencyTier: 'remote', players: seated, screen: { id: 'scr_b', isHost: false } }));
+    const couch = await p;
+    const seen: string[] = [];
+    couch.on('state', (e) => seen.push(`${e.epoch}:${e.seq}`));
+
+    const state = (epoch: string, seq: number) =>
+      h.deliver({ v: 1, type: 'couch:state', envelope: { epoch, seq, at: 0, state: {} } });
+    for (let seq = 1; seq <= 500; seq++) state('first', seq);
+    // The host TV reloads: a new run whose counter starts at 1 again.
+    state('second', 1);
+    state('second', 2);
+    state('second', 2);
+    expect(seen.slice(-3)).toEqual(['first:500', 'second:1', 'second:2']);
+    h.restore();
+  });
+
+  it('warns once, not every frame, when a non-host screen broadcasts', async () => {
+    const h = embed();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const p = CouchSDK.init({ manifest });
+    h.deliver(initMessage({ latencyTier: 'remote', players: seated, screen: { id: 'scr_b', isHost: false } }));
+    const couch = await p;
+    const before = h.posted.length;
+    for (let i = 0; i < 30; i++) couch.broadcast({ i });
+    expect(h.posted.length).toBe(before);
+    expect(warn.mock.calls.filter((call) => String(call[0]).includes('broadcast()'))).toHaveLength(1);
+    warn.mockRestore();
+    h.restore();
+  });
+
   it('a local couch (or an older host without screen info) is the host and seats everyone', async () => {
     const h = embed();
     const p = CouchSDK.init({ manifest });

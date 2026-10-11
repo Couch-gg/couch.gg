@@ -94,7 +94,7 @@ describe('host screens (host-authoritative broadcast)', () => {
 
     expect((await ack(tvA, 'game:state', { slug, epoch: 'run1', seq: 1, state: { x: 5 } })).ok).toBe(true);
     await expect.poll(() => atGuest.length).toBe(1);
-    expect(atGuest[0]).toMatchObject({ seq: 1, state: { x: 5 } });
+    expect(atGuest[0]).toMatchObject({ epoch: 'run1', seq: 1, state: { x: 5 } });
     expect(atHost).toHaveLength(0);
 
     const fromGuest = await ack(tvB, 'game:state', { slug, epoch: 'x', seq: 1, state: {} });
@@ -103,6 +103,37 @@ describe('host screens (host-authoritative broadcast)', () => {
     expect(fromPhone).toMatchObject({ ok: false, status: 403 });
     const tooBig = await ack(tvA, 'game:state', { slug, epoch: 'run1', seq: 2, state: 'x'.repeat(40_000) });
     expect(tooBig).toMatchObject({ ok: false, status: 413 });
+    const badEpoch = await ack(tvA, 'game:state', { slug, epoch: 'e'.repeat(33), seq: 2, state: {} });
+    expect(badEpoch).toMatchObject({ ok: false, status: 400 });
+  });
+
+  it('sends game:state and game:input to screens only, controller:state to its player only', async () => {
+    const { slug, tvA, tvB, alex, bea, host, guest } = await twoScreens(true);
+    const inputsAtB = collect(tvB, 'game:input');
+    const statesAtAlex = collect(alex, 'game:state');
+    const inputsAtAlex = collect(alex, 'game:input');
+    const inputsAtBea = collect(bea, 'game:input');
+    const controllerAtAlex = collect(alex, 'controller:state');
+    const controllerAtBea = collect(bea, 'controller:state');
+
+    await ack(tvA, 'game:state', { slug, epoch: 'run1', seq: 1, state: { x: 1 } });
+    await ack(bea, 'controller:event', {
+      slug,
+      playerToken: guest.playerToken,
+      event: { playerId: 'x', type: 'game', control: 'jump', value: { action: 'press' }, timestamp: Date.now() }
+    });
+    const patched = await ack(tvA, 'screen:controller', { slug, playerId: guest.player.id, patch: { labels: { jump: 'HOP' } } });
+    expect(patched).toMatchObject({ ok: true, state: { labels: { jump: 'HOP' } } });
+
+    await expect.poll(() => inputsAtB.length).toBe(1);
+    await expect.poll(() => controllerAtBea.length).toBe(1);
+    // A round trip on each phone socket flushes anything still in flight to it.
+    await ack(alex, 'controller:rename', { slug, playerToken: host.playerToken, name: 'Alex' });
+    await ack(bea, 'controller:rename', { slug, playerToken: guest.playerToken, name: 'Bea' });
+    expect(statesAtAlex).toHaveLength(0);
+    expect(inputsAtAlex).toHaveLength(0);
+    expect(inputsAtBea).toHaveLength(0);
+    expect(controllerAtAlex).toHaveLength(0);
   });
 
   it('binds a screen id to its first join, so the public host id cannot be joined as', async () => {

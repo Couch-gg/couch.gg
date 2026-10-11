@@ -142,7 +142,9 @@ class CouchCore {
   manifest: CouchManifest;
   lastSeq = -1;
   screen: CouchScreen = { id: null, isHost: true };
+  private lastStateEpoch: string | null = null;
   private lastStateSeq = -1;
+  private warnedNonHostBroadcast = false;
 
   private readonly listeners: Record<CouchEventName, Set<Listener>> = {
     input: new Set(),
@@ -227,8 +229,13 @@ class CouchCore {
 
   broadcast(state: unknown): void {
     if (!this.screen.isHost) {
-      // eslint-disable-next-line no-console
-      console.warn('[couch] broadcast() on a non-host screen — ignoring. Check couch.screen.isHost.');
+      // Once: a frame loop on a screen that just lost the host role would
+      // otherwise log 30 warnings a second.
+      if (!this.warnedNonHostBroadcast) {
+        this.warnedNonHostBroadcast = true;
+        // eslint-disable-next-line no-console
+        console.warn('[couch] broadcast() on a non-host screen — ignoring. Check couch.screen.isHost.');
+      }
       return;
     }
     this.send({ v: PROTOCOL_VERSION, type: 'couch:broadcast', state });
@@ -236,6 +243,13 @@ class CouchCore {
 
   /** Deliver host state; stale or duplicate envelopes are dropped. */
   receiveState(envelope: CouchStateEnvelope): void {
+    // A new epoch is a new run of the host's game (it reloaded, or the host
+    // moved) whose counter starts over.
+    const epoch = typeof envelope.epoch === 'string' ? envelope.epoch : '';
+    if (epoch !== this.lastStateEpoch) {
+      this.lastStateEpoch = epoch;
+      this.lastStateSeq = -1;
+    }
     if (envelope.seq <= this.lastStateSeq) return;
     this.lastStateSeq = envelope.seq;
     this.emit('state', envelope);

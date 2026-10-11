@@ -215,7 +215,7 @@ interface CouchGame {
 | `pause`          | `{ reason: string }`           | Host tab hidden (`reason: 'host-hidden'`). |
 | `resume`         | `void`                         | Host tab visible again. |
 | `abort`          | `{ reason: string }`           | Session torn down (`reason: 'host-unmounted'`). |
-| `state`          | `{ seq, at, state }`           | Non-host screens: a snapshot from the host screen (section 6). |
+| `state`          | `{ epoch, seq, at, state }`    | Non-host screens: a snapshot from the host screen (section 6). |
 | `screenChanged`  | `{ id, isHost }`               | This screen became (or stopped being) the host screen. |
 
 ```ts
@@ -410,17 +410,22 @@ just draw what it sends:
 ```ts
 const couch = await CouchSDK.init({ manifest });
 
-if (couch.screen.isHost) {
-  // Simulate everything from every player's inputs, then share the result.
-  couch.on('input', applyInput);
-  setInterval(() => {
-    step();
-    couch.broadcast(snapshot()); // ≤ 32 KB, ≤ 30 per second
-  }, 33);
-} else {
-  // Render the host's snapshots; inputs still arrive here too, ignore them.
-  couch.on('state', ({ state }) => render(state));
-}
+// Register both roles up front and ask couch.screen.isHost every time: the
+// host role can move to this screen (or away from it) mid-game.
+couch.on('input', (e) => {
+  if (couch.screen.isHost) applyInput(e); // non-host screens get inputs too: ignore them
+});
+couch.on('state', ({ state }) => {
+  if (couch.screen.isHost) return;
+  adopt(state); // keep the latest snapshot, so a promoted screen continues from it
+  render(state);
+});
+setInterval(() => {
+  if (!couch.screen.isHost) return;
+  step(); // simulate everything from every player's inputs
+  render(snapshot());
+  couch.broadcast(snapshot()); // ≤ 32 KB, ≤ 30 per second
+}, 33);
 
 // Who sits in front of this screen (split-screen, camera follow, HUD):
 const mine = couch.localPlayers;
@@ -428,13 +433,19 @@ const mine = couch.localPlayers;
 
 - `couch.screen` is `{ id, isHost }`. Exactly one screen per lobby is the host:
   the screen the host player scanned, else the first screen that opened the
-  lobby. On a local couch it is the only screen. If the host moves, you get
-  `on('screenChanged', screen)`.
+  lobby. On a local couch it is the only screen. If the host moves (the host
+  player re-scans another TV, or the host TV goes away for good), you get
+  `on('screenChanged', screen)`, and a newly promoted host continues from the
+  last state it adopted. That is why the example checks `isHost` on every tick
+  instead of branching once at start-up.
 - Every player carries `screenId`: the TV whose QR code they scanned (`null` if
   they joined by invite link). `couch.localPlayers` filters to this screen.
-- `on('state')` gets `{ seq, at, state }`; older or duplicate snapshots are
-  dropped for you. The host never receives its own broadcast. Broadcasts are
-  not stored: a screen that joins late gets the next one.
+- `on('state')` gets `{ epoch, seq, at, state }`; older or duplicate snapshots
+  are dropped for you. `epoch` changes when the host's game starts over (its TV
+  reloaded, or another screen became the host) and `seq` restarts with it. The
+  host never receives its own broadcast. Broadcasts are not stored: a screen
+  that joins late gets the next one. `broadcast()` on a non-host screen does
+  nothing (it warns once in the console).
 - Latency is one hop from the host screen through the server to the others,
   so the non-host screens see the game slightly behind the host. Inputs from
   players at a non-host screen travel phone → server → host screen first.

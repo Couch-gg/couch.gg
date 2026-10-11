@@ -52,14 +52,25 @@
       renderScreen();
       couch.on('playersChanged', renderScreen);
       couch.on('screenChanged', renderScreen);
-      // The host screen counts presses and broadcasts the count; mirrors show it.
+      // The host screen counts presses and broadcasts the count (on each press
+      // and as a 10 Hz heartbeat, asking isHost every tick); mirrors show it and
+      // note which broadcast run (epoch) and seq they last took.
       let inputs = 0;
       couch.on('input', (input) => {
         if (input.action !== 'press') return;
         inputs += 1;
         if (couch.screen.isHost) couch.broadcast({ inputs });
       });
-      couch.on('state', (envelope) => show('mirror', 'inputs:' + envelope.state.inputs));
+      setInterval(() => {
+        if (couch.screen.isHost) couch.broadcast({ inputs });
+      }, 100);
+      const mirror = document.querySelector('[data-testid="mirror"]');
+      couch.on('state', (envelope) => {
+        show('mirror', 'inputs:' + envelope.state.inputs);
+        if (mirror.dataset.epoch !== envelope.epoch) mirror.dataset.firstSeq = String(envelope.seq);
+        mirror.dataset.epoch = envelope.epoch;
+        mirror.dataset.seq = String(envelope.seq);
+      });
     }
     main();
   </script>
