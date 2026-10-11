@@ -90,8 +90,11 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
     if (!entry) return false;
     return entry.disabled.has(control) || (entry.coolUntil.get(control) ?? 0) > Date.now();
   };
-  const labelFor = (playerId: string, control: CouchControl): string =>
-    overrides.get(playerId)?.labels[control.control] ?? (control.label || control.control);
+  const labelFor = (playerId: string, control: CouchControl): string => {
+    const labels = overrides.get(playerId)?.labels;
+    const own = labels && Object.hasOwn(labels, control.control) ? labels[control.control] : undefined;
+    return own ?? (control.label || control.control);
+  };
 
   const emitInput = (
     playerId: string,

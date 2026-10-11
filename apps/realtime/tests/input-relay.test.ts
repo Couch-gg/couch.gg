@@ -495,6 +495,38 @@ describe('setControllerState (couch.setController)', () => {
     expect(() => store.setControllerState(slug, 'player_ghost', { labels: { tap: 'X' } })).toThrow(/Spieler/);
   });
 
+  it('stores labels/cooldowns for prototype-named controls as own keys', () => {
+    // A manifest that predates the validator's reserved-name rule.
+    const PROTO: ExternalGameManifest = {
+      ...TAP_RACE,
+      id: 'proto-pad',
+      controllerLayout: {
+        kind: 'generic-buttons',
+        controls: [
+          { control: '__proto__', type: 'button', label: 'P' },
+          { control: 'constructor', type: 'button', label: 'C' }
+        ]
+      }
+    };
+    const store = new LobbyStore(makeResolver(PROTO));
+    const lobby = store.createLobby(Date.now(), 'local');
+    const host = store.joinPlayer(lobby.slug, 'Alex');
+    store.joinPlayer(lobby.slug, 'Bea');
+    store.selectGame(lobby.slug, host.playerToken, PROTO.id);
+    store.startGame(lobby.slug, host.playerToken);
+
+    const state = store.setControllerState(lobby.slug, host.player.id, {
+      labels: { ['__proto__']: 'SHIELD', constructor: 'BASH' },
+      cooldowns: { ['__proto__']: 500 }
+    });
+    expect(Object.hasOwn(state.labels, '__proto__')).toBe(true);
+    expect(state.labels['__proto__']).toBe('SHIELD');
+    expect(state.labels.constructor).toBe('BASH');
+    expect(Object.hasOwn(state.cooldowns, '__proto__')).toBe(true);
+    expect(Object.hasOwn(state.cooldowns, 'constructor')).toBe(false);
+    expect(JSON.parse(JSON.stringify(state)).labels).toEqual({ ['__proto__']: 'SHIELD', constructor: 'BASH' });
+  });
+
   it('is cleared when a new round starts and survives persistence', () => {
     const { store, slug, tokens, host } = startedExternal();
     store.setControllerState(slug, tokens[0].id, { labels: { tap: 'SHIELD' } });

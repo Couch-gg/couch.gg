@@ -34,10 +34,11 @@ export function GenericController({ layout, enabled, onEvent, state }: GenericCo
 
   const render = (control: LayoutControl) => {
     const key = control.control;
-    const cooldown = cooldowns[control.control];
+    // Own-property reads: a control name must never resolve to an inherited key.
+    const cooldown = Object.hasOwn(cooldowns, key) ? cooldowns[key] : undefined;
     const base = {
       control: control.control,
-      label: state?.labels[control.control] ?? control.label,
+      label: (state && Object.hasOwn(state.labels, key) ? state.labels[key] : undefined) ?? control.label,
       enabled: enabled && !disabled.has(control.control) && !cooldown,
       cooldown,
       onEvent

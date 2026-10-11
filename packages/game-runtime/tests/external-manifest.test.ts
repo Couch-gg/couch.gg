@@ -225,6 +225,15 @@ describe('controllerLayout rules', () => {
     expect(check((m) => (m.controllerLayout.controls[0].control = 'a'.repeat(33))).ok).toBe(false);
   });
 
+  it('rejects control names that are Object.prototype keys', () => {
+    for (const name of ['constructor', '__proto__']) {
+      const res = check((m) => (m.controllerLayout.controls[0].control = name));
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect(res.errors.join('\n')).toMatch(/reserved/);
+    }
+    expect(check((m) => (m.controllerLayout.controls[0].control = 'constructors')).ok).toBe(true);
+  });
+
   it('rejects duplicate control names', () => {
     const res = check((m) => {
       m.controllerLayout.controls = [

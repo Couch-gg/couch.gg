@@ -209,6 +209,20 @@ describe('CouchSDK setController', () => {
   });
 });
 
+describe('dev simulator setController', () => {
+  it('reads labels as own keys, so a control named "constructor" keeps its label', async () => {
+    standalone();
+    const protoManifest: CouchManifest = {
+      ...manifest,
+      controllerLayout: { kind: 'generic-buttons', controls: [{ control: 'constructor', type: 'button', label: 'Build' }] }
+    };
+    const couch = await CouchSDK.init({ manifest: protoManifest });
+    couch.setController('sim-p1', { disabled: [] });
+    const btn = document.querySelector<HTMLButtonElement>('[data-player-id="sim-p1"] .couch-sim-pad-button')!;
+    expect(btn.textContent).toBe('Build');
+  });
+});
+
 describe('CouchSDK roster updates', () => {
   it('4. players message replaces roster + fires handler; joined/left deltas too', async () => {
     const h = embed();
