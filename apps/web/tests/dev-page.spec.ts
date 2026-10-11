@@ -96,12 +96,19 @@ test('/dev test harness: Stop reaches the game as abort', async ({ browser }) =>
 test('/dev test harness: a setController patch a live couch would reject shows why', async ({ browser }) => {
   const { page, game } = await startHarness(browser);
   // input-lab exposes its handle; the platform server refuses this patch.
-  await game.evaluate(() =>
-    (window as unknown as { couch: { setController(id: string, patch: unknown): void } }).couch.setController(
-      'dev-alex',
-      { labels: { fire: 'SHIELD', nope: 'X' } }
-    )
-  );
+  const setController = (playerId: string, patch: unknown) =>
+    game.evaluate(
+      ([id, p]) =>
+        (window as unknown as { couch: { setController(id: string, patch: unknown): void } }).couch.setController(id, p),
+      [playerId, patch] as const
+    );
+  await setController('dev-alex', { labels: { fire: 'SHIELD', nope: 'X' } });
   await expect(page.getByText('setController rejected: unknown control "nope" in labels')).toBeVisible();
+
+  // The line is about the latest patch: a valid one clears it.
+  await setController('dev-alex', { labels: { fire: 'SHIELD' } });
+  await expect(page.getByText('setController rejected:')).toHaveCount(0);
+  await setController('nobody', { labels: { fire: 'SHIELD' } });
+  await expect(page.getByText('setController rejected: no player "nobody"')).toBeVisible();
   await page.close();
 });

@@ -207,11 +207,13 @@ export function DevSubmitRoute({ navigate }: { navigate: (to: string) => void })
     } else if (event.kind === 'controller') {
       // No phones here, so nothing reaches the server that would reject a bad
       // couch.setController patch. Check it with the same rules instead, so
-      // the creator learns why before a live couch drops it.
+      // the creator learns why before a live couch drops it. The line shows
+      // the latest patch only: a good one clears an earlier rejection.
       const { playerId, patch } = event.detail as { playerId: string; patch: unknown };
       const checked = checkControllerPatch(patch, testManifest?.controllerLayout.controls.map((c) => c.control) ?? []);
       if (!FAKE_PLAYERS.some((p) => p.id === playerId)) setControllerError(`no player "${playerId}"`);
       else if (!checked.ok) setControllerError(checked.error);
+      else setControllerError(null);
     }
   }, [testManifest]);
 
