@@ -22,7 +22,7 @@ async function phonePage(browser: Browser, name: string, landscape = false) {
   return p;
 }
 
-async function startInputLab(browser: Browser) {
+async function startInputLab(browser: Browser, prepareAlex?: (page: Page) => Promise<void>) {
   const tv = await browser.newPage({ viewport: { width: 1440, height: 960 }, isMobile: false, hasTouch: false, userAgent: DESKTOP_UA });
   await tv.goto('/');
   await expect
@@ -31,6 +31,7 @@ async function startInputLab(browser: Browser) {
   const screenId = await tv.evaluate(() => window.sessionStorage.getItem('couch:screenId'));
 
   const alex = await phonePage(browser, 'Alex', true);
+  await prepareAlex?.(alex);
   await alex.goto('/s/' + screenId + '?mode=local');
   await expect(alex).toHaveURL(/\/c\/[A-Z0-9]+/, { timeout: 15_000 });
   const slug = alex.url().split('/').pop()!;
@@ -202,6 +203,56 @@ test('a second finger on the stick or d-pad neither moves nor releases it', asyn
   await touch(alex, padSel, 'pointerup', 4, px, padBox.y + padBox.height - 8);
   await expect(alex.locator(padSel)).toHaveAttribute('data-dir', 'up');
   await touch(alex, padSel, 'pointerup', 3, px, padBox.y + 8);
+  await expect
+    .poll(async () => (await logLines(log)).filter((l) => l.control === 'aim').map((l) => [l.action, l.value.dir]), {
+      timeout: 10_000
+    })
+    .toEqual([
+      ['change', 'up'],
+      ['release', 'none']
+    ]);
+
+  await tv.close();
+  await alex.close();
+  await bea.close();
+});
+
+test('a rate-limited d-pad change is resent while the direction is held', async ({ browser }) => {
+  test.setTimeout(120_000);
+  let droppedOnce = false;
+  const { tv, alex, bea, log } = await startInputLab(browser, async (page) => {
+    // Answer the first d-pad change with the server's rate-limit ack instead of
+    // relaying it, exactly as if the lobby budget had been spent.
+    await page.routeWebSocket(/socket\.io/, (ws) => {
+      const server = ws.connectToServer();
+      ws.onMessage((message) => {
+        const packet = typeof message === 'string' ? /^42(\d+)(\[.*)$/s.exec(message) : null;
+        if (packet && !droppedOnce) {
+          const [name, payload] = JSON.parse(packet[2]) as [string, { event?: { control?: string; value?: { action?: string } } }];
+          if (name === 'controller:event' && payload.event?.control === 'aim' && payload.event.value?.action === 'change') {
+            droppedOnce = true;
+            ws.send(`43${packet[1]}[{"ok":true,"dropped":true}]`);
+            return;
+          }
+        }
+        server.send(message);
+      });
+    });
+  });
+
+  const pad = alex.locator('[data-control="aim"]');
+  const padBox = (await pad.boundingBox())!;
+  await alex.mouse.move(padBox.x + padBox.width / 2, padBox.y + 8);
+  await alex.mouse.down();
+  await expect(pad).toHaveAttribute('data-dir', 'up');
+  // Still holding: the dropped change arrives via the resend.
+  await expect
+    .poll(async () => (await logLines(log)).filter((l) => l.control === 'aim').map((l) => [l.action, l.value.dir]), {
+      timeout: 10_000
+    })
+    .toEqual([['change', 'up']]);
+  expect(droppedOnce).toBe(true);
+  await alex.mouse.up();
   await expect
     .poll(async () => (await logLines(log)).filter((l) => l.control === 'aim').map((l) => [l.action, l.value.dir]), {
       timeout: 10_000

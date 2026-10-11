@@ -294,13 +294,17 @@ Cadence details (so you know how often events arrive):
 - **select**: one `change` per tap with the picked option.
 - **stick**: `change` at most every **~66 ms** (about 15/s), only when the
   position moved; the thumb lifting always sends `release` at rest.
-- **dpad**: one `change` per new direction, never repeats while held. Because
-  the value is the whole direction, a missed event can't leave a direction
-  stuck: the next one replaces it.
+- **dpad**: one `change` per new direction, never repeats while held. If the
+  rate limit drops a change, the previous direction stays in effect until the
+  phone's resend lands (see below), the next direction change, or the release.
 
-Releases are never dropped by the rate limit, and the phone releases every held
-control when it is locked, backgrounded or loses focus. A `release` is always
-the last thing you get for a control the player let go of.
+If the rate limit drops a `change` (stick, d-pad, slider, hold), the phone
+resends it about **100 ms** later as long as it is still that control's newest
+value, so a held position catches up instead of staying stale until the next
+move. The release of a held control is never dropped by the rate limit, and the
+phone releases every held control when it is locked, backgrounded or loses
+focus. A `release` is always the last thing you get for a control the player let
+go of.
 
 **Layout hint.** Set `controllerLayout.orientation: 'landscape'` for action
 games: the phone then shows a left and a right thumb zone. Sticks and d-pads go
