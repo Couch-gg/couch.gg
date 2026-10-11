@@ -105,6 +105,9 @@ export interface InternalPlayer extends Player {
 }
 
 export interface SerializedLobbyRecord {
+  // Always the first key: the commit script reads it off the front of the
+  // stored JSON (see persistence.ts). Absent in records persisted before it.
+  rev?: number;
   id: string;
   slug: LobbySlug;
   name: string;
@@ -144,6 +147,9 @@ export interface ScreenPresence {
 }
 
 export interface LobbyRecord {
+  // Bumped by every committed change (see nextLobbyRev), so the commit can
+  // tell whether the stored lobby moved on since it was loaded.
+  rev: number;
   id: string;
   slug: LobbySlug;
   name: string;
@@ -189,6 +195,9 @@ export class LobbyError extends Error {
 export class LobbyStore {
   readonly lobbies = new Map<LobbySlug, LobbyRecord>();
   private readonly resolveManifest: ManifestResolver;
+  // Counts adopt calls; each adopted lobby remembers its count (see adopt).
+  private adoptions = 0;
+  private readonly adoptedAt = new WeakMap<LobbyRecord, number>();
 
   constructor(getManifest: ManifestResolver = builtinManifestResolver) {
     this.resolveManifest = getManifest;
@@ -206,6 +215,7 @@ export class LobbyStore {
     let slug = randomSlug();
     while (this.lobbies.has(slug)) slug = randomSlug();
     const lobby: LobbyRecord = {
+      rev: 0,
       id: createId('lobby'),
       slug,
       name: createRoomName(slug),
@@ -249,6 +259,33 @@ export class LobbyStore {
   keepAlive(lobby: LobbyRecord, now = Date.now()): void {
     const latest = lobby.createdAt + LOBBY_MAX_AGE_MS;
     lobby.expiresAt = Math.max(lobby.expiresAt, Math.min(now + LOBBY_TTL_MS, latest));
+  }
+
+  // The lobby is about to be committed with a change: give it the next rev
+  // and keep it alive.
+  markChanged(lobby: LobbyRecord, now = Date.now()): void {
+    lobby.rev = nextLobbyRev(lobby.rev, now);
+    this.keepAlive(lobby, now);
+  }
+
+  // Where a read of storage starts, for adopt.
+  readMark(): number {
+    return this.adoptions;
+  }
+
+  // Keep a lobby read from (`readMark` from before the read) or committed to
+  // storage, unless the one held here is newer: a read that started before a
+  // commit can finish after it. A read that started after the held lobby was
+  // taken is what storage holds, though, even if its rev is lower (a deploy
+  // from before revs stored it). Returns the one now held.
+  adopt(record: LobbyRecord, readMark?: number): LobbyRecord {
+    const held = this.lobbies.get(record.slug);
+    if (held && held !== record && held.id === record.id && held.rev > record.rev) {
+      if (readMark === undefined || (this.adoptedAt.get(held) ?? 0) > readMark) return held;
+    }
+    this.lobbies.set(record.slug, record);
+    this.adoptedAt.set(record, ++this.adoptions);
+    return record;
   }
 
   publicLobby(slugOrLobby: string | LobbyRecord): Lobby {
@@ -637,6 +674,20 @@ export class LobbyStore {
     return gone;
   }
 
+  // Whether dropGoneScreens or markDroppedGone would change anything now.
+  // Read-only, so a poll can check without writing the lobby.
+  hasPresenceToSettle(slug: string, now: number, graceMs: number, quietMs: number): boolean {
+    const lobby = this.getLobby(slug);
+    for (const id of lobby.screens) {
+      const leftAt = lobby.screenPresence[id]?.leftAt;
+      if (leftAt != null && now - leftAt >= graceMs) return true;
+    }
+    for (const player of lobby.players.values()) {
+      if (player.droppedAt != null && player.connected && now - player.droppedAt >= quietMs) return true;
+    }
+    return false;
+  }
+
   // Remove a player that has been gone since `since` (and didn't come back).
   // Returns null when nothing changed.
   removeIfStillDisconnected(slug: string, playerId: PlayerId, since: number): PlayerRemoval | null {
@@ -873,6 +924,7 @@ export function sanitizeChatText(raw: unknown): string {
 
 export function serializeLobbyRecord(lobby: LobbyRecord): SerializedLobbyRecord {
   return {
+    rev: lobby.rev,
     id: lobby.id,
     slug: lobby.slug,
     name: lobby.name,
@@ -901,9 +953,23 @@ export function serializeLobbyRecord(lobby: LobbyRecord): SerializedLobbyRecord 
   };
 }
 
+// A copy of a lobby to change, which shares nothing it could change with the
+// original (the engine is rebuilt from the snapshot).
+export function cloneLobbyRecord(lobby: LobbyRecord): LobbyRecord {
+  return deserializeLobbyRecord(serializeLobbyRecord(lobby));
+}
+
+// The rev of a lobby's next committed change. Never below the clock, so it
+// still moves forward when a writer without revs (a deploy from before them)
+// stored the lobby in between and it reads as 0.
+export function nextLobbyRev(rev: number, now = Date.now()): number {
+  return Math.max(rev + 1, now);
+}
+
 export function deserializeLobbyRecord(serialized: SerializedLobbyRecord): LobbyRecord {
   const snapshot = serialized.gameSession?.snapshot ?? null;
   return {
+    rev: serialized.rev ?? 0,
     id: serialized.id,
     slug: serialized.slug.toUpperCase(),
     name: serialized.name,

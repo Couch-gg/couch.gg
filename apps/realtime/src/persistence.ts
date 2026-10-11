@@ -25,6 +25,10 @@ export interface LobbyPersistence {
   delete(slug: string): Promise<void>;
   load(slug: string): Promise<LobbyRecord | null>;
   save(lobby: LobbyRecord): Promise<void>;
+  // Store the lobby only if the stored one is still at `expectedRev` (the rev
+  // it was loaded with), or, with null, only if there is none yet. Resolves to
+  // whether it was stored. Without it (the Queue) a write is a plain save.
+  commit?(lobby: LobbyRecord, expectedRev: number | null): Promise<boolean>;
   loadScreen(id: string): Promise<ScreenRecord | null>;
   saveScreen(record: ScreenRecord): Promise<void>;
   deleteScreen(id: string): Promise<void>;
@@ -83,6 +87,19 @@ class RedisLobbyPersistence implements LobbyPersistence {
     await client.set(key(lobby.slug), JSON.stringify(serializeLobbyRecord(lobby)), {
       PXAT: lobby.expiresAt
     });
+  }
+
+  async commit(lobby: LobbyRecord, expectedRev: number | null): Promise<boolean> {
+    const client = await this.client();
+    const stored = await client.eval(COMMIT_LOBBY_SCRIPT, {
+      keys: [key(lobby.slug)],
+      arguments: [
+        expectedRev === null ? '' : String(expectedRev),
+        JSON.stringify(serializeLobbyRecord(lobby)),
+        String(lobby.expiresAt)
+      ]
+    });
+    return Number(stored) === 1;
   }
 
   async delete(slug: string): Promise<void> {
@@ -372,6 +389,25 @@ const GAMES_INDEX_KEY = 'couch:games:index';
 function key(slug: string): string {
   return `couch:lobby:${slug.toUpperCase()}`;
 }
+
+// KEYS: the lobby. ARGV: the rev the lobby was loaded with ('' for a new
+// lobby, which must not exist yet), the lobby JSON, its expiry in unix ms.
+// The stored rev is read off the front of the stored JSON
+// (serializeLobbyRecord puts it first), so the blob is never parsed here; a
+// lobby stored before revs existed reads as rev 0, like it loads. A lobby that
+// expired or was deleted since it was loaded is not brought back.
+const COMMIT_LOBBY_SCRIPT = `
+local current = redis.call('GET', KEYS[1])
+if ARGV[1] == '' then
+  if current then return 0 end
+else
+  if not current then return 0 end
+  local rev = string.match(current, '^{"rev":(%d+)[,}]') or '0'
+  if rev ~= ARGV[1] then return 0 end
+end
+redis.call('SET', KEYS[1], ARGV[2], 'PXAT', ARGV[3])
+return 1
+`;
 
 function screenKey(id: string): string {
   return `couch:screen:${id}`;
