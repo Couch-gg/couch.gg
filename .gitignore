@@ -6,6 +6,7 @@ apps/*/dist/
 packages/*/dist/
 packages/games/*/dist/
 apps/web/public/sdk/
+apps/web/public/shared/
 playwright-report/
 test-results/
 .env
