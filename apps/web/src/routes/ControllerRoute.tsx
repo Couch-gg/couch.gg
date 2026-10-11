@@ -10,6 +10,7 @@ import {
   Pencil,
   Play,
   Share2,
+  Square,
   X
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState, type FormEvent, type MutableRefObject, type PointerEvent } from 'react';
@@ -135,6 +136,29 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     setLastEvent(event);
   }, []);
 
+  // Read by the socket's reconnect handler, which is set up once per socket.
+  const playerRef = useRef<Player | null>(null);
+  playerRef.current = player;
+
+  // The room doesn't take this phone back (it moved on without it, or is
+  // gone): show the join screen with "Try again" instead of a controller that
+  // silently does nothing. A token the room no longer knows (refused as a new
+  // player, or unknown) is forgotten, so trying again joins afresh.
+  const lostSeat = useCallback(
+    (err: unknown) => {
+      const status = (err as { status?: number } | null)?.status;
+      if (status === 401 || status === 404 || status === 409 || status === 410) {
+        window.localStorage.removeItem(tokenKey(slug));
+        setPlayerToken('');
+      }
+      setReconnecting(false);
+      setPlayer(null);
+      setError(err instanceof Error ? err.message : 'Verbindung zum Raum verloren');
+      setJoinStatus('failed');
+    },
+    [slug]
+  );
+
   // --- Hold-to-repeat aim state -------------------------------------------
   const aimRepeatRef = useRef<number | null>(null);
   const aimHoldStartRef = useRef(0);
@@ -167,9 +191,12 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     // and turn — including mid-game (the server's token-reconnect path has no
     // game-in-progress block; only brand-new players are turned away during play).
     const rejoinIfPossible = () => {
-      setReconnecting(false);
       const token = window.localStorage.getItem(tokenKey(slug));
-      if (!token) return; // first-time visitors join via the form below
+      // Not joined yet: join() below (or "Try again") takes care of that.
+      if (!token || !playerRef.current) {
+        setReconnecting(false);
+        return;
+      }
       const storedName = window.localStorage.getItem('couch:name') || 'Player';
       void emitAck<JoinLobbyResponse & { ok: true; games: GameManifest[] }>(nextSocket, 'controller:join', {
         slug,
@@ -178,6 +205,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
         screenId: seatFor(slug)
       })
         .then((joined) => {
+          setReconnecting(false);
           setPlayer(joined.player);
           setLobby(joined.lobby);
           setGames(joined.games);
@@ -185,9 +213,9 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
           window.localStorage.setItem(tokenKey(slug), joined.playerToken);
           window.localStorage.setItem('couch:activeSlug', slug);
         })
-        .catch(() => {
-          // Room may be gone after a very long absence; leave the UI as-is.
-        });
+        // After a long absence the room may have removed this player (or be
+        // gone, or be mid-game and refuse newcomers).
+        .catch(lostSeat);
     };
 
     nextSocket.on('connect', rejoinIfPossible);
@@ -197,7 +225,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
       nextSocket.disconnect();
       setSocket(null);
     };
-  }, [slug, applyGameEvent]);
+  }, [slug, applyGameEvent, lostSeat]);
 
   // Replay the latest event carried inside the polled/snapshot lobby state — the
   // cross-instance path. When the opponent fired on a different serverless instance the
@@ -289,9 +317,12 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   const snapshot = isTrebuchetSnapshot(rawSnapshot) ? rawSnapshot : undefined;
   const currentTurn = snapshot?.turn;
   const myTurn = Boolean(player && currentTurn === player.id);
-  const canStart = Boolean(isHost && lobby && lobby.players.length >= 2 && lobby.state !== 'playing');
   const myUnit = player ? snapshot?.units.find((unit) => unit.id === player.id) : undefined;
   const currentManifest = games.find((game) => game.id === lobby?.currentGameId);
+  // The server refuses fewer than the game's minPlayers (some games are solo).
+  const canStart = Boolean(
+    isHost && lobby && lobby.players.length >= (currentManifest?.minPlayers ?? 2) && lobby.state !== 'playing'
+  );
   const isGenericLayout = currentManifest
     ? currentManifest.controllerLayout.kind !== 'trebuchet-aim-fire' || currentManifest.origin === 'external'
     : false;
@@ -313,7 +344,33 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
 
   const start = async () => {
     if (!socket) return;
-    await emitAck(socket, 'game:start', { slug, playerToken });
+    try {
+      await emitAck(socket, 'game:start', { slug, playerToken });
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Start fehlgeschlagen');
+    }
+  };
+
+  // The host's way out of a game that never ends by itself.
+  const endGame = async () => {
+    if (!socket || !window.confirm('Spiel für alle beenden?')) return;
+    try {
+      await emitAck(socket, 'game:end', { slug, playerToken });
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Spiel konnte nicht beendet werden');
+    }
+  };
+
+  const leave = () => {
+    // Tell the room right away, so the seat and the host role free up now
+    // rather than after the reconnect grace. Sent ahead of the disconnect
+    // that leaving the page causes.
+    if (socket?.connected && playerToken) socket.emit('controller:leave', { slug, playerToken });
+    window.localStorage.removeItem(tokenKey(slug));
+    window.localStorage.removeItem('couch:activeSlug');
+    navigate('/');
   };
 
   const startNameEdit = () => {
@@ -354,6 +411,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     if (!socket) return;
     try {
       await emitAck(socket, 'game:select', { slug, playerToken, gameId });
+      setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Spielauswahl fehlgeschlagen');
     }
@@ -453,13 +511,15 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
             }, GENERIC_RESEND_MS);
             resendTimersRef.current.add(timer);
           })
-          .catch(() => {
-            // Best-effort like the trebuchet preview path.
+          .catch((err: unknown) => {
+            // Best-effort like the trebuchet preview path, unless the room no
+            // longer knows this phone.
+            if (statusOf(err) === 401) lostSeat(err);
           });
       };
       emit(0);
     },
-    [player?.id, playerToken, slug, socket]
+    [player?.id, playerToken, slug, socket, lostSeat]
   );
 
   const sendPreview = useCallback(async (control: 'trebuchet.aim' | 'trebuchet.charge', value: unknown) => {
@@ -476,10 +536,11 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
           timestamp: Date.now()
         }
       });
-    } catch {
+    } catch (err) {
       // Preview events are best-effort; final fire remains acknowledged below.
+      if (statusOf(err) === 401) lostSeat(err);
     }
-  }, [myTurn, player?.id, playerToken, slug, socket]);
+  }, [myTurn, player?.id, playerToken, slug, socket, lostSeat]);
 
   // Apply a raw angle (already snapped) and broadcast the aim preview.
   const applyAngle = useCallback(
@@ -580,17 +641,22 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
 
   const fire = async (shotPower = power) => {
     if (!socket || !myTurn) return;
-    await emitAck(socket, 'controller:event', {
-      slug,
-      playerToken,
-      event: {
-        playerId: player?.id,
-        type: 'game',
-        control: 'trebuchet.fire',
-        value: { angle, power: shotPower },
-        timestamp: Date.now()
-      }
-    });
+    try {
+      await emitAck(socket, 'controller:event', {
+        slug,
+        playerToken,
+        event: {
+          playerId: player?.id,
+          type: 'game',
+          control: 'trebuchet.fire',
+          value: { angle, power: shotPower },
+          timestamp: Date.now()
+        }
+      });
+    } catch (err) {
+      // A lost shot shows by the turn not moving on; a lost seat needs the join screen.
+      if (statusOf(err) === 401) lostSeat(err);
+    }
   };
 
   const beginCharge = (event: PointerEvent<HTMLButtonElement>) => {
@@ -946,14 +1012,19 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
           </div>
         )}
 
-        <button
-          className="text-btn"
-          onClick={() => {
-            window.localStorage.removeItem(tokenKey(slug));
-            window.localStorage.removeItem('couch:activeSlug');
-            navigate('/');
-          }}
-        >
+        {error ? (
+          <p className="error-line" role="alert">
+            {error}
+          </p>
+        ) : null}
+
+        {isHost && lobby?.state === 'playing' ? (
+          <button className="text-btn" type="button" onClick={endGame}>
+            <Square size={16} /> Spiel beenden
+          </button>
+        ) : null}
+
+        <button className="text-btn" onClick={leave}>
           <LogOut size={16} /> Leave
         </button>
       </section>
@@ -983,6 +1054,10 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
 
 function tokenKey(slug: string): string {
   return `couch:player-token:${slug}`;
+}
+
+function statusOf(err: unknown): number | undefined {
+  return (err as { status?: number } | null)?.status;
 }
 
 function turnName(snapshot: TrebuchetSnapshot | undefined, playerId: string | null | undefined): string {
