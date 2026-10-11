@@ -754,7 +754,8 @@ export function sanitizeControllerPatch(
 
   if (raw.labels !== undefined) {
     if (!raw.labels || typeof raw.labels !== 'object' || Array.isArray(raw.labels)) throw new LobbyError('labels muss ein Objekt sein');
-    out.labels = {};
+    // Null-prototype maps: a control key can never hit Object.prototype.
+    out.labels = Object.create(null) as Record<string, string>;
     for (const [control, label] of Object.entries(raw.labels)) {
       known(control);
       if (typeof label !== 'string' || !label.trim() || label.trim().length > MAX_LABEL_CHARS) {
@@ -774,7 +775,7 @@ export function sanitizeControllerPatch(
   }
   if (raw.cooldowns !== undefined) {
     if (!raw.cooldowns || typeof raw.cooldowns !== 'object' || Array.isArray(raw.cooldowns)) throw new LobbyError('cooldowns muss ein Objekt sein');
-    out.cooldowns = {};
+    out.cooldowns = Object.create(null) as Record<string, number>;
     for (const [control, ms] of Object.entries(raw.cooldowns)) {
       known(control);
       if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0 || ms > MAX_COOLDOWN_MS) {

@@ -22,7 +22,7 @@ async function phonePage(browser: Browser, name: string, landscape = false) {
   return p;
 }
 
-async function startInputLab(browser: Browser) {
+async function startInputLab(browser: Browser, prepareAlex?: (page: Page) => Promise<void>) {
   const tv = await browser.newPage({ viewport: { width: 1440, height: 960 }, isMobile: false, hasTouch: false, userAgent: DESKTOP_UA });
   await tv.goto('/');
   await expect
@@ -31,6 +31,7 @@ async function startInputLab(browser: Browser) {
   const screenId = await tv.evaluate(() => window.sessionStorage.getItem('couch:screenId'));
 
   const alex = await phonePage(browser, 'Alex', true);
+  await prepareAlex?.(alex);
   await alex.goto('/s/' + screenId + '?mode=local');
   await expect(alex).toHaveURL(/\/c\/[A-Z0-9]+/, { timeout: 15_000 });
   const slug = alex.url().split('/').pop()!;
@@ -222,4 +223,128 @@ test('REMOTE host mode: the host screen broadcasts, the other screen renders it'
   await expect(hostFrame.locator('[data-testid="mirror"]')).toHaveText('');
 
   for (const page of [hostTv, guestTv, alex, bea]) await page.close();
+});
+
+// Dispatch a touch pointer event with an explicit pointerId on a control.
+async function touch(page: Page, selector: string, type: string, pointerId: number, x: number, y: number) {
+  await page.evaluate(
+    ({ selector, type, pointerId, x, y }) => {
+      const el = document.querySelector(selector)!;
+      el.dispatchEvent(
+        new PointerEvent(type, {
+          pointerId,
+          pointerType: 'touch',
+          isPrimary: pointerId === 1,
+          bubbles: true,
+          cancelable: true,
+          clientX: x,
+          clientY: y
+        })
+      );
+    },
+    { selector, type, pointerId, x, y }
+  );
+}
+
+test('a second finger on the stick or d-pad neither moves nor releases it', async ({ browser }) => {
+  test.setTimeout(120_000);
+  const { tv, alex, bea, log } = await startInputLab(browser);
+
+  const stickSel = '[data-control="move"]';
+  const box = (await alex.locator(stickSel).boundingBox())!;
+  const cx = box.x + box.width / 2;
+  const cy = box.y + box.height / 2;
+  // Finger 1 grabs the stick; finger 2 lands on its left edge and lifts again.
+  await touch(alex, stickSel, 'pointerdown', 1, cx, cy);
+  await touch(alex, stickSel, 'pointerdown', 2, box.x, cy);
+  await touch(alex, stickSel, 'pointermove', 2, box.x, cy);
+  await touch(alex, stickSel, 'pointerup', 2, box.x, cy);
+  // Finger 1 still steers: push right.
+  await touch(alex, stickSel, 'pointermove', 1, box.x + box.width, cy);
+  await expect
+    .poll(async () => (await logLines(log)).filter((l) => l.control === 'move').map((l) => [l.action, l.value.x]), {
+      timeout: 10_000
+    })
+    .toEqual([['change', 1]]);
+  await touch(alex, stickSel, 'pointerup', 1, box.x + box.width, cy);
+  await expect
+    .poll(async () => (await logLines(log)).filter((l) => l.control === 'move').map((l) => [l.action, l.value.x]), {
+      timeout: 10_000
+    })
+    .toEqual([
+      ['change', 1],
+      ['release', 0]
+    ]);
+
+  const padSel = '[data-control="aim"]';
+  const padBox = (await alex.locator(padSel).boundingBox())!;
+  const px = padBox.x + padBox.width / 2;
+  await touch(alex, padSel, 'pointerdown', 3, px, padBox.y + 8);
+  await expect(alex.locator(padSel)).toHaveAttribute('data-dir', 'up');
+  await touch(alex, padSel, 'pointerdown', 4, px, padBox.y + padBox.height - 8);
+  await touch(alex, padSel, 'pointerup', 4, px, padBox.y + padBox.height - 8);
+  await expect(alex.locator(padSel)).toHaveAttribute('data-dir', 'up');
+  await touch(alex, padSel, 'pointerup', 3, px, padBox.y + 8);
+  await expect
+    .poll(async () => (await logLines(log)).filter((l) => l.control === 'aim').map((l) => [l.action, l.value.dir]), {
+      timeout: 10_000
+    })
+    .toEqual([
+      ['change', 'up'],
+      ['release', 'none']
+    ]);
+
+  await tv.close();
+  await alex.close();
+  await bea.close();
+});
+
+test('a rate-limited d-pad change is resent while the direction is held', async ({ browser }) => {
+  test.setTimeout(120_000);
+  let droppedOnce = false;
+  const { tv, alex, bea, log } = await startInputLab(browser, async (page) => {
+    // Answer the first d-pad change with the server's rate-limit ack instead of
+    // relaying it, exactly as if the lobby budget had been spent.
+    await page.routeWebSocket(/socket\.io/, (ws) => {
+      const server = ws.connectToServer();
+      ws.onMessage((message) => {
+        const packet = typeof message === 'string' ? /^42(\d+)(\[.*)$/s.exec(message) : null;
+        if (packet && !droppedOnce) {
+          const [name, payload] = JSON.parse(packet[2]) as [string, { event?: { control?: string; value?: { action?: string } } }];
+          if (name === 'controller:event' && payload.event?.control === 'aim' && payload.event.value?.action === 'change') {
+            droppedOnce = true;
+            ws.send(`43${packet[1]}[{"ok":true,"dropped":true}]`);
+            return;
+          }
+        }
+        server.send(message);
+      });
+    });
+  });
+
+  const pad = alex.locator('[data-control="aim"]');
+  const padBox = (await pad.boundingBox())!;
+  await alex.mouse.move(padBox.x + padBox.width / 2, padBox.y + 8);
+  await alex.mouse.down();
+  await expect(pad).toHaveAttribute('data-dir', 'up');
+  // Still holding: the dropped change arrives via the resend.
+  await expect
+    .poll(async () => (await logLines(log)).filter((l) => l.control === 'aim').map((l) => [l.action, l.value.dir]), {
+      timeout: 10_000
+    })
+    .toEqual([['change', 'up']]);
+  expect(droppedOnce).toBe(true);
+  await alex.mouse.up();
+  await expect
+    .poll(async () => (await logLines(log)).filter((l) => l.control === 'aim').map((l) => [l.action, l.value.dir]), {
+      timeout: 10_000
+    })
+    .toEqual([
+      ['change', 'up'],
+      ['release', 'none']
+    ]);
+
+  await tv.close();
+  await alex.close();
+  await bea.close();
 });

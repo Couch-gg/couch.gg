@@ -240,6 +240,10 @@ export function validateExternalManifestInput(
           const name = ctrl.control;
           if (!CONTROL_NAME_RE.test(name)) {
             errors.push(`controllerLayout.controls[${i}].control must match /^[a-z0-9._-]{1,32}$/`);
+          } else if (name in Object.prototype) {
+            // 'constructor' / '__proto__' would read through every plain-object
+            // lookup keyed by control name (labels, cooldowns) on the phone.
+            errors.push(`controllerLayout.controls[${i}].control "${name}" is reserved`);
           } else if (seenNames.has(name)) {
             errors.push(`controllerLayout.controls[${i}].control "${name}" is duplicated`);
           } else {
