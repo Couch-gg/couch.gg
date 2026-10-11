@@ -213,6 +213,83 @@ export interface CouchControllerPatch {
   vibrate?: number | number[];
 }
 
+/** Limits a `CouchControllerPatch` must stay within. */
+export const CONTROLLER_PATCH_LIMITS = {
+  labelChars: 16,
+  cooldownMs: 60_000,
+  vibrateSteps: 10,
+  vibrateStepMs: 1_000
+} as const;
+
+export type CouchControllerPatchCheck =
+  | { ok: true; patch: CouchControllerPatch & { vibrate?: number[] } }
+  | { ok: false; error: string };
+
+/**
+ * Check a controller patch the way the platform server does
+ * (`sanitizeControllerPatch` in apps/realtime/src/lobbies.ts; keep the two in
+ * step): an unknown control or a value out of range rejects the WHOLE patch.
+ * On success returns the patch as the server stores it: trimmed labels,
+ * de-duplicated `disabled`, whole milliseconds, `vibrate` as a list.
+ */
+export function checkControllerPatch(patch: unknown, controls: Iterable<string>): CouchControllerPatchCheck {
+  const known = new Set(controls);
+  const L = CONTROLLER_PATCH_LIMITS;
+  const fail = (error: string): CouchControllerPatchCheck => ({ ok: false, error });
+  const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
+  if (!isRecord(patch)) return fail('the patch must be an object');
+  const out: CouchControllerPatch & { vibrate?: number[] } = {};
+
+  if (patch.labels !== undefined) {
+    if (!isRecord(patch.labels)) return fail('labels must be an object');
+    // Null-prototype maps: a control key can never hit Object.prototype.
+    const labels = Object.create(null) as Record<string, string>;
+    for (const [control, label] of Object.entries(patch.labels)) {
+      if (!known.has(control)) return fail(`unknown control "${control}" in labels`);
+      if (typeof label !== 'string' || !label.trim() || label.trim().length > L.labelChars) {
+        return fail(`the label for "${control}" must be 1-${L.labelChars} characters`);
+      }
+      labels[control] = label.trim();
+    }
+    out.labels = labels;
+  }
+  if (patch.disabled !== undefined) {
+    if (!Array.isArray(patch.disabled)) return fail('disabled must be a list of control names');
+    const disabled: string[] = [];
+    for (const control of patch.disabled) {
+      if (typeof control !== 'string') return fail('disabled must be a list of control names');
+      if (!known.has(control)) return fail(`unknown control "${control}" in disabled`);
+      if (!disabled.includes(control)) disabled.push(control);
+    }
+    out.disabled = disabled;
+  }
+  if (patch.cooldowns !== undefined) {
+    if (!isRecord(patch.cooldowns)) return fail('cooldowns must be an object');
+    const cooldowns = Object.create(null) as Record<string, number>;
+    for (const [control, ms] of Object.entries(patch.cooldowns)) {
+      if (!known.has(control)) return fail(`unknown control "${control}" in cooldowns`);
+      if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0 || ms > L.cooldownMs) {
+        return fail(`the cooldown for "${control}" must be 0-${L.cooldownMs} ms`);
+      }
+      cooldowns[control] = Math.round(ms);
+    }
+    out.cooldowns = cooldowns;
+  }
+  if (patch.vibrate !== undefined) {
+    const steps = typeof patch.vibrate === 'number' ? [patch.vibrate] : patch.vibrate;
+    if (
+      !Array.isArray(steps) ||
+      steps.length === 0 ||
+      steps.length > L.vibrateSteps ||
+      steps.some((ms) => typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0 || ms > L.vibrateStepMs)
+    ) {
+      return fail(`vibrate must be 1-${L.vibrateSteps} steps of 0-${L.vibrateStepMs} ms`);
+    }
+    out.vibrate = (steps as number[]).map((ms) => Math.round(ms));
+  }
+  return { ok: true, patch: out };
+}
+
 /** Update one player's phone controller. */
 export interface CouchSetControllerMessage {
   v: ProtocolVersion;

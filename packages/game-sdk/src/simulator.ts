@@ -4,16 +4,17 @@
  * DOM only; styles are injected via one inline <style> (no CSS imports, so it
  * works from file:// and inside LLM sandboxes). Every fake input is stamped with
  * an incrementing `seq` and dispatched through the SAME core funnel as live
- * `couch:input` messages.
+ * `couch:input` messages, in the shapes the real phone sends.
  */
 
-import type {
-  CouchControl,
-  CouchControllerPatch,
-  CouchInputEnvelope,
-  CouchManifest,
-  CouchPlayer,
-  CouchScore
+import {
+  checkControllerPatch,
+  type CouchControl,
+  type CouchControllerPatch,
+  type CouchInputEnvelope,
+  type CouchManifest,
+  type CouchPlayer,
+  type CouchScore
 } from './protocol';
 
 /**
@@ -55,6 +56,8 @@ const FAKE_NAMES = ['Alex', 'Bea', 'Cyd', 'Dex', 'Eli', 'Fin', 'Gus', 'Hana'];
 const MAX_PLAYERS = 8;
 /** Progress emit cadence while a hold control is held down (ms). */
 const HOLD_TICK_MS = 120;
+/** A hold's `progress` reaches 1 after this long, as on the phone (ms). */
+const HOLD_RAMP_MS = 1500;
 /** Minimum gap between coalesced slider `change` emits (ms). */
 const SLIDER_COALESCE_MS = 100;
 
@@ -98,13 +101,14 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
     return own ?? (control.label || control.control);
   };
 
+  /** Returns false when a disabled or cooling-down control swallowed it. */
   const emitInput = (
     playerId: string,
     control: string,
     action: CouchInputEnvelope['action'],
     value?: unknown
-  ): void => {
-    if (action !== 'release' && isBlocked(playerId, control)) return;
+  ): boolean => {
+    if (action !== 'release' && isBlocked(playerId, control)) return false;
     core.dispatchInput({
       seq: nextSeq(),
       at: Date.now(),
@@ -113,7 +117,49 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
       action,
       value
     });
+    return true;
   };
+
+  // Buttons and holds that are down, per player and control. The pointer and
+  // the keyboard share this, so either one drives the control like a phone
+  // does: one press, then (holds) a { progress } tick every HOLD_TICK_MS, then
+  // one release ({ heldMs } for holds). A release without a press never happens.
+  const held = new Map<string, { since: number; ticker?: ReturnType<typeof setInterval> }>();
+  const heldKey = (playerId: string, control: string): string => `${playerId}:${control}`;
+
+  function pressControl(playerId: string, control: CouchControl): boolean {
+    const key = heldKey(playerId, control.control);
+    if (held.has(key)) return false;
+    if (!emitInput(playerId, control.control, 'press')) return false;
+    const since = Date.now();
+    const ticker =
+      control.type === 'hold'
+        ? setInterval(() => {
+            const progress = Math.min(1, (Date.now() - since) / HOLD_RAMP_MS);
+            emitInput(playerId, control.control, 'change', { progress });
+          }, HOLD_TICK_MS)
+        : undefined;
+    held.set(key, { since, ticker });
+    return true;
+  }
+
+  function releaseControl(playerId: string, control: CouchControl): void {
+    const key = heldKey(playerId, control.control);
+    const entry = held.get(key);
+    if (!entry) return;
+    held.delete(key);
+    if (entry.ticker !== undefined) clearInterval(entry.ticker);
+    emitInput(playerId, control.control, 'release', control.type === 'hold' ? { heldMs: Date.now() - entry.since } : undefined);
+  }
+
+  // A player who leaves takes their phone along: stop its hold ticks quietly.
+  function dropHeld(playerId: string): void {
+    for (const [key, entry] of held) {
+      if (!key.startsWith(`${playerId}:`)) continue;
+      if (entry.ticker !== undefined) clearInterval(entry.ticker);
+      held.delete(key);
+    }
+  }
 
   // ---- style injection (single inline <style>) --------------------------
   injectStyles();
@@ -203,6 +249,7 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
   seedInput.className = 'couch-sim-seed-input';
   seedInput.type = 'text';
   seedInput.value = core.seed;
+  seedInput.title = "Enter sets couch.seed for the game's next read of it. Reload for a new random seed.";
   seedWrap.appendChild(seedLabel);
   seedWrap.appendChild(seedInput);
   controlsRow.appendChild(seedWrap);
@@ -235,6 +282,7 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
   removeBtn.addEventListener('click', () => {
     if (core.players.length <= 1) return;
     const last = core.players[core.players.length - 1];
+    dropHeld(last.id);
     core.removePlayer(last.id);
     renderPhones();
     syncRosterButtons();
@@ -243,9 +291,17 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
   pauseBtn.addEventListener('click', () => core.pause('dev'));
   resumeBtn.addEventListener('click', () => core.resume());
 
-  seedInput.addEventListener('input', () => {
-    core.setSeed(seedInput.value);
-    seedHint.textContent = 'reload to apply';
+  // On commit (Enter / blur), not per keystroke. couch.seed changes right
+  // away, but a game that already seeded its PRNG only sees it when it reads
+  // the seed again (e.g. on its next round).
+  seedInput.addEventListener('change', () => {
+    const seed = seedInput.value.trim();
+    if (!seed) {
+      seedInput.value = core.seed;
+      return;
+    }
+    core.setSeed(seed);
+    seedHint.textContent = `couch.seed is now "${seed}" for its next read`;
   });
 
   function syncRosterButtons(): void {
@@ -293,9 +349,8 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
   function renderControl(player: CouchPlayer, control: CouchControl): HTMLElement {
     switch (control.type) {
       case 'button':
-        return renderButton(player, control);
       case 'hold':
-        return renderHold(player, control);
+        return renderPressable(player, control, control.type);
       case 'slider':
         return renderSlider(player, control);
       case 'select':
@@ -304,70 +359,34 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
       case 'dpad':
         return renderDirectional(player, control);
       default:
-        return renderButton(player, control);
+        return renderPressable(player, control, 'button');
     }
   }
 
-  function renderButton(player: CouchPlayer, control: CouchControl): HTMLElement {
+  // Button and hold pads differ only in what pressControl/releaseControl send.
+  // A control of a type this SDK doesn't know renders as a button.
+  function renderPressable(player: CouchPlayer, control: CouchControl, kind: 'button' | 'hold'): HTMLElement {
     const btn = document.createElement('button');
-    btn.className = 'couch-sim-pad couch-sim-pad-button';
+    btn.className = `couch-sim-pad couch-sim-pad-${kind}`;
     btn.type = 'button';
     btn.textContent = labelFor(player.id, control);
     btn.dataset.control = control.control;
-    btn.dataset.kind = 'button';
-    const press = (e: Event): void => {
+    btn.dataset.kind = kind;
+    // Only a press that started on this pad may release it: sliding the mouse
+    // over it, or off it while the keyboard holds the control, sends nothing.
+    let pointerDown = false;
+    btn.addEventListener('pointerdown', (e) => {
       e.preventDefault();
-      emitInput(player.id, control.control, 'press');
+      if (pressControl(player.id, control)) pointerDown = true;
+    });
+    const up = (): void => {
+      if (!pointerDown) return;
+      pointerDown = false;
+      releaseControl(player.id, control);
     };
-    const release = (): void => {
-      emitInput(player.id, control.control, 'release');
-    };
-    btn.addEventListener('pointerdown', press);
-    btn.addEventListener('pointerup', release);
-    btn.addEventListener('pointerleave', release);
-    return btn;
-  }
-
-  function renderHold(player: CouchPlayer, control: CouchControl): HTMLElement {
-    const btn = document.createElement('button');
-    btn.className = 'couch-sim-pad couch-sim-pad-hold';
-    btn.type = 'button';
-    btn.textContent = labelFor(player.id, control);
-    btn.dataset.control = control.control;
-    btn.dataset.kind = 'hold';
-
-    let holdStart = 0;
-    let ticker: ReturnType<typeof setInterval> | undefined;
-    let held = false;
-
-    const start = (e: Event): void => {
-      e.preventDefault();
-      if (held) return;
-      held = true;
-      holdStart = Date.now();
-      emitInput(player.id, control.control, 'press');
-      ticker = setInterval(() => {
-        const elapsed = Date.now() - holdStart;
-        // Progress ramps to 1 over ~2s; clamped. Purely illustrative in the sim.
-        const progress = Math.min(1, elapsed / 2000);
-        emitInput(player.id, control.control, 'change', { progress });
-      }, HOLD_TICK_MS);
-    };
-
-    const end = (): void => {
-      if (!held) return;
-      held = false;
-      if (ticker !== undefined) {
-        clearInterval(ticker);
-        ticker = undefined;
-      }
-      const heldMs = Date.now() - holdStart;
-      emitInput(player.id, control.control, 'release', { heldMs });
-    };
-
-    btn.addEventListener('pointerdown', start);
-    btn.addEventListener('pointerup', end);
-    btn.addEventListener('pointerleave', end);
+    btn.addEventListener('pointerup', up);
+    btn.addEventListener('pointercancel', up);
+    btn.addEventListener('pointerleave', up);
     return btn;
   }
 
@@ -530,16 +549,13 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
       emitDirection(pid, directional, wasdDirection());
       return;
     }
-    // Digit1..9 -> nth button press.
+    // Digit1..9 -> nth button/hold control, pressed like its pad.
     const digit = /^Digit([1-9])$/.exec(e.code);
     if (digit) {
       const n = Number(digit[1]) - 1;
       const btns = buttonControls();
       const control = btns[n];
-      if (control && !keyState.has(e.code)) {
-        keyState.add(e.code);
-        emitInput(pid, control.control, 'press');
-      }
+      if (control && !keyState.has(e.code) && pressControl(pid, control)) keyState.add(e.code);
       return;
     }
     if (e.code === 'ArrowUp' || e.code === 'ArrowDown') {
@@ -553,9 +569,8 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
     if (e.code === 'Space') {
       const hold = firstHold();
       if (hold && !keyState.has('Space')) {
-        keyState.add('Space');
         e.preventDefault();
-        emitInput(pid, hold.control, 'press');
+        if (pressControl(pid, hold)) keyState.add('Space');
       }
     }
   };
@@ -575,13 +590,13 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
       keyState.delete(e.code);
       const n = Number(digit[1]) - 1;
       const control = buttonControls()[n];
-      if (control) emitInput(pid, control.control, 'release');
+      if (control) releaseControl(pid, control);
       return;
     }
     if (e.code === 'Space' && keyState.has('Space')) {
       keyState.delete('Space');
       const hold = firstHold();
-      if (hold) emitInput(pid, hold.control, 'release');
+      if (hold) releaseControl(pid, hold);
     }
   };
 
@@ -629,7 +644,21 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
     toastTimer = setTimeout(() => toast.classList.add('is-hidden'), 6000);
   }
 
-  function setController(playerId: string, patch: CouchControllerPatch): void {
+  // Checked like the platform checks it, so a patch a live couch would reject
+  // fails here too, with the reason in the console, instead of only on a TV.
+  function setController(playerId: string, raw: CouchControllerPatch): void {
+    if (!core.players.some((p) => p.id === playerId)) {
+      // eslint-disable-next-line no-console
+      console.error(`[couch] setController rejected: no player "${playerId}". Use an id from couch.players.`);
+      return;
+    }
+    const checked = checkControllerPatch(raw, controls.map((c) => c.control));
+    if (!checked.ok) {
+      // eslint-disable-next-line no-console
+      console.error(`[couch] setController rejected: ${checked.error}. A live couch rejects the whole patch too.`);
+      return;
+    }
+    const patch = checked.patch;
     const entry = overrideFor(playerId);
     if (patch.labels) entry.labels = { ...patch.labels };
     if (patch.disabled) entry.disabled = new Set(patch.disabled);
@@ -670,6 +699,8 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
   function destroy(): void {
     window.removeEventListener('keydown', onKeyDown);
     window.removeEventListener('keyup', onKeyUp);
+    for (const entry of held.values()) if (entry.ticker !== undefined) clearInterval(entry.ticker);
+    held.clear();
     if (toastTimer !== undefined) clearTimeout(toastTimer);
     root.remove();
   }
