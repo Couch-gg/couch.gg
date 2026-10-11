@@ -28,20 +28,28 @@ let sfxPromise: Promise<SfxModule | null> | null = null;
 
 // How long an external game's winner screen stays up after the lobby ends.
 const GAME_OVER_LINGER_MS = 5_000;
+// How often a TV the server doesn't list (anymore) may ask to join again.
+const REJOIN_INTERVAL_MS = 3_000;
+const SCREENS_FULL_NOTICE = 'Diese Lobby hat schon genug Screens. Dieser Screen schaut nur zu, bis einer frei wird.';
+
+const SCREEN_ID_KEY = 'couch:screenId';
+
+function newScreenId(): string {
+  return `scr_${Math.random().toString(36).slice(2, 12)}${Date.now().toString(36)}`;
+}
 
 // This TV's screen id: the one the attract screen registered (and phones scanned),
 // or a fresh one for a TV that opened the lobby URL directly. Games use it to
 // tell which players sit here and which screen is the host.
 function ownScreenId(): string {
-  const key = 'couch:screenId';
   try {
-    const existing = window.sessionStorage.getItem(key);
+    const existing = window.sessionStorage.getItem(SCREEN_ID_KEY);
     if (existing) return existing;
-    const created = `scr_${Math.random().toString(36).slice(2, 12)}${Date.now().toString(36)}`;
-    window.sessionStorage.setItem(key, created);
+    const created = newScreenId();
+    window.sessionStorage.setItem(SCREEN_ID_KEY, created);
     return created;
   } catch {
-    return `scr_${Math.random().toString(36).slice(2, 12)}`;
+    return newScreenId();
   }
 }
 
@@ -73,6 +81,26 @@ function keepScreenToken(slug: string, screenId: string, token: string): void {
   }
 }
 
+// Give up a screen id the server says belongs to another device (the first
+// join of an id binds it, and ids are public, e.g. in the pairing link):
+// forget it and its token, and use a new id in this tab from now on.
+function replaceScreenId(slug: string, old: string): string {
+  const fresh = newScreenId();
+  const key = screenTokenKey(slug, old);
+  screenTokens.delete(key);
+  try {
+    window.sessionStorage.removeItem(key);
+    window.sessionStorage.setItem(SCREEN_ID_KEY, fresh);
+  } catch {
+    // This page keeps the new id in memory.
+  }
+  return fresh;
+}
+
+function statusOf(err: unknown): number | undefined {
+  return (err as { status?: number } | null)?.status;
+}
+
 function loadSfx(): Promise<SfxModule | null> {
   if (sfxPromise) return sfxPromise;
   sfxPromise = (async () => {
@@ -95,12 +123,14 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
   const [lastEvent, setLastEvent] = useState<TrebuchetEvent | null>(null);
   const [lastControlEvent, setLastControlEvent] = useState<TrebuchetControlEvent | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [muted, setMuted] = useState(false);
   // Exposed to the external-game host (game:finish auth) + input hook. The
   // trebuchet path never reads it, so its flow is untouched.
   const [socket, setSocket] = useState<Socket | null>(null);
   const gameHostRef = useRef<GameHostStageHandle | null>(null);
-  const screenId = useMemo(ownScreenId, []);
+  const [screenId, setScreenId] = useState(ownScreenId);
+  const screenIdRef = useRef(screenId);
 
   // A shot can reach this screen via the socket (same instance, instant) or via the
   // polled/snapshot lobby state (cross-instance, ≤750ms). Dedupe by monotonic seq so
@@ -114,43 +144,103 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
 
   useEffect(() => {
     let active = true;
+    // The first join is through (or found no room): from then on reconnects
+    // and the listing check below join again.
+    let ready = false;
+    let joining = false;
+    let lastJoinAt = 0;
+    let replacedId = false;
     const socket = createSocket();
     setSocket(socket);
+    // Join this lobby as this TV. If the server says the screen id belongs to
+    // another device, take a fresh id, once.
     const joinScreen = async () => {
-      const joined = await emitAck<{ ok: true; lobby: Lobby; games: GameManifest[]; screenToken?: string }>(socket, 'screen:join', {
-        slug,
-        screenId,
-        screenToken: readScreenToken(slug, screenId)
-      });
-      if (joined.screenToken) keepScreenToken(slug, screenId, joined.screenToken);
-      return joined;
+      joining = true;
+      lastJoinAt = Date.now();
+      try {
+        for (;;) {
+          const id = screenIdRef.current;
+          try {
+            const joined = await emitAck<{ ok: true; lobby: Lobby; games: GameManifest[]; screenToken?: string }>(socket, 'screen:join', {
+              slug,
+              screenId: id,
+              screenToken: readScreenToken(slug, id)
+            });
+            if (joined.screenToken) keepScreenToken(slug, id, joined.screenToken);
+            if (active) {
+              setNotice(null);
+              if (joined.lobby) setLobby(joined.lobby);
+            }
+            return;
+          } catch (err) {
+            if (statusOf(err) !== 403 || replacedId || !active) throw err;
+            replacedId = true;
+            screenIdRef.current = replaceScreenId(slug, id);
+            setScreenId(screenIdRef.current);
+          }
+        }
+      } finally {
+        joining = false;
+      }
     };
+    // A lobby that already has enough screens still shows here, just without
+    // a screen seat (never the host, no broadcasts) until one frees up.
+    const noRoom = (err: unknown) => {
+      if (statusOf(err) !== 409) return false;
+      if (active) setNotice(SCREENS_FULL_NOTICE);
+      return true;
+    };
+    const rejoin = () => {
+      if (joining) return;
+      void joinScreen().catch((err) => {
+        // Anything but "no room": the poll keeps the screen going and the
+        // next reconnect or listing check retries.
+        noRoom(err);
+      });
+    };
+    // The server may drop a TV that is still here (it missed a rejoin, or a
+    // write got lost between instances), and an unlisted TV is never the host
+    // screen: whenever a snapshot doesn't list this one, join again.
+    const checkListed = (next: Lobby) => {
+      if (!ready || joining || !socket.connected || !next.screens) return;
+      if (next.screens.includes(screenIdRef.current)) return;
+      if (Date.now() - lastJoinAt < REJOIN_INTERVAL_MS) return;
+      rejoin();
+    };
+
     Promise.all([fetchLobby(slug), fetchGames()])
       .then(([initialLobby, gameList]) => {
         if (!active) return;
         setLobby(initialLobby);
         setGames(gameList);
-        return joinScreen();
-      })
-      .then((joined) => {
-        if (joined?.lobby && active) setLobby(joined.lobby);
-        // After a dropped connection the server no longer has this socket in
-        // the lobby room (no inputs, no host role for broadcasts): rejoin.
-        socket.on('connect', () => {
-          void joinScreen().catch(() => {
-            // The poll keeps the screen going; the next reconnect retries.
-          });
+        return joinScreen().catch((err) => {
+          if (!noRoom(err)) throw err;
         });
+      })
+      .then(() => {
+        ready = true;
       })
       .catch((err) => active && setError(err instanceof Error ? err.message : 'Lobby konnte nicht geladen werden'));
 
-    socket.on('lobby:snapshot', (next: Lobby) => setLobby(next));
+    // After a dropped connection the server no longer has this socket in the
+    // lobby room (no inputs, no host role for broadcasts): rejoin.
+    socket.on('connect', () => {
+      if (ready) rejoin();
+    });
+    socket.on('lobby:snapshot', (next: Lobby) => {
+      setLobby(next);
+      checkListed(next);
+    });
     socket.on('game:event', (p: { seq: number; event: TrebuchetEvent }) => applyGameEvent(p.seq, p.event));
     socket.on('game:control', (control: TrebuchetControlEvent) => setLastControlEvent(control));
 
     const refreshTimer = window.setInterval(() => {
       void fetchLobby(slug)
-        .then((next) => active && setLobby(next))
+        .then((next) => {
+          if (!active) return;
+          setLobby(next);
+          checkListed(next);
+        })
         .catch(() => {
           // Socket errors still surface during initial load; polling stays quiet.
         });
@@ -162,7 +252,7 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
       socket.disconnect();
       setSocket(null);
     };
-  }, [slug, applyGameEvent, screenId]);
+  }, [slug, applyGameEvent]);
 
   // Replay the latest event carried inside the polled/snapshot lobby state. This is the
   // cross-instance path: when the opponent fired on a different serverless instance the
@@ -337,6 +427,11 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
             <div>
               <h1>{currentGame?.title ?? 'Trebuchet'}</h1>
               <p>{currentGame?.description ?? 'Waiting for game catalog.'}</p>
+              {notice ? (
+                <p className="screen-notice" role="status">
+                  {notice}
+                </p>
+              ) : null}
             </div>
             <span className={lobby?.state === 'playing' ? 'state-live' : 'state-waiting'}>
               {lobby?.state === 'playing' ? 'Live' : lobby?.players.length ? 'Ready' : 'Waiting'}

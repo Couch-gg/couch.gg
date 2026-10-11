@@ -524,6 +524,11 @@ button:disabled {
   color: var(--muted);
 }
 
+.surface-topline .screen-notice {
+  color: var(--accent);
+  font-weight: 700;
+}
+
 .state-live,
 .state-waiting {
   border-radius: 7px;

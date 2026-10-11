@@ -17,10 +17,11 @@ export function createSocket(): Socket {
 export function emitAck<T>(socket: Socket, event: string, payload: unknown): Promise<T> {
   return new Promise((resolve, reject) => {
     const timeout = window.setTimeout(() => reject(new Error('Realtime connection timed out')), 8_000);
-    const send = () => socket.emit(event, payload, (response: T & { ok?: boolean; error?: string }) => {
+    const send = () => socket.emit(event, payload, (response: T & { ok?: boolean; error?: string; status?: number }) => {
       window.clearTimeout(timeout);
       if (response && response.ok === false) {
-        reject(new Error(response.error || 'Socket event failed'));
+        // Keep the server's status (403, 409, ...) for callers that react to it.
+        reject(Object.assign(new Error(response.error || 'Socket event failed'), { status: response.status }));
         return;
       }
       resolve(response);
