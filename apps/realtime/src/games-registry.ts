@@ -30,7 +30,7 @@ import {
 } from '@couch/game-runtime';
 import type { ExternalGameManifest } from '@couch/types';
 import { LOBBY_TTL_MS } from './lobbies.js';
-import type { GamePersistence } from './persistence.js';
+import { GameWriteConflictError, type GamePersistence } from './persistence.js';
 
 // A published external game plus the registry bookkeeping the manifest itself
 // does not carry. `manifest` is always a full ExternalGameManifest with
@@ -77,6 +77,8 @@ const TOKEN_BYTES = 16; // 128-bit management token
 const MAX_TRACKED_CLIENTS = 50;
 // How long a game session's probe claim is kept: a lobby's lifetime.
 const PROBE_CLAIM_TTL_MS = LOBBY_TTL_MS;
+// How often a probe result that changes nothing but lastCheckedAt is written.
+const PROBE_RECHECK_MS = 10 * 60_000;
 
 // Per-client budgets for the public write endpoints, shared by every instance.
 // A real TV sends one probe result per game it starts.
@@ -287,11 +289,13 @@ export class GamesRegistry {
   }
 
   async remove(id: string, token: string): Promise<void> {
-    const deleted = await this.persistence.deleteGame(id, (record) => {
-      if (!tokenMatches(record, token)) {
-        throw new RegistryError('invalid management token', 401);
-      }
-    });
+    const deleted = await retryable(() =>
+      this.persistence.deleteGame(id, (record) => {
+        if (!tokenMatches(record, token)) {
+          throw new RegistryError('invalid management token', 401);
+        }
+      })
+    );
     this.cache.delete(id);
     if (!deleted) throw new RegistryError('game not found', 404);
   }
@@ -333,13 +337,22 @@ export class GamesRegistry {
   // client not yet in the current run of failures adds one, and at the
   // threshold the probe is 'failed' (which hides it from the catalog via
   // listPublic — perpetual URL-rot defense).
+  //
+  // A result that would only move lastCheckedAt (an ok for a game that is
+  // already ok, a failure that already counts) is written once per
+  // PROBE_RECHECK_MS: a popular game reports ok on every start, and rewriting
+  // its record each time would race every admin and creator write to it.
   async probeResult(id: string, ok: boolean, source: string, now = Date.now()): Promise<PublishedGameRecord> {
     return this.mutate(id, (current) => {
+      const checkedLately =
+        current.probe.lastCheckedAt !== null && now - current.probe.lastCheckedAt < PROBE_RECHECK_MS;
       if (ok) {
+        if (current.probe.status === 'ok' && current.probe.failCount === 0 && checkedLately) return current;
         return { ...current, probe: { status: 'ok', lastCheckedAt: now, failCount: 0, failedBy: [] }, updatedAt: now };
       }
       const failedBy = current.probe.failedBy ?? [];
       if (failedBy.includes(source) || failedBy.length >= MAX_TRACKED_CLIENTS) {
+        if (checkedLately) return current;
         return { ...current, probe: { ...current.probe, lastCheckedAt: now }, updatedAt: now };
       }
       const failCount = current.probe.failCount + 1;
@@ -395,13 +408,26 @@ export class GamesRegistry {
     id: string,
     change: (current: PublishedGameRecord) => PublishedGameRecord
   ): Promise<PublishedGameRecord> {
-    const updated = await this.persistence.updateGame(id, change);
+    const updated = await retryable(() => this.persistence.updateGame(id, change));
     if (!updated) {
       this.cache.delete(id);
       throw new RegistryError('game not found', 404);
     }
     this.cache.set(id, updated);
     return updated;
+  }
+}
+
+// Run a store write; when it keeps losing to concurrent writes to the same
+// game, fail with a 503 so the caller knows to try again.
+async function retryable<T>(write: () => Promise<T>): Promise<T> {
+  try {
+    return await write();
+  } catch (err) {
+    if (err instanceof GameWriteConflictError) {
+      throw new RegistryError('too many concurrent changes to this game, try again', 503);
+    }
+    throw err;
   }
 }
 

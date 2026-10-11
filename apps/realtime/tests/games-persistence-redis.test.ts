@@ -1,6 +1,7 @@
+import { createClient } from 'redis';
 import { describe, expect, it } from 'vitest';
 import { createProductionGamePersistence } from '../src/persistence.js';
-import type { PublishedGameRecord } from '../src/games-registry.js';
+import { GamesRegistry, type PublishedGameRecord } from '../src/games-registry.js';
 
 // The Redis games store's conditional writes. Needs a real Redis: run with
 // TEST_REDIS_URL=redis://localhost:6379. Two stores = two connections, like
@@ -40,6 +41,7 @@ const uniqueId = (prefix: string) => `${prefix}-${Date.now().toString(36)}${Math
 describe.skipIf(!redisUrl)('Redis games store', () => {
   const a = createProductionGamePersistence(redisUrl);
   const b = createProductionGamePersistence(redisUrl);
+  const c = createProductionGamePersistence(redisUrl);
 
   it('creates a record only on a free id', async () => {
     const id = uniqueId('create');
@@ -69,6 +71,43 @@ describe.skipIf(!redisUrl)('Redis games store', () => {
     expect(await a.loadGame(id)).toMatchObject({ hidden: true, reports: 5 });
     // Some writes had to start over (a plain GET + SET would have lost them).
     expect(attempts).toBeGreaterThan(5);
+  });
+
+  it('lands every one of many concurrent writes to one game', async () => {
+    // Without a pause between attempts, writers that collided collide again
+    // in lockstep and some run out of attempts (a 500 for an admin takedown).
+    const id = uniqueId('crowd');
+    await a.createGame(record(id));
+    const stores = [a, b, c];
+    const results = await Promise.allSettled(
+      Array.from({ length: 16 }, (_, i) =>
+        stores[i % stores.length].updateGame(id, (current) => ({ ...current, reports: current.reports + 1 }))
+      )
+    );
+    expect(results.filter((result) => result.status === 'rejected')).toEqual([]);
+    expect(await a.loadGame(id)).toMatchObject({ reports: 16 });
+  });
+
+  it('writes nothing for a probe ok on a game that is already ok', async () => {
+    const id = uniqueId('healthy');
+    await a.createGame({ ...record(id), probe: { status: 'ok', lastCheckedAt: 1_000, failCount: 0, failedBy: [] } });
+    const registry = new GamesRegistry(a);
+    // EXEC on a connection that WATCHes the key fails once anything wrote it.
+    const watcher = createClient({ url: redisUrl });
+    await watcher.connect();
+    try {
+      const key = `couch:game:${id}`;
+      await watcher.watch(key);
+      await registry.probeResult(id, true, 'tv-a', 2_000);
+      await expect(watcher.multi().get(key).exec()).resolves.toHaveLength(1);
+      // Once lastCheckedAt is old, the ok is written.
+      await watcher.watch(key);
+      await registry.probeResult(id, true, 'tv-a', 1_000 + 10 * 60_000);
+      await expect(watcher.multi().get(key).exec()).rejects.toThrow();
+      expect((await b.loadGame(id))?.probe.lastCheckedAt).toBe(601_000);
+    } finally {
+      watcher.destroy();
+    }
   });
 
   it('never recreates a deleted record on update', async () => {

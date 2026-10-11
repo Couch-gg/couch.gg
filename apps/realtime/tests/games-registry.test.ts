@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { FALLBACK_THUMBNAIL_GRADIENT, FALLBACK_THUMBNAIL_ICON } from '@couch/game-runtime';
-import { InMemoryGamePersistence, type GamePersistence } from '../src/persistence.js';
+import { GameWriteConflictError, InMemoryGamePersistence, type GamePersistence } from '../src/persistence.js';
 import {
   GamesRegistry,
   RegistryError,
@@ -283,6 +283,34 @@ describe('probeResult', () => {
     expect(registry.listPublic()).toHaveLength(1);
   });
 
+  it('writes an ok for a game that is already ok once per 10 minutes', async () => {
+    const persistence = makePersistence();
+    const registry = new GamesRegistry(persistence);
+    await registry.submit(manifestInput(), { probeFn: okProbe, handshakeOk: true, now: () => 1_000 });
+    // Every start of a popular game reports ok: those leave the record alone...
+    const soon = await registry.probeResult('tap-race', true, 'tv-a', 1_000 + 9 * 60_000);
+    expect(soon).toMatchObject({ updatedAt: 1_000, probe: { status: 'ok', lastCheckedAt: 1_000 } });
+    expect(await persistence.loadGame('tap-race')).toMatchObject({ updatedAt: 1_000 });
+    // ...until lastCheckedAt is 10 minutes old.
+    const later = await registry.probeResult('tap-race', true, 'tv-b', 1_000 + 10 * 60_000);
+    expect(later).toMatchObject({ updatedAt: 601_000, probe: { status: 'ok', lastCheckedAt: 601_000 } });
+    expect(await persistence.loadGame('tap-race')).toMatchObject({ updatedAt: 601_000 });
+  });
+
+  it('writes a failure that already counts once per 10 minutes, and an ok after failures at once', async () => {
+    const persistence = makePersistence();
+    const registry = new GamesRegistry(persistence);
+    await submitTapRace(registry);
+    await registry.probeResult('tap-race', false, 'tv-a', 5_000);
+    const repeated = await registry.probeResult('tap-race', false, 'tv-a', 6_000);
+    expect(repeated).toMatchObject({ updatedAt: 5_000, probe: { failCount: 1, lastCheckedAt: 5_000 } });
+    const later = await registry.probeResult('tap-race', false, 'tv-a', 5_000 + 10 * 60_000);
+    expect(later.probe).toMatchObject({ failCount: 1, lastCheckedAt: 605_000 });
+    // An ok after a failure always counts, however recent the last check.
+    const recovered = await registry.probeResult('tap-race', true, 'tv-b', 606_000);
+    expect(recovered.probe).toMatchObject({ status: 'ok', failCount: 0, lastCheckedAt: 606_000 });
+  });
+
   it('a restore takes a probe-failed game back into the catalog', async () => {
     const registry = new GamesRegistry(makePersistence());
     await submitTapRace(registry);
@@ -408,6 +436,40 @@ describe('admin ops', () => {
     const serialized = JSON.stringify(view);
     expect(serialized).not.toContain('reporter-id-a');
     expect(serialized).not.toContain('failing-tv-id-b');
+  });
+});
+
+describe('writes that keep losing to concurrent writes', () => {
+  it('fail with a 503, so the caller knows to try again', async () => {
+    const persistence = makePersistence();
+    const registry = new GamesRegistry(persistence);
+    const { managementToken } = await submitTapRace(registry);
+    persistence.updateGame = async (id) => {
+      throw new GameWriteConflictError(id);
+    };
+    persistence.deleteGame = async (id) => {
+      throw new GameWriteConflictError(id);
+    };
+    const retryLater = { status: 503, message: 'too many concurrent changes to this game, try again' };
+    await expect(registry.setHidden('tap-race', true)).rejects.toMatchObject(retryLater);
+    await expect(registry.setFeatured('tap-race', true)).rejects.toMatchObject(retryLater);
+    await expect(registry.report('tap-race', 'client-a')).rejects.toMatchObject(retryLater);
+    await expect(registry.probeResult('tap-race', false, 'tv-a')).rejects.toMatchObject(retryLater);
+    await expect(registry.update('tap-race', managementToken, manifestInput())).rejects.toMatchObject(retryLater);
+    await expect(registry.remove('tap-race', managementToken)).rejects.toBeInstanceOf(RegistryError);
+    // Nothing was dropped from the cache on the way.
+    expect(registry.resolveById('tap-race')).not.toBeNull();
+  });
+
+  it('pass any other store failure through as it is', async () => {
+    const persistence = makePersistence();
+    const registry = new GamesRegistry(persistence);
+    await submitTapRace(registry);
+    persistence.updateGame = async () => {
+      throw new Error('connection lost');
+    };
+    await expect(registry.setHidden('tap-race', true)).rejects.toThrow('connection lost');
+    await expect(registry.setHidden('tap-race', true)).rejects.not.toBeInstanceOf(RegistryError);
   });
 });
 

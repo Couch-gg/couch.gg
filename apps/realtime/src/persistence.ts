@@ -24,11 +24,12 @@ export interface GamePersistence {
   createGame(record: PublishedGameRecord): Promise<boolean>;
   // Read-modify-write of the stored record: `change` gets it and returns the
   // next one, or throws to write nothing. Starts over when another write got
-  // in between, so `change` may run more than once. Null (nothing written)
-  // when there is no record.
+  // in between, so `change` may run more than once, and throws
+  // GameWriteConflictError when it keeps losing. Null (nothing written) when
+  // there is no record; returning the record unchanged writes nothing either.
   updateGame(id: string, change: (current: PublishedGameRecord) => PublishedGameRecord): Promise<PublishedGameRecord | null>;
   // Delete the stored record once `check` accepts it (it throws to keep the
-  // record). False when there is no record.
+  // record). False when there is no record. Retries like updateGame.
   deleteGame(id: string, check?: (current: PublishedGameRecord) => void): Promise<boolean>;
   listGames(): Promise<PublishedGameRecord[]>;
   // Take a one-time marker for ttlMs (e.g. one probe result per game session).
@@ -37,6 +38,14 @@ export interface GamePersistence {
   // Count a hit against a limit every instance shares: the number of hits on
   // `key` in the window of windowMs that began with its first hit.
   countHit(key: string, windowMs: number): Promise<number>;
+}
+
+// A conditional games write lost to other writes to the same game on every
+// attempt. Nothing was written; trying again later can succeed.
+export class GameWriteConflictError extends Error {
+  constructor(id: string) {
+    super(`Games persistence: too many concurrent writes to ${id}`);
+  }
 }
 
 export interface LobbyPersistence {
@@ -400,8 +409,18 @@ const COUNT_HIT_SCRIPT = `
 local hits = redis.call('INCR', KEYS[1])
 if hits == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end
 return hits`;
-// How often a read-modify-write starts over before giving up.
+// How often a read-modify-write starts over before giving up, and the longest
+// wait before a new attempt.
 const MAX_WRITE_ATTEMPTS = 8;
+const MAX_WRITE_BACKOFF_MS = 50;
+
+// Wait before attempt number `attempt` (1 = the first retry): a random share
+// of a ceiling that doubles with each lost race, so writers that collided
+// don't all come back at once and collide again.
+function writeBackoff(attempt: number): Promise<void> {
+  const ceiling = Math.min(MAX_WRITE_BACKOFF_MS, 5 * 2 ** attempt);
+  return new Promise((resolve) => setTimeout(resolve, Math.random() * ceiling));
+}
 
 class RedisGamePersistence implements GamePersistence {
   enabled = true;
@@ -433,6 +452,7 @@ class RedisGamePersistence implements GamePersistence {
   ): Promise<PublishedGameRecord | null> {
     const client = await this.client();
     for (let attempt = 0; attempt < MAX_WRITE_ATTEMPTS; attempt++) {
+      if (attempt > 0) await writeBackoff(attempt);
       const raw = await client.get(gameKey(id));
       if (!raw) return null;
       const next = change(JSON.parse(raw) as PublishedGameRecord);
@@ -441,12 +461,13 @@ class RedisGamePersistence implements GamePersistence {
       const replaced = await client.eval(REPLACE_GAME_SCRIPT, { keys: [gameKey(id)], arguments: [raw, encoded] });
       if (Number(replaced) === 1) return next;
     }
-    throw new Error(`Games persistence: too many concurrent writes to ${id}`);
+    throw new GameWriteConflictError(id);
   }
 
   async deleteGame(id: string, check?: (current: PublishedGameRecord) => void): Promise<boolean> {
     const client = await this.client();
     for (let attempt = 0; attempt < MAX_WRITE_ATTEMPTS; attempt++) {
+      if (attempt > 0) await writeBackoff(attempt);
       const raw = await client.get(gameKey(id));
       if (!raw) return false;
       check?.(JSON.parse(raw) as PublishedGameRecord);
@@ -456,7 +477,7 @@ class RedisGamePersistence implements GamePersistence {
       });
       if (Number(deleted) === 1) return true;
     }
-    throw new Error(`Games persistence: too many concurrent writes to ${id}`);
+    throw new GameWriteConflictError(id);
   }
 
   // SMEMBERS + MGET, pruning any index ids whose record has vanished (e.g. a key
