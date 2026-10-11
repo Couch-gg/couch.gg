@@ -1,15 +1,37 @@
 import type { AddressInfo } from 'node:net';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { io as connect, type Socket } from 'socket.io-client';
+import type { ExternalGameManifest } from '@couch/types';
 import { createRealtimeServer, type RealtimeServerInstance } from '../src/index.js';
 
-describe('game:state (host-authoritative broadcast)', () => {
+const DUEL: ExternalGameManifest = {
+  id: 'screen-duel',
+  title: 'Screen Duel',
+  description: 'Test game.',
+  minPlayers: 1,
+  maxPlayers: 4,
+  controllerLayout: { kind: 'generic-buttons', controls: [{ control: 'jump', type: 'button', label: 'Jump' }] },
+  aspectRatio: '16:9',
+  estimatedDurationMinutes: 1,
+  status: 'published',
+  origin: 'external',
+  entryUrl: 'https://games.example.com/duel/',
+  supportsRemote: true,
+  sdkProtocol: 1,
+  publishedAt: '2026-10-01T00:00:00.000Z',
+  thumbnail: { kind: 'css', gradient: 'linear-gradient(#000,#111)', icon: 'Zap' }
+};
+
+type Ack<T = unknown> = T & { ok: boolean; error?: string; status?: number };
+
+describe('host screens (host-authoritative broadcast)', () => {
   let instance: RealtimeServerInstance;
   let url = '';
   const sockets: Socket[] = [];
 
   beforeAll(async () => {
-    instance = createRealtimeServer();
+    process.env.EXTERNAL_GAMES_JSON = JSON.stringify([DUEL]);
+    instance = createRealtimeServer({ screenGraceMs: 150 });
     await new Promise<void>((resolve) => instance.server.listen(0, resolve));
     url = `http://localhost:${(instance.server.address() as AddressInfo).port}`;
   });
@@ -17,6 +39,7 @@ describe('game:state (host-authoritative broadcast)', () => {
   afterAll(() => {
     for (const socket of sockets) socket.disconnect();
     instance.io.close();
+    delete process.env.EXTERNAL_GAMES_JSON;
   });
 
   function open(): Socket {
@@ -25,36 +48,133 @@ describe('game:state (host-authoritative broadcast)', () => {
     return socket;
   }
 
-  function ack<T>(socket: Socket, event: string, payload: unknown): Promise<T & { ok: boolean; error?: string }> {
+  function ack<T>(socket: Socket, event: string, payload: unknown): Promise<Ack<T>> {
     return new Promise((resolve) => socket.emit(event, payload, resolve));
   }
 
+  function collect(socket: Socket, event: string): unknown[] {
+    const seen: unknown[] = [];
+    socket.on(event, (e: unknown) => seen.push(e));
+    return seen;
+  }
+
+  async function remoteLobby(): Promise<string> {
+    const created = await fetch(`${url}/api/lobbies`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{"mode":"remote"}'
+    }).then((r) => r.json());
+    return created.lobby.slug;
+  }
+
+  // Two TVs and a phone each: Alex (host) sits at TV A, Bea at TV B.
+  async function twoScreens(gameRunning = false) {
+    const slug = await remoteLobby();
+    const tvA = open();
+    const tvB = open();
+    const joinA = await ack<{ screenToken?: string }>(tvA, 'screen:join', { slug, screenId: 'scr_tva' });
+    const joinB = await ack<{ screenToken?: string }>(tvB, 'screen:join', { slug, screenId: 'scr_tvb' });
+    const alex = open();
+    const bea = open();
+    const host = await ack<{ playerToken: string; player: { id: string } }>(alex, 'controller:join', { slug, name: 'Alex', screenId: 'scr_tva' });
+    const guest = await ack<{ playerToken: string; player: { id: string } }>(bea, 'controller:join', { slug, name: 'Bea', screenId: 'scr_tvb' });
+    if (gameRunning) {
+      await ack(alex, 'game:select', { slug, playerToken: host.playerToken, gameId: DUEL.id });
+      expect((await ack(alex, 'game:start', { slug, playerToken: host.playerToken })).ok).toBe(true);
+    }
+    return { slug, tvA, tvB, joinA, joinB, alex, bea, host, guest };
+  }
+
+  const lobbyOf = (slug: string) => fetch(`${url}/api/lobbies/${slug}`).then((r) => r.json()).then((body) => body.lobby);
+
   it('relays the host screen to the other screens and refuses everyone else', async () => {
-    const created = await fetch(`${url}/api/lobbies`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"mode":"remote"}' }).then((r) => r.json());
-    const slug: string = created.lobby.slug;
+    const { slug, tvA, tvB, alex } = await twoScreens();
+    const atGuest = collect(tvB, 'game:state');
+    const atHost = collect(tvA, 'game:state');
 
-    const hostTv = open();
-    const guestTv = open();
-    await ack(hostTv, 'screen:join', { slug, screenId: 'scr_hostscreen' });
-    await ack(guestTv, 'screen:join', { slug, screenId: 'scr_guestscreen' });
-    const phone = open();
-    await ack(phone, 'controller:join', { slug, name: 'Alex', screenId: 'scr_hostscreen' });
-
-    const atGuest: unknown[] = [];
-    const atHost: unknown[] = [];
-    guestTv.on('game:state', (e: unknown) => atGuest.push(e));
-    hostTv.on('game:state', (e: unknown) => atHost.push(e));
-
-    expect((await ack(hostTv, 'game:state', { slug, seq: 1, state: { x: 5 } })).ok).toBe(true);
+    expect((await ack(tvA, 'game:state', { slug, epoch: 'run1', seq: 1, state: { x: 5 } })).ok).toBe(true);
     await expect.poll(() => atGuest.length).toBe(1);
     expect(atGuest[0]).toMatchObject({ seq: 1, state: { x: 5 } });
     expect(atHost).toHaveLength(0);
 
-    const fromGuest = await ack(guestTv, 'game:state', { slug, seq: 1, state: {} });
+    const fromGuest = await ack(tvB, 'game:state', { slug, epoch: 'x', seq: 1, state: {} });
     expect(fromGuest).toMatchObject({ ok: false, status: 403 });
-    const fromPhone = await ack(phone, 'game:state', { slug, seq: 1, state: {} });
+    const fromPhone = await ack(alex, 'game:state', { slug, epoch: 'x', seq: 1, state: {} });
     expect(fromPhone).toMatchObject({ ok: false, status: 403 });
-    const tooBig = await ack(hostTv, 'game:state', { slug, seq: 2, state: 'x'.repeat(40_000) });
+    const tooBig = await ack(tvA, 'game:state', { slug, epoch: 'run1', seq: 2, state: 'x'.repeat(40_000) });
     expect(tooBig).toMatchObject({ ok: false, status: 413 });
+  });
+
+  it('binds a screen id to its first join, so the public host id cannot be joined as', async () => {
+    const { slug, joinA } = await twoScreens();
+    expect(typeof joinA.screenToken).toBe('string');
+
+    // The host screen id is public (lobby snapshot); knowing it is not enough.
+    expect((await lobbyOf(slug)).hostScreenId).toBe('scr_tva');
+    const impostor = open();
+    expect(await ack(impostor, 'screen:join', { slug, screenId: 'scr_tva' })).toMatchObject({ ok: false, status: 403 });
+    expect(await ack(impostor, 'screen:join', { slug, screenId: 'scr_tva', screenToken: 'nope' })).toMatchObject({ ok: false, status: 403 });
+    expect(await ack(impostor, 'game:state', { slug, epoch: 'x', seq: 1, state: {} })).toMatchObject({ ok: false, status: 403 });
+
+    // The real TV rejoining (reload, reconnect) presents its token.
+    const reloaded = open();
+    const rejoin = await ack<{ screenToken?: string }>(reloaded, 'screen:join', { slug, screenId: 'scr_tva', screenToken: joinA.screenToken });
+    expect(rejoin.ok).toBe(true);
+    expect(rejoin.screenToken).toBeUndefined();
+    expect((await ack(reloaded, 'game:state', { slug, epoch: 'run2', seq: 1, state: {} })).ok).toBe(true);
+  });
+
+  it('refuses screens beyond the maximum instead of evicting the host screen', async () => {
+    const { slug, tvA } = await twoScreens();
+    for (let i = 0; i < 6; i++) {
+      expect((await ack(open(), 'screen:join', { slug, screenId: `scr_extra${i}` })).ok).toBe(true);
+    }
+    expect(await ack(open(), 'screen:join', { slug, screenId: 'scr_onetoomany' })).toMatchObject({ ok: false, status: 409 });
+    const lobby = await lobbyOf(slug);
+    expect(lobby.screens).toHaveLength(8);
+    expect(lobby.screens).not.toContain('scr_onetoomany');
+    expect(lobby.hostScreenId).toBe('scr_tva');
+    expect((await ack(tvA, 'game:state', { slug, epoch: 'run1', seq: 1, state: {} })).ok).toBe(true);
+  });
+
+  it('lets only the host screen finish the game or drive the phones', async () => {
+    const { slug, tvA, tvB, bea, guest } = await twoScreens(true);
+    const controllerAtBea = collect(bea, 'controller:state');
+
+    const ignored = await ack(tvB, 'screen:controller', { slug, playerId: guest.player.id, patch: { disabled: ['jump'] } });
+    expect(ignored).toEqual({ ok: true, ignored: true });
+    expect((await lobbyOf(slug)).controllerState?.[guest.player.id]).toBeUndefined();
+
+    const scores = [{ playerId: guest.player.id, score: 99 }];
+    expect(await ack(tvB, 'game:finish', { slug, scores })).toMatchObject({ ok: false, status: 403 });
+    expect((await lobbyOf(slug)).state).toBe('playing');
+
+    expect(await ack(tvA, 'screen:controller', { slug, playerId: guest.player.id, patch: { disabled: ['jump'] } })).toMatchObject({ ok: true });
+    await expect.poll(() => controllerAtBea.length).toBe(1);
+    expect(await ack(tvA, 'game:finish', { slug, scores })).toEqual({ ok: true, finished: true });
+    expect((await lobbyOf(slug)).state).toBe('ended');
+  });
+
+  it('drops a screen whose TV is gone after the grace period, so a live screen takes over', async () => {
+    const { slug, tvA, tvB, joinB } = await twoScreens(true);
+    tvA.disconnect();
+    await expect.poll(async () => (await lobbyOf(slug)).screens, { timeout: 5_000 }).toEqual(['scr_tvb']);
+    const lobby = await lobbyOf(slug);
+    // Alex still sits at TV A, but a dead seat is never the host screen.
+    expect(lobby.players.find((p: { name: string }) => p.name === 'Alex').screenId).toBe('scr_tva');
+    expect(lobby.hostScreenId).toBe('scr_tvb');
+    expect((await ack(tvB, 'game:state', { slug, epoch: 'run2', seq: 1, state: {} })).ok).toBe(true);
+    expect(joinB.ok).toBe(true);
+  });
+
+  it('keeps a screen that comes back within the grace period (reload)', async () => {
+    const { slug, tvA, joinA } = await twoScreens();
+    tvA.disconnect();
+    const reloaded = open();
+    expect((await ack(reloaded, 'screen:join', { slug, screenId: 'scr_tva', screenToken: joinA.screenToken })).ok).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const lobby = await lobbyOf(slug);
+    expect(lobby.screens).toEqual(['scr_tva', 'scr_tvb']);
+    expect(lobby.hostScreenId).toBe('scr_tva');
   });
 });

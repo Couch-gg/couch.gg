@@ -259,6 +259,9 @@ couch.gameOver({ p1: 30, p2: 12 });
 - Both forms are accepted; the record form is normalised to the array form
   (`playerId` string, `score` number).
 - **Call it exactly once.** A second call logs a warning and is ignored.
+- In a remote couch only the host screen's `gameOver` ends the round; a
+  non-host screen's call waits and only counts if that screen becomes the host
+  while the round is still running. So make sure the host screen calls it.
 - After this, the platform shows your winner screen for ~5 seconds, then returns
   to the catalog (section 9).
 
@@ -294,6 +297,9 @@ couch.setController(ranger.id, { disabled: ['a'] });
 - Everything resets when a new round starts. In the dev simulator the fake
   phones show labels, disabled controls and cooldowns too.
 - Budget: about 20 updates per second per lobby. Send changes, not every frame.
+- In a remote couch every screen may run your code; the platform only forwards
+  the host screen's `setController` calls (`couch.screen.isHost`), so each one
+  reaches the phone once.
 
 ---
 

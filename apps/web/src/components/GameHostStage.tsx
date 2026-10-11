@@ -145,6 +145,8 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
   const initializedRef = useRef(false); // sent couch:init at least once
   const readyRef = useRef(false);
   const finishedRef = useRef(false); // game:finish sent (idempotent guard)
+  // Scores waiting for this screen to be the host screen (only it may finish).
+  const pendingFinishRef = useRef<CouchScore[] | null>(null);
   const probedRef = useRef(false); // probe-result sent (once)
   const knownPlayersRef = useRef<Map<string, CouchPlayer>>(new Map());
 
@@ -190,6 +192,26 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
     } catch {
       /* never throw out of a lifecycle path */
     }
+  }, []);
+
+  // --- game:finish: only the host screen reports (the server refuses the
+  // others). A screen that isn't the host keeps the scores and sends them if
+  // it becomes the host while the game is still running (the host TV left).
+  const sendFinish = useCallback(() => {
+    const scores = pendingFinishRef.current;
+    const sock = socketRef.current;
+    const l = lobbyRef.current;
+    if (!scores || !sock || finishedRef.current || l.state !== 'playing') return;
+    if (!screenRole(l, screenIdRef.current).isHost) return;
+    finishedRef.current = true;
+    void emitAck(sock, 'game:finish', { slug: l.slug, scores })
+      .then(() => {
+        pendingFinishRef.current = null;
+      })
+      .catch(() => {
+        // Not the host after all (stale view): retry on the next lobby update.
+        finishedRef.current = false;
+      });
   }, []);
 
   // --- Build & send couch:init (idempotent; SDK ignores duplicate inits). ---
@@ -281,15 +303,9 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
           const scores = normalizeScores((msg as { scores?: unknown }).scores);
           onEventRef.current?.({ kind: 'gameOver', detail: { scores } });
           if (modeRef.current === 'test') break; // /dev owns the finish
-          if (finishedRef.current) break;
-          finishedRef.current = true;
-          const sock = socketRef.current;
-          if (sock) {
-            // Screen sockets are authorized server-side; fire-and-forget.
-            void emitAck(sock, 'game:finish', { slug: lobbyRef.current.slug, scores }).catch(() => {
-              /* server logs; nothing to do client-side */
-            });
-          }
+          if (finishedRef.current || pendingFinishRef.current) break;
+          pendingFinishRef.current = scores;
+          sendFinish();
           break;
         }
         case 'couch:broadcast': {
@@ -311,6 +327,9 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
           if (typeof playerId !== 'string' || !patch || typeof patch !== 'object') break;
           onEventRef.current?.({ kind: 'controller', detail: { playerId, patch } });
           if (modeRef.current === 'test') break; // /dev shows it; no phones to update
+          // In a remote couch every screen may run the game: only the host
+          // screen's calls go to the phones, so each one lands once.
+          if (!screenRole(lobbyRef.current, screenIdRef.current).isHost) break;
           const sock = socketRef.current;
           if (!sock) break;
           // The server validates the patch against the manifest; log its
@@ -337,7 +356,7 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
 
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
-  }, [sendInit, sendProbeResult]);
+  }, [sendInit, sendProbeResult, sendFinish]);
 
   // --- Ready timeout: no couch:ready within 15s -> error overlay + probe fail. ---
   useEffect(() => {
@@ -402,6 +421,11 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
     screenKeyRef.current = key;
     post({ v: 1, type: 'couch:screen', screen });
   }, [lobby, screenId, post]);
+
+  // --- A finish this screen held back goes out once it is the host screen. ---
+  useEffect(() => {
+    if (mode === 'live') sendFinish();
+  }, [lobby, screenId, mode, sendFinish]);
 
   // --- Host-authoritative state from the host screen -> couch:state. ---
   useEffect(() => {

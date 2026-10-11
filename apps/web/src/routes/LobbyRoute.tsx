@@ -45,6 +45,34 @@ function ownScreenId(): string {
   }
 }
 
+// The secret the server handed this TV on its first screen:join, proving on
+// every rejoin (reload, reconnect) that the screen id is really ours. Kept for
+// the tab like the screen id itself; memory is the fallback without storage.
+const screenTokens = new Map<string, string>();
+
+function screenTokenKey(slug: string, screenId: string): string {
+  return `couch:screenToken:${slug}:${screenId}`;
+}
+
+function readScreenToken(slug: string, screenId: string): string | undefined {
+  const key = screenTokenKey(slug, screenId);
+  try {
+    return window.sessionStorage.getItem(key) ?? screenTokens.get(key);
+  } catch {
+    return screenTokens.get(key);
+  }
+}
+
+function keepScreenToken(slug: string, screenId: string, token: string): void {
+  const key = screenTokenKey(slug, screenId);
+  screenTokens.set(key, token);
+  try {
+    window.sessionStorage.setItem(key, token);
+  } catch {
+    // The in-memory copy covers this page's lifetime.
+  }
+}
+
 function loadSfx(): Promise<SfxModule | null> {
   if (sfxPromise) return sfxPromise;
   sfxPromise = (async () => {
@@ -88,19 +116,28 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
     let active = true;
     const socket = createSocket();
     setSocket(socket);
+    const joinScreen = async () => {
+      const joined = await emitAck<{ ok: true; lobby: Lobby; games: GameManifest[]; screenToken?: string }>(socket, 'screen:join', {
+        slug,
+        screenId,
+        screenToken: readScreenToken(slug, screenId)
+      });
+      if (joined.screenToken) keepScreenToken(slug, screenId, joined.screenToken);
+      return joined;
+    };
     Promise.all([fetchLobby(slug), fetchGames()])
       .then(([initialLobby, gameList]) => {
         if (!active) return;
         setLobby(initialLobby);
         setGames(gameList);
-        return emitAck<{ ok: true; lobby: Lobby; games: GameManifest[] }>(socket, 'screen:join', { slug, screenId });
+        return joinScreen();
       })
       .then((joined) => {
         if (joined?.lobby && active) setLobby(joined.lobby);
         // After a dropped connection the server no longer has this socket in
         // the lobby room (no inputs, no host role for broadcasts): rejoin.
         socket.on('connect', () => {
-          void emitAck(socket, 'screen:join', { slug, screenId }).catch(() => {
+          void joinScreen().catch(() => {
             // The poll keeps the screen going; the next reconnect retries.
           });
         });

@@ -547,10 +547,10 @@ describe('screens and the host screen (host-authoritative mode)', () => {
     const lobby = store.createLobby(Date.now(), 'remote');
     expect(store.publicLobby(lobby.slug).hostScreenId).toBeNull();
 
-    store.addScreen(lobby.slug, 'scr_guest');
-    store.addScreen(lobby.slug, 'scr_host');
-    expect(store.addScreen(lobby.slug, 'scr_host')).toBe(false); // already known
-    expect(store.addScreen(lobby.slug, 'not a screen id')).toBe(false);
+    store.joinScreen(lobby.slug, 'scr_guest', undefined);
+    const hostScreen = store.joinScreen(lobby.slug, 'scr_host', undefined);
+    expect(store.joinScreen(lobby.slug, 'scr_host', hostScreen.screenToken).changed).toBe(false); // already known
+    expect(store.joinScreen(lobby.slug, 'not a screen id', undefined)).toEqual({ screenId: null, changed: false });
     expect(store.publicLobby(lobby.slug).hostScreenId).toBe('scr_guest');
 
     const host = store.joinPlayer(lobby.slug, 'Alex', undefined, 'scr_host');
@@ -569,5 +569,55 @@ describe('screens and the host screen (host-authoritative mode)', () => {
     store.joinPlayer(lobby.slug, 'Bea', guest.playerToken);
     expect(store.getLobby(lobby.slug).players.get(guest.player.id)?.screenId).toBe('scr_guest');
     expect(host.player.screenId).toBe('scr_host');
+  });
+
+  it('binds a screen id to the token from its first join', () => {
+    const store = new LobbyStore(makeResolver(TAP_RACE));
+    const { slug } = store.createLobby(Date.now(), 'remote');
+    const first = store.joinScreen(slug, 'scr_tv', undefined);
+    expect(first).toMatchObject({ screenId: 'scr_tv', changed: true });
+    expect(typeof first.screenToken).toBe('string');
+    expect(first.screenToken!.length).toBeGreaterThanOrEqual(32);
+
+    // Rejoin (reload/reconnect): the token is required, and not handed out again.
+    expect(() => store.joinScreen(slug, 'scr_tv', undefined)).toThrow(/anderen Gerät/);
+    expect(() => store.joinScreen(slug, 'scr_tv', 'guessed')).toThrow(/anderen Gerät/);
+    expect(store.joinScreen(slug, 'scr_tv', first.screenToken)).toEqual({ screenId: 'scr_tv', changed: false, screenToken: undefined });
+
+    // Only the hash is kept, it survives persistence, and it is never public.
+    const record = store.getLobby(slug);
+    expect(Object.values(record.screenSecrets)).not.toContain(first.screenToken);
+    const restored = deserializeLobbyRecord(serializeLobbyRecord(record));
+    expect(restored.screenSecrets).toEqual(record.screenSecrets);
+    expect(JSON.stringify(store.publicLobby(slug))).not.toContain(record.screenSecrets.scr_tv);
+  });
+
+  it('refuses a new screen once the lobby is full instead of evicting one', () => {
+    const store = new LobbyStore(makeResolver(TAP_RACE));
+    const { slug } = store.createLobby(Date.now(), 'remote');
+    for (let i = 0; i < 8; i++) store.joinScreen(slug, `scr_tv${i}`, undefined);
+    expect(() => store.joinScreen(slug, 'scr_late', undefined)).toThrow(/genug Screens/);
+    expect(store.getLobby(slug).screens).toEqual(['scr_tv0', 'scr_tv1', 'scr_tv2', 'scr_tv3', 'scr_tv4', 'scr_tv5', 'scr_tv6', 'scr_tv7']);
+    expect(store.publicLobby(slug).hostScreenId).toBe('scr_tv0');
+    expect(store.getLobby(slug).screenSecrets.scr_late).toBeUndefined();
+  });
+
+  it('falls back to a live screen when the host seat is removed, and the TV can come back', () => {
+    const store = new LobbyStore(makeResolver(TAP_RACE));
+    const { slug } = store.createLobby(Date.now(), 'remote');
+    const a = store.joinScreen(slug, 'scr_a', undefined);
+    store.joinScreen(slug, 'scr_b', undefined);
+    store.joinPlayer(slug, 'Alex', undefined, 'scr_a');
+    expect(store.publicLobby(slug).hostScreenId).toBe('scr_a');
+
+    expect(store.removeScreen(slug, 'scr_a')).toBe(true);
+    expect(store.removeScreen(slug, 'scr_a')).toBe(false);
+    expect(store.publicLobby(slug).hostScreenId).toBe('scr_b');
+
+    // The same TV rejoins with its token and is the host seat again; nobody
+    // else can claim its id meanwhile.
+    expect(() => store.joinScreen(slug, 'scr_a', undefined)).toThrow(/anderen Gerät/);
+    expect(store.joinScreen(slug, 'scr_a', a.screenToken).changed).toBe(true);
+    expect(store.publicLobby(slug).hostScreenId).toBe('scr_a');
   });
 });
