@@ -690,6 +690,10 @@ top-level to skip the wait.
   nudge the first slider, `W`/`A`/`S`/`D` steer the first stick or d-pad. A
   hold sends the same `change` ticks and `release` `{ heldMs }` from the
   keyboard as from its fake phone.
+- As on a phone, a held control is released the moment `setController`
+  disables it or starts its cooldown, and everything held is released when the
+  window loses focus or is hidden. A key still down after that must be let go
+  and pressed again.
 - The seed box: type a seed and press Enter to set `couch.seed`. Your game sees
   it the next time it reads `couch.seed` (e.g. when it starts a new round);
   reload for a new random seed.

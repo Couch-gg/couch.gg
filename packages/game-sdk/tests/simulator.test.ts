@@ -17,7 +17,8 @@ const manifest: CouchManifest = {
     kind: 'generic-buttons',
     controls: [
       { control: 'tap', type: 'button', label: 'Tap' },
-      { control: 'charge', type: 'hold', label: 'Charge' }
+      { control: 'charge', type: 'hold', label: 'Charge' },
+      { control: 'move', type: 'dpad', label: 'Move' }
     ]
   }
 };
@@ -60,7 +61,8 @@ function recordingCore(): Recorder {
 
 const actions = (inputs: CouchInputEnvelope[]) => inputs.map((i) => `${i.control}:${i.action}`);
 const fire = (el: Element, type: string) => el.dispatchEvent(new Event(type, { bubbles: true }));
-const key = (type: 'keydown' | 'keyup', code: string) => window.dispatchEvent(new KeyboardEvent(type, { code }));
+const key = (type: 'keydown' | 'keyup', code: string, repeat = false) =>
+  window.dispatchEvent(new KeyboardEvent(type, { code, repeat }));
 const pad = (playerId: string, control: string) =>
   document.querySelector<HTMLButtonElement>(`[data-player-id="${playerId}"] button[data-control="${control}"]`)!;
 
@@ -110,7 +112,7 @@ describe('dev simulator pads', () => {
 
   it('the keyboard holds a hold control like the pad: press, progress ticks, release with heldMs', () => {
     key('keydown', 'Space');
-    key('keydown', 'Space'); // auto-repeat
+    key('keydown', 'Space', true); // auto-repeat
     vi.advanceTimersByTime(360);
     key('keyup', 'Space');
     expect(actions(rec.inputs)).toEqual(['charge:press', 'charge:change', 'charge:change', 'charge:change', 'charge:release']);
@@ -133,6 +135,56 @@ describe('dev simulator pads', () => {
     fire(btn, 'pointerup');
     key('keyup', 'Digit1');
     expect(actions(rec.inputs)).toEqual(['tap:press', 'tap:release']);
+  });
+
+  it('a key let go while the window had no focus does not stay held', () => {
+    key('keydown', 'Space');
+    key('keydown', 'KeyW');
+    vi.advanceTimersByTime(240);
+    window.dispatchEvent(new Event('blur')); // the keyups go to DevTools
+    expect(actions(rec.inputs)).toEqual([
+      'charge:press', 'move:change', 'charge:change', 'charge:change', 'charge:release', 'move:release'
+    ]);
+    expect(rec.inputs[4].value).toEqual({ heldMs: 240 });
+    expect(rec.inputs[5].value).toEqual({ dir: 'none' });
+    vi.advanceTimersByTime(1_000);
+    expect(rec.inputs).toHaveLength(6);
+
+    // The pad works again; the key still down repeats without pressing, and
+    // its late keyup does not release the pad's press.
+    fire(pad('sim-p1', 'charge'), 'pointerdown');
+    key('keydown', 'Space', true);
+    key('keyup', 'Space');
+    key('keyup', 'KeyW');
+    expect(actions(rec.inputs.slice(6))).toEqual(['charge:press']);
+    fire(pad('sim-p1', 'charge'), 'pointerup');
+    expect(actions(rec.inputs.slice(6))).toEqual(['charge:press', 'charge:release']);
+
+    // A fresh key press after that works as before.
+    key('keydown', 'Space');
+    key('keyup', 'Space');
+    expect(actions(rec.inputs.slice(8))).toEqual(['charge:press', 'charge:release']);
+  });
+
+  it('a hidden page lets go of what is held, pads included', () => {
+    fire(pad('sim-p2', 'charge'), 'pointerdown');
+    key('keydown', 'Digit1');
+    const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
+    document.dispatchEvent(new Event('visibilitychange'));
+    visibility.mockRestore();
+    expect(actions(rec.inputs)).toEqual(['charge:press', 'tap:press', 'charge:release', 'tap:release']);
+    vi.advanceTimersByTime(1_000);
+    fire(pad('sim-p2', 'charge'), 'pointerup');
+    key('keyup', 'Digit1');
+    expect(rec.inputs).toHaveLength(4);
+  });
+
+  it('stops listening for blur when destroyed', () => {
+    key('keydown', 'Space');
+    sim.destroy();
+    const before = rec.inputs.length;
+    window.dispatchEvent(new Event('blur'));
+    expect(rec.inputs).toHaveLength(before);
   });
 
   it('a removed player stops sending hold ticks', () => {
@@ -168,6 +220,41 @@ describe('dev simulator setController', () => {
     expect(pad('sim-p1', 'tap').disabled).toBe(false);
     fire(pad('sim-p1', 'tap'), 'pointerdown');
     expect(actions(rec.inputs)).toEqual(['tap:press']);
+  });
+
+  it('releases a held control the moment it gets disabled, like the phone', () => {
+    fire(pad('sim-p1', 'charge'), 'pointerdown');
+    fire(pad('sim-p2', 'charge'), 'pointerdown');
+    vi.advanceTimersByTime(130);
+    sim.setController('sim-p1', { disabled: ['charge'] });
+    const p1 = () => rec.inputs.filter((i) => i.playerId === 'sim-p1');
+    expect(actions(p1())).toEqual(['charge:press', 'charge:change', 'charge:release']);
+    expect(p1().at(-1)!.value).toEqual({ heldMs: 130 });
+
+    // No more ticks, and the pointer coming up sends nothing more.
+    vi.advanceTimersByTime(1_000);
+    fire(pad('sim-p1', 'charge'), 'pointerup');
+    expect(p1()).toHaveLength(3);
+    // Another player's hold of the same control is not theirs to lose.
+    expect(rec.inputs.filter((i) => i.playerId === 'sim-p2').at(-1)!.action).toBe('change');
+  });
+
+  it('releases a key-held control when its cooldown starts; the key must come up to press again', () => {
+    key('keydown', 'Digit1');
+    vi.advanceTimersByTime(50);
+    sim.setController('sim-p1', { cooldowns: { tap: 500 } });
+    expect(actions(rec.inputs)).toEqual(['tap:press', 'tap:release']);
+
+    // Still held through the cooldown: auto-repeat presses nothing, not even after it ends.
+    key('keydown', 'Digit1', true);
+    vi.advanceTimersByTime(600);
+    key('keydown', 'Digit1', true);
+    key('keyup', 'Digit1');
+    expect(rec.inputs).toHaveLength(2);
+
+    key('keydown', 'Digit1');
+    key('keyup', 'Digit1');
+    expect(actions(rec.inputs.slice(2))).toEqual(['tap:press', 'tap:release']);
   });
 
   it('applies a valid patch as the server stores it (trimmed labels)', () => {

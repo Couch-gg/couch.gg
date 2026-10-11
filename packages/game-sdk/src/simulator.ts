@@ -124,38 +124,51 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
   // the keyboard share this, so either one drives the control like a phone
   // does: one press, then (holds) a { progress } tick every HOLD_TICK_MS, then
   // one release ({ heldMs } for holds). A release without a press never happens.
-  const held = new Map<string, { since: number; ticker?: ReturnType<typeof setInterval> }>();
+  interface Held {
+    playerId: string;
+    control: CouchControl;
+    since: number;
+    ticker?: ReturnType<typeof setInterval>;
+  }
+  const held = new Map<string, Held>();
   const heldKey = (playerId: string, control: string): string => `${playerId}:${control}`;
 
-  function pressControl(playerId: string, control: CouchControl): boolean {
+  /** Returns the new press, or undefined when the control is held or blocked. */
+  function pressControl(playerId: string, control: CouchControl): Held | undefined {
     const key = heldKey(playerId, control.control);
-    if (held.has(key)) return false;
-    if (!emitInput(playerId, control.control, 'press')) return false;
-    const since = Date.now();
-    const ticker =
-      control.type === 'hold'
-        ? setInterval(() => {
-            const progress = Math.min(1, (Date.now() - since) / HOLD_RAMP_MS);
-            emitInput(playerId, control.control, 'change', { progress });
-          }, HOLD_TICK_MS)
-        : undefined;
-    held.set(key, { since, ticker });
-    return true;
+    if (held.has(key)) return undefined;
+    if (!emitInput(playerId, control.control, 'press')) return undefined;
+    const entry: Held = { playerId, control, since: Date.now() };
+    if (control.type === 'hold') {
+      entry.ticker = setInterval(() => {
+        const progress = Math.min(1, (Date.now() - entry.since) / HOLD_RAMP_MS);
+        emitInput(playerId, control.control, 'change', { progress });
+      }, HOLD_TICK_MS);
+    }
+    held.set(key, entry);
+    return entry;
   }
 
-  function releaseControl(playerId: string, control: CouchControl): void {
-    const key = heldKey(playerId, control.control);
-    const entry = held.get(key);
-    if (!entry) return;
+  // Ends this press. A no-op once something else let go of it first (the
+  // control got disabled, the window lost focus), so a pad or key coming up
+  // late never releases a newer press of the same control.
+  function releaseHeld(entry: Held): void {
+    const key = heldKey(entry.playerId, entry.control.control);
+    if (held.get(key) !== entry) return;
     held.delete(key);
     if (entry.ticker !== undefined) clearInterval(entry.ticker);
-    emitInput(playerId, control.control, 'release', control.type === 'hold' ? { heldMs: Date.now() - entry.since } : undefined);
+    emitInput(
+      entry.playerId,
+      entry.control.control,
+      'release',
+      entry.control.type === 'hold' ? { heldMs: Date.now() - entry.since } : undefined
+    );
   }
 
   // A player who leaves takes their phone along: stop its hold ticks quietly.
   function dropHeld(playerId: string): void {
     for (const [key, entry] of held) {
-      if (!key.startsWith(`${playerId}:`)) continue;
+      if (entry.playerId !== playerId) continue;
       if (entry.ticker !== undefined) clearInterval(entry.ticker);
       held.delete(key);
     }
@@ -363,7 +376,7 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
     }
   }
 
-  // Button and hold pads differ only in what pressControl/releaseControl send.
+  // Button and hold pads differ only in what pressControl/releaseHeld send.
   // A control of a type this SDK doesn't know renders as a button.
   function renderPressable(player: CouchPlayer, control: CouchControl, kind: 'button' | 'hold'): HTMLElement {
     const btn = document.createElement('button');
@@ -374,15 +387,16 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
     btn.dataset.kind = kind;
     // Only a press that started on this pad may release it: sliding the mouse
     // over it, or off it while the keyboard holds the control, sends nothing.
-    let pointerDown = false;
+    let pressed: Held | undefined;
     btn.addEventListener('pointerdown', (e) => {
       e.preventDefault();
-      if (pressControl(player.id, control)) pointerDown = true;
+      pressed = pressControl(player.id, control) ?? pressed;
     });
     const up = (): void => {
-      if (!pointerDown) return;
-      pointerDown = false;
-      releaseControl(player.id, control);
+      if (!pressed) return;
+      const entry = pressed;
+      pressed = undefined;
+      releaseHeld(entry);
     };
     btn.addEventListener('pointerup', up);
     btn.addEventListener('pointercancel', up);
@@ -519,7 +533,8 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
   }
 
   // ---- keyboard bindings (player 1) ------------------------------------
-  const keyState = new Set<string>();
+  // The press each held key started (Digit1..9, Space).
+  const keyState = new Map<string, Held>();
   const buttonControls = (): CouchControl[] =>
     controls.filter((c) => c.type === 'button' || c.type === 'hold');
   const firstSlider = (): CouchControl | undefined =>
@@ -544,18 +559,22 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
     const wasd = WASD[e.code];
     const directional = firstDirectional();
     if (wasd && directional) {
-      if (heldDirs.has(wasd)) return;
+      if (e.repeat || heldDirs.has(wasd)) return;
       heldDirs.add(wasd);
       emitDirection(pid, directional, wasdDirection());
       return;
     }
-    // Digit1..9 -> nth button/hold control, pressed like its pad.
+    // Digit1..9 -> nth button/hold control, pressed like its pad. Auto-repeat
+    // never presses: a key still down after a forced release (the control got
+    // disabled, the window lost focus) must come up first, like a finger.
     const digit = /^Digit([1-9])$/.exec(e.code);
     if (digit) {
       const n = Number(digit[1]) - 1;
       const btns = buttonControls();
       const control = btns[n];
-      if (control && !keyState.has(e.code) && pressControl(pid, control)) keyState.add(e.code);
+      if (!control || e.repeat || keyState.has(e.code)) return;
+      const entry = pressControl(pid, control);
+      if (entry) keyState.set(e.code, entry);
       return;
     }
     if (e.code === 'ArrowUp' || e.code === 'ArrowDown') {
@@ -568,9 +587,10 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
     }
     if (e.code === 'Space') {
       const hold = firstHold();
-      if (hold && !keyState.has('Space')) {
+      if (hold && !e.repeat && !keyState.has('Space')) {
         e.preventDefault();
-        if (pressControl(pid, hold)) keyState.add('Space');
+        const entry = pressControl(pid, hold);
+        if (entry) keyState.set('Space', entry);
       }
     }
   };
@@ -585,19 +605,34 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
       emitDirection(pid, directional, wasdDirection());
       return;
     }
-    const digit = /^Digit([1-9])$/.exec(e.code);
-    if (digit && keyState.has(e.code)) {
+    const entry = keyState.get(e.code);
+    if (entry) {
       keyState.delete(e.code);
-      const n = Number(digit[1]) - 1;
-      const control = buttonControls()[n];
-      if (control) releaseControl(pid, control);
-      return;
+      releaseHeld(entry);
     }
-    if (e.code === 'Space' && keyState.has('Space')) {
-      keyState.delete('Space');
-      const hold = firstHold();
-      if (hold) releaseControl(pid, hold);
-    }
+  };
+
+  // Let go of a press the player did not end (see setController), and forget
+  // the key that made it so its keyup sends nothing.
+  function forceRelease(entry: Held): void {
+    releaseHeld(entry);
+    for (const [code, pressedBy] of keyState) if (pressedBy === entry) keyState.delete(code);
+  }
+
+  // The phone lets go of every held control when it is locked, backgrounded or
+  // loses focus. Here a key let go while DevTools or another window has focus
+  // never sends its keyup, so the hold would tick on and its pad stay dead.
+  function releaseAll(): void {
+    for (const entry of [...held.values()]) releaseHeld(entry);
+    keyState.clear();
+    if (heldDirs.size === 0) return;
+    heldDirs.clear();
+    const pid = primaryId();
+    const directional = firstDirectional();
+    if (pid && directional) emitDirection(pid, directional, 'none');
+  }
+  const onVisibility = (): void => {
+    if (document.visibilityState === 'hidden') releaseAll();
   };
 
   // Track slider value per keyboard nudge.
@@ -614,6 +649,8 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
 
   window.addEventListener('keydown', onKeyDown);
   window.addEventListener('keyup', onKeyUp);
+  window.addEventListener('blur', releaseAll);
+  document.addEventListener('visibilitychange', onVisibility);
 
   // ---- initial paint ----------------------------------------------------
   renderPhones();
@@ -666,6 +703,11 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
       entry.coolUntil.set(control, Date.now() + ms);
       setTimeout(paintOverrides, ms + 10);
     }
+    // A control greyed out or cooling down under the finger stops getting
+    // pointer events on the phone, which releases it right away; so do we.
+    for (const pressed of [...held.values()]) {
+      if (pressed.playerId === playerId && isBlocked(playerId, pressed.control.control)) forceRelease(pressed);
+    }
     if (patch.vibrate !== undefined) {
       try {
         navigator.vibrate?.(patch.vibrate);
@@ -699,6 +741,8 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
   function destroy(): void {
     window.removeEventListener('keydown', onKeyDown);
     window.removeEventListener('keyup', onKeyUp);
+    window.removeEventListener('blur', releaseAll);
+    document.removeEventListener('visibilitychange', onVisibility);
     for (const entry of held.values()) if (entry.ticker !== undefined) clearInterval(entry.ticker);
     held.clear();
     if (toastTimer !== undefined) clearTimeout(toastTimer);
