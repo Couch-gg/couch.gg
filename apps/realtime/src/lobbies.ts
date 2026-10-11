@@ -441,16 +441,16 @@ export class LobbyStore {
   }
 
   // Stamp a prepared input with its seq and append it to the ring buffer. `seq`
-  // comes from shared storage when the server has it (Redis INCR); otherwise the
-  // lobby's own counter. Inputs from other instances can land out of order, so
-  // the log is kept sorted by seq.
-  commitGameInput(slug: string, prepared: PreparedGameInput, seq?: number): GameInputEnvelope {
+  // comes from shared storage when the server has it (Redis INCR, stored along
+  // with `at`); otherwise the lobby's own counter. Inputs from other instances
+  // can land out of order, so the log is kept sorted by seq.
+  commitGameInput(slug: string, prepared: PreparedGameInput, seq?: number, at = new Date().toISOString()): GameInputEnvelope {
     const lobby = this.getLobby(slug);
     const stamped = seq ?? lobby.inputSeq + 1;
     lobby.inputSeq = Math.max(lobby.inputSeq, stamped);
     const envelope: GameInputEnvelope = {
       seq: stamped,
-      at: new Date().toISOString(),
+      at,
       ...prepared
     };
     lobby.inputLog.push(envelope);

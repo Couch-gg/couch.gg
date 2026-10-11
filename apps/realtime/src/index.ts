@@ -5,7 +5,7 @@ import express from 'express';
 import { Server, type ServerOptions } from 'socket.io';
 import { GAME_MANIFESTS } from '@couch/game-runtime';
 import type { TrebuchetEvent } from '@couch/trebuchet';
-import type { ControllerEvent, GameId, GameManifest, PlayerId, ScreenId } from '@couch/types';
+import type { ControllerEvent, GameId, GameInputEnvelope, GameManifest, PlayerId, ScreenId } from '@couch/types';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { LobbyError, LobbyStore, RECONNECT_GRACE_MS, type LobbyRecord, type ManifestResolver } from './lobbies.js';
 import { mergeCatalog, parseExternalGamesJson } from './external-games.js';
@@ -420,15 +420,19 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
             ack?.({ ok: true, dropped: true });
             return;
           }
-          // Validate first, then take the seq: from Redis INCR when available so
-          // two instances can't stamp the same seq, else the lobby's counter.
+          // Validate first, then take the seq: with Redis one script INCRs it (so
+          // two instances can't stamp the same seq) and appends the input under
+          // it; else the lobby's counter and a save of the lobby blob.
           const prepared = store.prepareGameInput(slug, playerToken, controllerEvent);
-          const seq = persistence.nextInputSeq ? await persistence.nextInputSeq(slug) : undefined;
-          const envelope = store.commitGameInput(slug, prepared, seq);
-          ack?.({ ok: true, seq: envelope.seq });
-          if (persistence.appendInput) {
-            await persistence.appendInput(slug, envelope, store.getLobby(slug).expiresAt);
+          let envelope: GameInputEnvelope;
+          if (persistence.appendNextInput) {
+            const at = new Date().toISOString();
+            const seq = await persistence.appendNextInput(slug, { at, ...prepared }, store.getLobby(slug).expiresAt);
+            envelope = store.commitGameInput(slug, prepared, seq, at);
+            ack?.({ ok: true, seq });
           } else {
+            envelope = store.commitGameInput(slug, prepared);
+            ack?.({ ok: true, seq: envelope.seq });
             await saveLobby(slug);
           }
           io.to(room(slug)).emit('game:input', envelope);

@@ -132,6 +132,14 @@ describe('commitGameInput (externally allocated seq)', () => {
     expect(store.getLobby(slug).inputSeq).toBe(2);
   });
 
+  it('stamps the at stored with the seq instead of a fresh one', () => {
+    const { store, slug, tokens } = startedExternal();
+    const prepared = store.prepareGameInput(slug, tokens[0].token, tapEvent());
+    const envelope = store.commitGameInput(slug, prepared, 1, '2026-10-01T00:00:00.000Z');
+    expect(envelope.at).toBe('2026-10-01T00:00:00.000Z');
+    expect(store.getLobby(slug).inputLog[0]).toEqual(envelope);
+  });
+
   it('rejects before a seq is taken', () => {
     const { store, slug, tokens } = startedExternal();
     expect(() => store.prepareGameInput(slug, tokens[0].token, tapEvent('bogus' as never))).toThrow(/Aktion/);

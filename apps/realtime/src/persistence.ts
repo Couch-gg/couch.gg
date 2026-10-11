@@ -34,8 +34,9 @@ export interface LobbyPersistence {
   // different serverless instances at the same moment; a load-modify-save of the
   // lobby blob would hand both the same seq and one would overwrite the other.
   // With these, the seq is an INCR and the log is a list the blob never touches.
-  nextInputSeq?(slug: string): Promise<number>;
-  appendInput?(slug: string, envelope: GameInputEnvelope, expiresAt: number): Promise<void>;
+  // appendNextInput takes the seq and appends the input under it in one atomic
+  // script and resolves to that seq, so no seq is handed out without its entry.
+  appendNextInput?(slug: string, input: Omit<GameInputEnvelope, 'seq'>, expiresAt: number): Promise<number>;
   resetInputs?(slug: string): Promise<void>;
 }
 
@@ -98,20 +99,14 @@ class RedisLobbyPersistence implements LobbyPersistence {
     return lobby;
   }
 
-  async nextInputSeq(slug: string): Promise<number> {
+  async appendNextInput(slug: string, input: Omit<GameInputEnvelope, 'seq'>, expiresAt: number): Promise<number> {
     const client = await this.client();
-    return client.incr(inputSeqKey(slug));
-  }
-
-  async appendInput(slug: string, envelope: GameInputEnvelope, expiresAt: number): Promise<void> {
-    const client = await this.client();
-    await client
-      .multi()
-      .rPush(inputsKey(slug), JSON.stringify(envelope))
-      .lTrim(inputsKey(slug), -INPUT_LOG_LIMIT, -1)
-      .pExpireAt(inputsKey(slug), expiresAt)
-      .pExpireAt(inputSeqKey(slug), expiresAt)
-      .exec();
+    // The script puts `{"seq":N,` in front, so the rest goes without its brace.
+    const seq = await client.eval(APPEND_NEXT_INPUT_SCRIPT, {
+      keys: [inputsKey(slug), inputSeqKey(slug)],
+      arguments: [JSON.stringify(input).slice(1), String(-INPUT_LOG_LIMIT), String(expiresAt)]
+    });
+    return Number(seq);
   }
 
   async resetInputs(slug: string): Promise<void> {
@@ -421,6 +416,19 @@ function inputsKey(slug: string): string {
 function inputSeqKey(slug: string): string {
   return `couch:lobby:${slug.toUpperCase()}:inputseq`;
 }
+
+// KEYS: input list, seq counter. ARGV: the envelope JSON minus its opening brace
+// (no seq yet), -INPUT_LOG_LIMIT, the lobby's expiry in unix ms. One script so an
+// instance dying or a dropped connection between the INCR and the RPUSH can't
+// leave a seq that screens wait on but that never reaches the log.
+const APPEND_NEXT_INPUT_SCRIPT = `
+local seq = redis.call('INCR', KEYS[2])
+redis.call('RPUSH', KEYS[1], '{"seq":' .. seq .. ',' .. ARGV[1])
+redis.call('LTRIM', KEYS[1], ARGV[2], -1)
+redis.call('PEXPIREAT', KEYS[1], ARGV[3])
+redis.call('PEXPIREAT', KEYS[2], ARGV[3])
+return seq
+`;
 
 function screenKey(id: string): string {
   return `couch:screen:${id}`;
