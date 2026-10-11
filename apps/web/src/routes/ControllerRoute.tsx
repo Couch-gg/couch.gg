@@ -31,7 +31,7 @@ import {
 import { GameCatalog } from '../components/GameCatalog.js';
 import { ChatPanel } from '../components/ChatPanel.js';
 import { GenericController } from '../components/GenericController.js';
-import { fetchLobby, sendChat } from '../api.js';
+import { fetchLobby, leaveLobby, sendChat } from '../api.js';
 import { createSocket, emitAck } from '../socket.js';
 
 // True only for the built-in trebuchet snapshot shape. External games report
@@ -59,6 +59,10 @@ const REMOTE_SHARE_KEY_PREFIX = 'couch:share-room:';
 const GENERIC_RESEND_MS = 100;
 const GENERIC_RESEND_MAX = 10;
 const DEFAULT_AIM_ELEVATION = 72;
+// How long Leave waits for the room to answer, over the socket and then over HTTP.
+const LEAVE_WAIT_MS = 2_000;
+// How soon a reconnect the room didn't answer (in time) is tried again.
+const REJOIN_RETRY_MS = 2_000;
 
 function loadSfx(): Promise<SfxModule | null> {
   if (sfxPromise) return sfxPromise;
@@ -105,6 +109,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   });
   const [shareCopied, setShareCopied] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
+  const [leaving, setLeaving] = useState(false);
   const copiedTimerRef = useRef<number | null>(null);
   const shareTimerRef = useRef<number | null>(null);
   const chargeStartRef = useRef<number | null>(null);
@@ -146,8 +151,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   // player, or unknown) is forgotten, so trying again joins afresh.
   const lostSeat = useCallback(
     (err: unknown) => {
-      const status = (err as { status?: number } | null)?.status;
-      if (status === 401 || status === 404 || status === 409 || status === 410) {
+      if (isFinalRefusal(statusOf(err))) {
         window.localStorage.removeItem(tokenKey(slug));
         setPlayerToken('');
       }
@@ -190,7 +194,16 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     // connected. Within the server's grace window we keep the same slot, host status
     // and turn — including mid-game (the server's token-reconnect path has no
     // game-in-progress block; only brand-new players are turned away during play).
+    //
+    // Only the newest attempt's answer counts. One sent just before the link
+    // dropped again never gets its ack (Socket.IO drops it on disconnect) and
+    // only times out, long after a newer attempt got the phone back in.
+    let rejoinAttempt = 0;
+    let rejoinRetry: number | null = null;
     const rejoinIfPossible = () => {
+      if (rejoinRetry != null) window.clearTimeout(rejoinRetry);
+      rejoinRetry = null;
+      const attempt = ++rejoinAttempt;
       const token = window.localStorage.getItem(tokenKey(slug));
       // Not joined yet: join() below (or "Try again") takes care of that.
       if (!token || !playerRef.current) {
@@ -205,6 +218,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
         screenId: seatFor(slug)
       })
         .then((joined) => {
+          if (attempt !== rejoinAttempt) return;
           setReconnecting(false);
           setPlayer(joined.player);
           setLobby(joined.lobby);
@@ -213,15 +227,27 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
           window.localStorage.setItem(tokenKey(slug), joined.playerToken);
           window.localStorage.setItem('couch:activeSlug', slug);
         })
-        // After a long absence the room may have removed this player (or be
-        // gone, or be mid-game and refuse newcomers).
-        .catch(lostSeat);
+        .catch((err: unknown) => {
+          if (attempt !== rejoinAttempt) return;
+          // After a long absence the room may have removed this player (or be
+          // gone, or be mid-game and refuse newcomers).
+          if (isFinalRefusal(statusOf(err))) {
+            lostSeat(err);
+            return;
+          }
+          // No answer in time, or a passing server error: the seat may well
+          // still be there. Keep the controller and ask again (the next
+          // connect does that anyway).
+          if (nextSocket.connected) rejoinRetry = window.setTimeout(rejoinIfPossible, REJOIN_RETRY_MS);
+        });
     };
 
     nextSocket.on('connect', rejoinIfPossible);
     nextSocket.on('disconnect', () => setReconnecting(true));
 
     return () => {
+      rejoinAttempt += 1; // an answer still on its way is for nobody now
+      if (rejoinRetry != null) window.clearTimeout(rejoinRetry);
       nextSocket.disconnect();
       setSocket(null);
     };
@@ -363,11 +389,10 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     }
   };
 
-  const leave = () => {
-    // Tell the room right away, so the seat and the host role free up now
-    // rather than after the reconnect grace. Sent ahead of the disconnect
-    // that leaving the page causes.
-    if (socket?.connected && playerToken) socket.emit('controller:leave', { slug, playerToken });
+  const leave = async () => {
+    if (leaving) return;
+    setLeaving(true);
+    if (playerToken) await leaveRoom(socket, slug, playerToken);
     window.localStorage.removeItem(tokenKey(slug));
     window.localStorage.removeItem('couch:activeSlug');
     navigate('/');
@@ -1024,7 +1049,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
           </button>
         ) : null}
 
-        <button className="text-btn" onClick={leave}>
+        <button className="text-btn" onClick={leave} disabled={leaving}>
           <LogOut size={16} /> Leave
         </button>
       </section>
@@ -1054,6 +1079,37 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
 
 function tokenKey(slug: string): string {
   return `couch:player-token:${slug}`;
+}
+
+// The room's answer for a phone it won't take (back): the player is unknown,
+// the lobby is gone, or it is full or mid-game for newcomers. Anything else
+// (no answer in time, a server error) may go away when asked again.
+function isFinalRefusal(status: number | undefined): boolean {
+  return status === 401 || status === 404 || status === 409 || status === 410;
+}
+
+// Tell the room this phone leaves, so its seat and the host role free up now
+// rather than after the reconnect grace. Leaving the page closes the socket,
+// and the server never runs an event that arrives together with the close,
+// so wait for the answer first (a short while at most). With the socket down,
+// or no answer, leave over HTTP instead. Never fails: the phone leaves anyway.
+async function leaveRoom(socket: Socket | null, slug: string, playerToken: string): Promise<void> {
+  if (socket?.connected) {
+    const answered = await Promise.race([
+      emitAck(socket, 'controller:leave', { slug, playerToken }).then(
+        () => true,
+        // Unknown player or no lobby: nothing left to leave.
+        (err: unknown) => [401, 404, 410].includes(statusOf(err) ?? 0)
+      ),
+      wait(LEAVE_WAIT_MS).then(() => false)
+    ]);
+    if (answered) return;
+  }
+  await Promise.race([leaveLobby(slug, playerToken).catch(() => undefined), wait(LEAVE_WAIT_MS)]);
+}
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 function statusOf(err: unknown): number | undefined {

@@ -21,8 +21,10 @@ describe.skipIf(!redisUrl)('player lifecycle on shared Redis', () => {
   beforeAll(async () => {
     process.env.REDIS_URL = redisUrl;
     await redis.connect();
-    for (let i = 0; i < 2; i++) {
-      const instance = createRealtimeServer({ disconnectQuietMs: 200, reconnectGraceMs: 300 });
+    // C stands for an instance that is gone before its quiet-window timer
+    // fires (it would only fire after a minute).
+    for (const disconnectQuietMs of [200, 200, 60_000]) {
+      const instance = createRealtimeServer({ disconnectQuietMs, reconnectGraceMs: 300 });
       await new Promise<void>((resolve) => instance.server.listen(0, resolve));
       servers.push(instance);
       urls.push(`http://localhost:${(instance.server.address() as AddressInfo).port}`);
@@ -37,7 +39,7 @@ describe.skipIf(!redisUrl)('player lifecycle on shared Redis', () => {
     else process.env.REDIS_URL = previousRedisUrl;
   });
 
-  const [A, B] = [0, 1];
+  const [A, B, C] = [0, 1, 2];
 
   function open(at: number): Socket {
     const socket = connect(urls[at], { transports: ['websocket'], forceNew: true });
@@ -74,6 +76,31 @@ describe.skipIf(!redisUrl)('player lifecycle on shared Redis', () => {
     expect(lobby.players.find((p: { id: string }) => p.id === ann.player.id)).toMatchObject({ connected: true, isHost: true });
     const fired = await ack(newOnB, 'chat:send', { slug, playerToken: ann.playerToken, text: 'still here' });
     expect(fired.ok).toBe(true);
+  });
+
+  it('shows a dropped phone as gone through another instance, even if the one it dropped from never gets to it', async () => {
+    const slug = await newLobby();
+    const annOnC = open(C);
+    const ann = await ack<Joined>(annOnC, 'controller:join', { slug, name: 'Ann' });
+    await ack<Joined>(open(A), 'controller:join', { slug, name: 'Bo' });
+    annOnC.disconnect();
+    // The drop is in the record at once, but nobody hears of it yet.
+    await expect
+      .poll(async () => {
+        const stored = JSON.parse((await redis.get(`couch:lobby:${slug}`)) ?? '{}');
+        return stored.players?.find((p: { id: string }) => p.id === ann.player.id)?.droppedAt ?? null;
+      })
+      .not.toBeNull();
+    let lobby = await lobbyAt(C, slug);
+    expect(lobby.players.find((p: { id: string }) => p.id === ann.player.id).connected).toBe(true);
+    expect(lobby.activity.map((a: { text: string }) => a.text)).not.toContain('Ann Verbindung verloren');
+
+    await sleep(300);
+    lobby = await lobbyAt(B, slug);
+    expect(lobby.players.find((p: { id: string }) => p.id === ann.player.id).connected).toBe(false);
+    expect(lobby.activity.map((a: { text: string }) => a.text)).toContain('Ann Verbindung verloren');
+    // Saved, so every instance agrees.
+    expect((await lobbyAt(C, slug)).players.find((p: { id: string }) => p.id === ann.player.id).connected).toBe(false);
   });
 
   it('answers a screen lookup that fails in Redis with an error instead of crashing', async () => {

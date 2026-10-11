@@ -69,6 +69,17 @@ export async function claimScreen(id: string, slug: string): Promise<ScreenRecor
   return body.screen;
 }
 
+// Leave a lobby without the socket (the phone's Leave while it is down).
+export async function leaveLobby(slug: string, playerToken: string): Promise<void> {
+  const response = await fetch(`${REALTIME_URL}${REALTIME_API_PREFIX}/lobbies/${slug}/leave`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ playerToken }),
+    keepalive: true
+  });
+  if (!response.ok) throw Object.assign(new Error('Verlassen fehlgeschlagen'), { status: response.status });
+}
+
 export async function sendChat(slug: string, playerToken: string, text: string): Promise<ChatMessage> {
   const response = await fetch(`${REALTIME_URL}${REALTIME_API_PREFIX}/lobbies/${slug}/chat`, {
     method: 'POST',

@@ -163,6 +163,9 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
   } | null>(null);
   const finishingRef = useRef(false); // a game:finish is waiting for its ack
   const finishRetryRef = useRef<number | null>(null);
+  // False once the stage is gone. An answer that arrives after that is not
+  // acted on: the stage's lobby view is frozen, and a new round may run.
+  const mountedRef = useRef(true);
   const probedRef = useRef(false); // probe-result sent (once)
   const knownPlayersRef = useRef<Map<string, CouchPlayer>>(new Map());
 
@@ -219,12 +222,13 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
   // it becomes the host while the game is still running (the host TV left).
   // The round counts as finished only once the server took the report: one
   // lost to a reconnect or a timeout is sent again (finishing is idempotent),
-  // until the server answers or the round is over anyway.
+  // until the server answers or the round is over anyway. The report names
+  // its round, so the server never ends another one with it.
   const sendFinish = useCallback(() => {
     const pending = pendingFinishRef.current;
     const sock = socketRef.current;
     const l = lobbyRef.current;
-    if (!pending || !sock || finishedRef.current || finishingRef.current) return;
+    if (!mountedRef.current || !pending || !sock || finishedRef.current || finishingRef.current) return;
     if (pending.session !== (l.gameSession?.id ?? '') || l.state !== 'playing') {
       pendingFinishRef.current = null; // that round is over (or a new one started)
       return;
@@ -238,13 +242,14 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
     if (!screenRole(l, screenIdRef.current).isHost) return;
     if (Date.now() < pending.retryAt) return; // the retry timer sends it
     finishingRef.current = true;
-    void emitAck<{ finished?: boolean }>(sock, 'game:finish', { slug: l.slug, scores: pending.scores })
+    void emitAck<{ finished?: boolean }>(sock, 'game:finish', { slug: l.slug, sessionId: pending.session, scores: pending.scores })
       .then(() => {
         // Finished now, or already before (by another screen's report).
         finishedRef.current = true;
         pendingFinishRef.current = null;
       })
       .catch((err: unknown) => {
+        if (!mountedRef.current) return;
         const status = (err as { status?: number } | null)?.status;
         if (status === 403) {
           pending.refusedFor = hostScreen;
@@ -520,9 +525,12 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
 
   // --- Teardown: abort on unmount. ---
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
+      mountedRef.current = false;
       post({ v: 1, type: 'couch:abort', reason: 'host-unmounted' });
       if (finishRetryRef.current != null) window.clearTimeout(finishRetryRef.current);
+      finishRetryRef.current = null;
     };
   }, [post]);
 

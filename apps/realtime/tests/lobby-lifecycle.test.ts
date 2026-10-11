@@ -4,7 +4,14 @@ import { io as connect, type Socket } from 'socket.io-client';
 import type { ExternalGameManifest, GameId, GameManifest } from '@couch/types';
 import { getGameManifest } from '@couch/game-runtime';
 import type { TrebuchetSnapshot } from '@couch/trebuchet';
-import { LOBBY_MAX_AGE_MS, LOBBY_TTL_MS, LobbyStore, type ManifestResolver } from '../src/lobbies.js';
+import {
+  LOBBY_MAX_AGE_MS,
+  LOBBY_TTL_MS,
+  LobbyStore,
+  deserializeLobbyRecord,
+  serializeLobbyRecord,
+  type ManifestResolver
+} from '../src/lobbies.js';
 import { createRealtimeServer, type RealtimeServerInstance } from '../src/index.js';
 
 const RACE: ExternalGameManifest = {
@@ -67,6 +74,19 @@ describe('rounds', () => {
     expect(store.publicLobby(slug).gameSession?.gameId).toBe(DASH.id);
   });
 
+  it('ignores a finish report for a round that is already over', () => {
+    const { store, slug, host } = startedRace();
+    const first = store.publicLobby(slug).gameSession!.id;
+    store.endGame(slug, host.playerToken);
+    store.startGame(slug, host.playerToken);
+    const second = store.publicLobby(slug).gameSession!.id;
+    // A late retry of the first round's report must not end the second.
+    expect(store.finishExternalGame(slug, [{ playerId: host.player.id, score: 9 }], first)).toBe(false);
+    expect(store.publicLobby(slug).state).toBe('playing');
+    expect(store.finishExternalGame(slug, [{ playerId: host.player.id, score: 2 }], second)).toBe(true);
+    expect(store.publicLobby(slug).gameSession?.snapshot).toMatchObject({ scores: [{ playerId: host.player.id, score: 2 }] });
+  });
+
   it('still refuses a game change while a round runs', () => {
     const { store, slug, host } = startedRace();
     expect(() => store.selectGame(slug, host.playerToken, DASH.id)).toThrow(/nur in der Lobby/);
@@ -116,13 +136,48 @@ describe('finish reports', () => {
 });
 
 describe('players leaving', () => {
+  const connectedOf = (store: LobbyStore, slug: string, id: string) =>
+    store.publicLobby(slug).players.find((p) => p.id === id)?.connected;
+
   it('ignores the drop of a socket the player already replaced', () => {
     const { store, slug, host } = twoPlayers();
     store.joinPlayer(slug, 'Ann', host.playerToken, undefined, 'sock-ann-2');
+    expect(store.noteDropped(slug, host.player.id, 'sock-ann', 10)).toBe(false);
     expect(store.markDisconnected(slug, host.player.id, 10, 'sock-ann')).toBeNull();
-    expect(store.publicLobby(slug).players.find((p) => p.id === host.player.id)?.connected).toBe(true);
-    expect(store.markDisconnected(slug, host.player.id, 20, 'sock-ann-2')).not.toBeNull();
-    expect(store.publicLobby(slug).players.find((p) => p.id === host.player.id)?.connected).toBe(false);
+    expect(store.markDroppedGone(slug, 1_000_000, 5_000)).toEqual([]);
+    expect(connectedOf(store, slug, host.player.id)).toBe(true);
+    expect(store.noteDropped(slug, host.player.id, 'sock-ann-2', 20)).toBe(true);
+    expect(store.markDroppedGone(slug, 1_000_000, 5_000)).toEqual([{ playerId: host.player.id, since: 20 }]);
+    expect(connectedOf(store, slug, host.player.id)).toBe(false);
+  });
+
+  it('keeps a drop in the record quietly, and shows the player gone once the quiet window is over', () => {
+    const { store, slug, host } = twoPlayers();
+    const before = store.getLobby(slug).activity.length;
+    expect(store.noteDropped(slug, host.player.id, 'sock-ann', 100)).toBe(true);
+    // Nothing to tell anyone yet.
+    expect(connectedOf(store, slug, host.player.id)).toBe(true);
+    expect(store.getLobby(slug).activity.length).toBe(before);
+    // The note travels with the record, so any instance can act on it.
+    const elsewhere = new LobbyStore(resolver(RACE, DASH));
+    elsewhere.lobbies.set(slug, deserializeLobbyRecord(serializeLobbyRecord(store.getLobby(slug))));
+    expect(elsewhere.markDroppedGone(slug, 100 + 4_999, 5_000)).toEqual([]);
+    expect(elsewhere.markDroppedGone(slug, 100 + 5_000, 5_000)).toEqual([{ playerId: host.player.id, since: 100 }]);
+    expect(connectedOf(elsewhere, slug, host.player.id)).toBe(false);
+    expect(elsewhere.getLobby(slug).activity.at(-1)?.text).toBe('Ann Verbindung verloren');
+    expect(elsewhere.markDroppedGone(slug, 100 + 9_000, 5_000)).toEqual([]);
+    // The removal grace counts from the drop.
+    expect(elsewhere.removeIfStillDisconnected(slug, host.player.id, 100)).not.toBeNull();
+  });
+
+  it('forgets a drop when the player is back within the quiet window, without a word', () => {
+    const { store, slug, host } = twoPlayers();
+    const before = store.getLobby(slug).activity.length;
+    store.noteDropped(slug, host.player.id, 'sock-ann', 100);
+    store.joinPlayer(slug, 'Ann', host.playerToken, undefined, 'sock-ann-2');
+    expect(store.markDroppedGone(slug, 100_000, 5_000)).toEqual([]);
+    expect(connectedOf(store, slug, host.player.id)).toBe(true);
+    expect(store.getLobby(slug).activity.length).toBe(before);
   });
 
   it('only announces a reconnect when the player was shown as gone', () => {
@@ -131,7 +186,8 @@ describe('players leaving', () => {
     store.joinPlayer(slug, 'Ann', host.playerToken, undefined, 'sock-ann-2');
     expect(store.getLobby(slug).activity.length).toBe(before);
 
-    store.markDisconnected(slug, host.player.id, 10, 'sock-ann-2');
+    store.noteDropped(slug, host.player.id, 'sock-ann-2', 10);
+    store.markDroppedGone(slug, 10_000, 5_000);
     store.joinPlayer(slug, 'Ann', host.playerToken, undefined, 'sock-ann-3');
     expect(store.getLobby(slug).activity.map((a) => a.text)).toContain('Ann ist wieder verbunden');
   });
@@ -323,6 +379,26 @@ describe('player and screen sockets', () => {
     expect((await ack(bo, 'game:select', { slug, playerToken: guest.playerToken, gameId: RACE.id })).ok).toBe(true);
   });
 
+  it('lets a player whose socket is down leave over HTTP', async () => {
+    const slug = await newLobby();
+    const ann = open();
+    const host = await ack<Joined>(ann, 'controller:join', { slug, name: 'Ann' });
+    const guest = await ack<Joined>(open(), 'controller:join', { slug, name: 'Bo' });
+    ann.disconnect();
+    const leave = () =>
+      fetch(`${url}/api/lobbies/${slug}/leave`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ playerToken: host.playerToken })
+      });
+    expect((await leave()).status).toBe(200);
+    const lobby = await lobbyOf(slug);
+    expect(lobby.players.map((p: { id: string }) => p.id)).toEqual([guest.player.id]);
+    expect(lobby.hostPlayerId).toBe(guest.player.id);
+    // Left already (e.g. the socket's leave got through after all).
+    expect((await leave()).status).toBe(401);
+  });
+
   it('keeps a lobby everyone left, so the next player becomes host', async () => {
     const slug = await newLobby();
     const ann = open();
@@ -351,6 +427,25 @@ describe('player and screen sockets', () => {
     const finished = await ack<{ finished: boolean }>(back, 'game:finish', { slug, scores: [{ playerId: host.player.id, score: 5 }] });
     expect(finished).toMatchObject({ ok: true, finished: true });
     expect((await lobbyOf(slug)).state).toBe('ended');
+  });
+
+  it('does not end a new round with a late finish of the last one', async () => {
+    const slug = await newLobby();
+    const tv = open();
+    await ack(tv, 'screen:join', { slug, screenId: 'scr_roundtv' });
+    const phone = open();
+    const host = await ack<Joined>(phone, 'controller:join', { slug, name: 'Ann' });
+    await ack(phone, 'game:select', { slug, playerToken: host.playerToken, gameId: RACE.id });
+    await ack(phone, 'game:start', { slug, playerToken: host.playerToken });
+    const first = (await lobbyOf(slug)).gameSession.id as string;
+    await ack(phone, 'game:end', { slug, playerToken: host.playerToken });
+    await ack(phone, 'game:start', { slug, playerToken: host.playerToken });
+
+    const scores = [{ playerId: host.player.id, score: 4 }];
+    expect(await ack(tv, 'game:finish', { slug, sessionId: first, scores })).toEqual({ ok: true, finished: false });
+    expect((await lobbyOf(slug)).state).toBe('playing');
+    const second = (await lobbyOf(slug)).gameSession.id as string;
+    expect(await ack(tv, 'game:finish', { slug, sessionId: second, scores })).toEqual({ ok: true, finished: true });
   });
 
   it('lets the host end a running game from the phone', async () => {

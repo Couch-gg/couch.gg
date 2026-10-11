@@ -181,9 +181,10 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   app.get(`${apiPrefix}/lobbies/:slug`, async (req, res) => {
     try {
       await hydrateLobby(req.params.slug);
-      // Every TV and phone polls this, so a TV that left is dropped even when
-      // the instance that saw it go is gone before its grace timer fires.
-      await dropGoneScreens(req.params.slug.toUpperCase());
+      // Every TV and phone polls this, so a TV that left is dropped, and a
+      // phone that dropped shows as gone, even when the instance that saw the
+      // socket go is gone before its timer fires.
+      await settlePresence(req.params.slug.toUpperCase());
       res.json({ lobby: store.publicLobby(req.params.slug) });
     } catch (err) {
       sendHttpError(res, err);
@@ -196,6 +197,20 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
       const joined = store.joinPlayer(req.params.slug, req.body?.name, req.body?.playerToken, req.body?.screenId);
       await saveLobby(req.params.slug);
       res.status(201).json(joined);
+    } catch (err) {
+      sendHttpError(res, err);
+    }
+  });
+
+  // The phone's Leave when its socket is down or doesn't answer (see
+  // controller:leave). Body { playerToken }.
+  app.post(`${apiPrefix}/lobbies/:slug/leave`, async (req, res) => {
+    try {
+      const slug = req.params.slug.toUpperCase();
+      await hydrateLobby(slug);
+      const removal = store.leavePlayer(slug, String(req.body?.playerToken ?? ''));
+      await playerRemoved(slug, removal);
+      res.json({ ok: true });
     } catch (err) {
       sendHttpError(res, err);
     }
@@ -420,15 +435,17 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
     });
 
     // The phone's Leave button. The player is gone for good, so this socket's
-    // disconnect that follows changes nothing.
+    // disconnect that follows changes nothing. The phone waits for the ack
+    // before it closes the socket: a leave that arrives together with the
+    // disconnect is never run (Socket.IO drops events of a closed socket).
     socket.on('controller:leave', async (payload: { slug?: string; playerToken?: string }, ack?: (value: unknown) => void) => {
       try {
         const slug = String(payload?.slug ?? '').toUpperCase();
         await hydrateLobby(slug);
         const removal = store.leavePlayer(slug, String(payload?.playerToken ?? ''));
         if (ctx?.role === 'controller' && ctx.slug === slug) ctx = null;
-        ack?.({ ok: true });
         await playerRemoved(slug, removal);
+        ack?.({ ok: true });
       } catch (err) {
         ack?.(socketError(err));
       }
@@ -568,8 +585,9 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
 
     // An external game reports its final scores. Accepted ONLY from the trusted
     // shell (the iframe can't reach the socket) of the lobby's host screen.
-    // Idempotent: a duplicate report acks { ok:true, finished:false }.
-    socket.on('game:finish', async (payload: { slug?: string; scores?: unknown }, ack?: (value: unknown) => void) => {
+    // Idempotent: a duplicate report, or one for a round that is over, acks
+    // { ok:true, finished:false }.
+    socket.on('game:finish', async (payload: { slug?: string; sessionId?: unknown; scores?: unknown }, ack?: (value: unknown) => void) => {
       try {
         const slug = String(payload?.slug ?? '').toUpperCase();
         if (screenJoining) await screenJoining;
@@ -578,7 +596,7 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
         }
         await hydrateLobby(slug);
         if (!isHostScreen(slug)) throw new LobbyError('Nur der Host-Screen kann das Spiel beenden', 403);
-        const finished = store.finishExternalGame(slug, payload?.scores);
+        const finished = store.finishExternalGame(slug, payload?.scores, payload?.sessionId);
         ack?.({ ok: true, finished });
         if (finished) {
           await saveLobby(slug);
@@ -725,9 +743,7 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
         return;
       }
       if (!ctx || ctx.role !== 'controller' || !ctx.playerId) return;
-      const { slug, playerId } = ctx;
-      // Only a phone that isn't back by then shows as gone.
-      setTimeout(() => void controllerLeft(slug, playerId, socket.id), disconnectQuietMs).unref?.();
+      void controllerDropped(ctx.slug, ctx.playerId, socket.id);
     });
   });
 
@@ -784,20 +800,31 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
     screens.pruneExpired();
   }, 60_000).unref?.();
 
-  // A phone's socket dropped disconnectQuietMs ago. Unless the player joined
-  // again since (on any socket, any instance), they now show as gone, and
-  // after reconnectGraceMs more without coming back they are removed.
-  async function controllerLeft(slug: string, playerId: PlayerId, socketId: string): Promise<void> {
+  // A phone's socket dropped. The drop goes into the lobby record quietly (no
+  // activity, nobody told): the phone is usually back within a second or
+  // two. If it isn't back after disconnectQuietMs, the next poll of the lobby
+  // (on any instance) shows it as gone; this instance's timer is only the
+  // fast path. See settlePresence.
+  async function controllerDropped(slug: string, playerId: PlayerId, socketId: string): Promise<void> {
     try {
       await hydrateLobby(slug);
-      const at = Date.now();
-      if (!store.markDisconnected(slug, playerId, at, socketId)) return;
+      if (!store.noteDropped(slug, playerId, socketId, Date.now())) return;
       await saveLobby(slug);
-      emitLobby(slug);
-      setTimeout(() => void removeIfGone(slug, playerId, at), reconnectGraceMs).unref?.();
     } catch (err) {
       logUnlessGone('Disconnect failed', slug, err);
+      return;
     }
+    // A little past the quiet window, so the drop is surely old enough by then.
+    setTimeout(() => {
+      void (async () => {
+        try {
+          await hydrateLobby(slug);
+          await settlePresence(slug);
+        } catch (err) {
+          logUnlessGone('Disconnect failed', slug, err);
+        }
+      })();
+    }, disconnectQuietMs + 100).unref?.();
   }
 
   async function removeIfGone(slug: string, playerId: PlayerId, since: number): Promise<void> {
@@ -838,7 +865,7 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
       void (async () => {
         try {
           await hydrateLobby(slug);
-          await dropGoneScreens(slug);
+          await settlePresence(slug);
         } catch {
           // The lobby expired meanwhile.
         }
@@ -846,12 +873,21 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
     }, screenGraceMs + 100).unref?.();
   }
 
-  // Drop the lobby's screens that left more than screenGraceMs ago (the lobby
-  // must already be hydrated) and tell everyone.
-  async function dropGoneScreens(slug: string): Promise<void> {
-    if (!store.dropGoneScreens(slug, Date.now(), screenGraceMs)) return;
+  // Act on drops the lobby record holds (the lobby must already be hydrated):
+  // screens that left more than screenGraceMs ago are dropped, phones that
+  // dropped more than disconnectQuietMs ago show as gone (and are removed
+  // after reconnectGraceMs more). Tells everyone when something changed.
+  async function settlePresence(slug: string): Promise<void> {
+    const now = Date.now();
+    const screensDropped = store.dropGoneScreens(slug, now, screenGraceMs);
+    const gone = store.markDroppedGone(slug, now, disconnectQuietMs);
+    if (!screensDropped && gone.length === 0) return;
     await saveLobby(slug);
     emitLobby(slug);
+    for (const { playerId, since } of gone) {
+      const delay = Math.max(0, since + reconnectGraceMs - Date.now());
+      setTimeout(() => void removeIfGone(slug, playerId, since), delay).unref?.();
+    }
   }
 
   function emitLobby(slug: string): void {

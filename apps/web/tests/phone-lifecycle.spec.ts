@@ -1,4 +1,4 @@
-import { expect, test, type APIRequestContext, type Browser, type Page } from '@playwright/test';
+import { expect, test, type APIRequestContext, type Browser, type Page, type WebSocketRoute } from '@playwright/test';
 
 // Phones and the attract screen across leaving, lost seats, solo starts,
 // slow first connections and expired screen ids.
@@ -54,6 +54,38 @@ async function slowFirstConnection(page: Page) {
   });
 }
 
+// Puts a page's realtime sockets under the test's control. cut() closes the
+// open ones (the phone reconnects within a second). While `refuse` is set,
+// new ones are closed at once: the socket is down, HTTP still works. While
+// `dropAcks` is set, the server's answers to the phone's events are lost
+// (pings and pushes still go through), as with an answer that the link takes
+// down with it, or one that never comes in time.
+async function controlSockets(page: Page) {
+  const control = { refuse: false, dropAcks: false, droppedAcks: 0, cut: () => {} };
+  const open = new Set<WebSocketRoute>();
+  await page.routeWebSocket(/\/socket\.io\//, (ws) => {
+    if (control.refuse) {
+      void ws.close();
+      return;
+    }
+    const server = ws.connectToServer();
+    open.add(ws);
+    server.onMessage((message) => {
+      // Socket.IO acks are "43<id>[...]" frames.
+      if (control.dropAcks && typeof message === 'string' && message.startsWith('43')) {
+        control.droppedAcks += 1;
+        return;
+      }
+      ws.send(message);
+    });
+  });
+  control.cut = () => {
+    for (const ws of open) void ws.close();
+    open.clear();
+  };
+  return control;
+}
+
 async function pickGame(page: Page, title: string) {
   await page
     .locator('.game-card')
@@ -82,6 +114,80 @@ test('a host who leaves hands the room over at once', async ({ browser, request 
 
   await alex.close();
   await bea.close();
+});
+
+test('a phone whose socket is down still leaves the room at once', async ({ browser, request }) => {
+  const slug = await newLobby(request);
+  const alex = await phonePage(browser, 'Alex');
+  const sockets = await controlSockets(alex);
+  await joinByLink(alex, slug);
+  const bea = await phonePage(browser, 'Bea');
+  await joinByLink(bea, slug);
+  await expect(alex.locator('.host-pill')).toBeVisible();
+
+  sockets.refuse = true;
+  sockets.cut();
+  await expect(alex.locator('.reconnect-pill')).toBeVisible({ timeout: 10_000 });
+
+  await alex.getByRole('button', { name: /Leave/ }).click();
+  await expect(alex).toHaveURL(/\/$/);
+  // The leave went over HTTP. The room only learns of the dropped socket
+  // itself after the quiet window, and that keeps the host role anyway.
+  await expect(bea.locator('.host-pill')).toBeVisible({ timeout: 4_000 });
+  expect((await lobbyOf(request, slug)).players.map((p) => p.name)).toEqual(['Bea']);
+
+  await alex.close();
+  await bea.close();
+});
+
+test('a lost answer to an older reconnect does not throw out the phone a newer one brought back', async ({ browser, request }) => {
+  const slug = await newLobby(request);
+  const alex = await phonePage(browser, 'Alex');
+  const sockets = await controlSockets(alex);
+  await joinByLink(alex, slug);
+
+  // The link drops. The phone reconnects and asks for its seat, but the
+  // answer is lost with the link, which drops again.
+  sockets.dropAcks = true;
+  sockets.cut();
+  await expect.poll(() => sockets.droppedAcks, { timeout: 10_000 }).toBeGreaterThan(0);
+  const lostAt = Date.now();
+  sockets.cut();
+  sockets.dropAcks = false;
+  // The next reconnect gets its answer.
+  await expect(alex.locator('.reconnect-pill')).toHaveCount(0, { timeout: 10_000 });
+
+  // Past the 8 s after which the lost one gives up.
+  await alex.waitForTimeout(Math.max(0, lostAt + 9_000 - Date.now()));
+  await expect(alex.getByRole('heading', { name: 'Controller join failed' })).toHaveCount(0);
+  await expect(alex.locator('.host-pill')).toBeVisible();
+  expect((await lobbyOf(request, slug)).players.map((p) => p.name)).toEqual(['Alex']);
+
+  await alex.close();
+});
+
+test('a reconnect the room does not answer in time keeps the controller and asks again', async ({ browser, request }) => {
+  const slug = await newLobby(request);
+  const alex = await phonePage(browser, 'Alex');
+  const sockets = await controlSockets(alex);
+  await joinByLink(alex, slug);
+
+  sockets.dropAcks = true;
+  sockets.cut();
+  await expect.poll(() => sockets.droppedAcks, { timeout: 10_000 }).toBeGreaterThan(0);
+  const lostAt = Date.now();
+  // The link stays up, but no answer comes before the 8 s timeout: that
+  // is no reason to give up the seat.
+  await alex.waitForTimeout(Math.max(0, lostAt + 8_500 - Date.now()));
+  await expect(alex.getByRole('heading', { name: 'Controller join failed' })).toHaveCount(0);
+  await expect(alex.locator('.reconnect-pill')).toBeVisible();
+
+  // Asked again, and answered this time.
+  sockets.dropAcks = false;
+  await expect(alex.locator('.reconnect-pill')).toHaveCount(0, { timeout: 10_000 });
+  await expect(alex.locator('.host-pill')).toBeVisible();
+
+  await alex.close();
 });
 
 test('a single player can start a game made for one', async ({ browser, request }) => {

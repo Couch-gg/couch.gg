@@ -97,8 +97,11 @@ export interface InternalPlayer extends Player {
   token: PlayerToken;
   disconnectedAt: number | null;
   // The socket this player last joined with: only its disconnect counts (see
-  // markDisconnected). Absent in records persisted before it existed.
+  // noteDropped). Absent in records persisted before it existed.
   connectionId?: string | null;
+  // When that socket dropped, while the player still shows as connected (see
+  // noteDropped and markDroppedGone). Null or absent otherwise.
+  droppedAt?: number | null;
 }
 
 export interface SerializedLobbyRecord {
@@ -284,10 +287,11 @@ export class LobbyStore {
       const wasGone = !reconnect.connected;
       reconnect.connected = true;
       reconnect.disconnectedAt = null;
+      reconnect.droppedAt = null;
       if (connectionId) reconnect.connectionId = connectionId;
       reconnect.name = sanitizePlayerName(name || reconnect.name);
       if (seat) reconnect.screenId = seat;
-      // A phone back before it was even marked gone (see markDisconnected)
+      // A phone back before it was even marked gone (see markDroppedGone)
       // reconnected quietly.
       if (wasGone) this.addActivity(lobby, `${reconnect.name} ist wieder verbunden`);
       return {
@@ -538,14 +542,17 @@ export class LobbyStore {
 
   // Finish an external game with reported scores (from the trusted screen shell).
   // Idempotent: a duplicate report (e.g. from a second TV) is a no-op returning
-  // false. Scores are filtered to the current roster, one per player. Entries
-  // that don't fit (a NaN score from a game bug, a bot, a duplicate) are left
-  // out rather than refusing the whole report, which would leave the round
-  // running with nobody able to end it.
-  finishExternalGame(slug: string, scores: unknown): boolean {
+  // false. So is a report for another round than the running one (`sessionId`,
+  // left out by older TVs): a late retry must not end the next round with the
+  // last one's scores. Scores are filtered to the current roster, one per
+  // player. Entries that don't fit (a NaN score from a game bug, a bot, a
+  // duplicate) are left out rather than refusing the whole report, which
+  // would leave the round running with nobody able to end it.
+  finishExternalGame(slug: string, scores: unknown, sessionId?: unknown): boolean {
     const lobby = this.getLobby(slug);
     const session = lobby.gameSession;
     if (!session || !isExternalSnapshot(session.snapshot)) return false;
+    if (sessionId !== undefined && sessionId !== session.id) return false;
     if (session.state === 'finished' || lobby.state === 'ended') return false;
 
     if (!Array.isArray(scores)) throw new LobbyError('Ungültige Punktestände', 400);
@@ -588,20 +595,46 @@ export class LobbyStore {
     return message;
   }
 
-  // The socket `connectionId` of a player dropped. Only the player's latest
-  // socket counts: a phone that already joined again (here or on another
-  // instance, e.g. before the server noticed its old connection die) stays
-  // connected. Returns null when nothing changed.
+  // The socket `connectionId` of a player dropped: they show as gone now.
+  // Only the player's latest socket counts: a phone that already joined again
+  // (here or on another instance, e.g. before the server noticed its old
+  // connection die) stays connected. Returns null when nothing changed.
   markDisconnected(slug: string, playerId: PlayerId, at = Date.now(), connectionId?: string): Lobby | null {
     const lobby = this.lobbies.get(slug.toUpperCase());
     if (!lobby) return null;
     const player = lobby.players.get(playerId);
     if (!player || !player.connected) return null;
     if (connectionId && player.connectionId && player.connectionId !== connectionId) return null;
-    player.connected = false;
-    player.disconnectedAt = at;
-    this.addActivity(lobby, `${player.name} Verbindung verloren`);
+    this.showGone(lobby, player, at);
     return this.publicLobby(lobby);
+  }
+
+  // The socket `connectionId` of a player dropped, but they don't show as
+  // gone yet: the platform closes long-lived connections every few minutes,
+  // and the phone is back within a second or two. The drop is kept in the
+  // record, so any instance can turn it into "gone" later (markDroppedGone).
+  // Only the player's latest socket counts, as in markDisconnected. Returns
+  // whether the record changed.
+  noteDropped(slug: string, playerId: PlayerId, connectionId: string, at = Date.now()): boolean {
+    const player = this.lobbies.get(slug.toUpperCase())?.players.get(playerId);
+    if (!player || !player.connected || player.droppedAt != null) return false;
+    if (player.connectionId && player.connectionId !== connectionId) return false;
+    player.droppedAt = at;
+    return true;
+  }
+
+  // Players whose socket dropped at least quietMs ago, without them joining
+  // again since, now show as gone (from the time they dropped). Returns them.
+  markDroppedGone(slug: string, now: number, quietMs: number): Array<{ playerId: PlayerId; since: number }> {
+    const lobby = this.getLobby(slug);
+    const gone: Array<{ playerId: PlayerId; since: number }> = [];
+    for (const player of lobby.players.values()) {
+      const since = player.droppedAt;
+      if (since == null || !player.connected || now - since < quietMs) continue;
+      this.showGone(lobby, player, since);
+      gone.push({ playerId: player.id, since });
+    }
+    return gone;
   }
 
   // Remove a player that has been gone since `since` (and didn't come back).
@@ -815,6 +848,13 @@ export class LobbyStore {
     lobby.hostPlayerId = next?.id ?? null;
     for (const player of lobby.players.values()) player.isHost = player.id === lobby.hostPlayerId;
     if (next) this.addActivity(lobby, `${next.name} ist jetzt Host`);
+  }
+
+  private showGone(lobby: LobbyRecord, player: InternalPlayer, at: number): void {
+    player.connected = false;
+    player.disconnectedAt = at;
+    player.droppedAt = null;
+    this.addActivity(lobby, `${player.name} Verbindung verloren`);
   }
 
   private addActivity(lobby: LobbyRecord, text: string): void {
