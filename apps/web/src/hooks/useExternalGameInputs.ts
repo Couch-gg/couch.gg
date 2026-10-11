@@ -31,7 +31,13 @@ import type { GameInputEnvelope, Lobby } from '@couch/types';
  * is not a realistic path for a freshly-started session but is handled for
  * robustness. The buffer is reset whenever the game session restarts so a new
  * round always begins its own seq stream from scratch.
+ *
+ * GAP POLL: while inputs wait on a missing seq, `onGap` is called every
+ * GAP_POLL_MS. The missing input is in the log, and the regular poll may be
+ * slow (it is while the socket carries every change), so the caller polls now.
  */
+
+const GAP_POLL_MS = 400;
 
 export interface UseExternalGameInputsOptions {
   /** The lobby socket (may be null before it connects). */
@@ -40,6 +46,8 @@ export interface UseExternalGameInputsOptions {
   lobby: Lobby | null;
   /** Called once per input, strictly in ascending `seq` order, exactly once. */
   onInput: (input: GameInputEnvelope) => void;
+  /** Called while inputs wait on a missing seq (see GAP POLL). */
+  onGap?: () => void;
 }
 
 /**
@@ -52,7 +60,7 @@ function sessionKey(lobby: Lobby | null): string {
   return `${lobby.currentGameId ?? ''}::${lobby.gameSession?.startedAt ?? ''}`;
 }
 
-export function useExternalGameInputs({ socket, lobby, onInput }: UseExternalGameInputsOptions): void {
+export function useExternalGameInputs({ socket, lobby, onInput, onGap }: UseExternalGameInputsOptions): void {
   const lastForwardedSeqRef = useRef(0);
   // Out-of-order socket arrivals held until the sequence fills in.
   const pendingRef = useRef<Map<number, GameInputEnvelope>>(new Map());
@@ -62,6 +70,17 @@ export function useExternalGameInputs({ socket, lobby, onInput }: UseExternalGam
   useEffect(() => {
     onInputRef.current = onInput;
   }, [onInput]);
+  const onGapRef = useRef(onGap);
+  useEffect(() => {
+    onGapRef.current = onGap;
+  }, [onGap]);
+  const gapTimerRef = useRef<number | null>(null);
+  useEffect(
+    () => () => {
+      if (gapTimerRef.current != null) window.clearTimeout(gapTimerRef.current);
+    },
+    []
+  );
 
   const resetCursor = useCallback(() => {
     lastForwardedSeqRef.current = 0;
@@ -81,6 +100,15 @@ export function useExternalGameInputs({ socket, lobby, onInput }: UseExternalGam
       onInputRef.current(next);
       next = pending.get(lastForwardedSeqRef.current + 1);
     }
+    // Anything still pending waits on a missing seq (GAP POLL).
+    if (pending.size === 0 || gapTimerRef.current != null) return;
+    const askForLog = () => {
+      gapTimerRef.current = null;
+      if (pendingRef.current.size === 0) return;
+      onGapRef.current?.();
+      gapTimerRef.current = window.setTimeout(askForLog, GAP_POLL_MS);
+    };
+    gapTimerRef.current = window.setTimeout(askForLog, GAP_POLL_MS);
   }, []);
 
   /** Buffer or immediately deliver a single envelope (socket path). */

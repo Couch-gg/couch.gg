@@ -2,13 +2,14 @@ import type { AddressInfo } from 'node:net';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { io as connect, type Socket } from 'socket.io-client';
 import type { ExternalGameManifest, Lobby } from '@couch/types';
-import type { TrebuchetSnapshot } from '@couch/trebuchet';
+import type { TrebuchetShotEvent, TrebuchetSnapshot } from '@couch/trebuchet';
 import {
   LobbyStore,
   cloneLobbyRecord,
   deserializeLobbyRecord,
   nextLobbyRev,
-  serializeLobbyRecord
+  serializeLobbyRecord,
+  withoutRepeatedSnapshot
 } from '../src/lobbies.js';
 import { createRealtimeServer, type RealtimeServerInstance } from '../src/index.js';
 
@@ -122,6 +123,47 @@ describe('lobby copies', () => {
     store.leavePlayer(slug, host.playerToken);
     expect(JSON.stringify(serializeLobbyRecord(original))).toBe(before);
   });
+
+  it('rebuild the Trebuchet engine only when a change needs it', () => {
+    const { store, slug, host, guest } = shotFired();
+    const restored = deserializeLobbyRecord(serializeLobbyRecord(store.getLobby(slug)));
+    expect(restored.engine).toBeNull();
+    const elsewhere = new LobbyStore();
+    elsewhere.lobbies.set(slug, restored);
+    const turn = (restored.gameSession?.snapshot as TrebuchetSnapshot).turn;
+    const token = turn === host.player.id ? host.playerToken : guest.playerToken;
+    expect(elsewhere.fire(slug, token, 60, 70)?.type).toBe('shot');
+    expect(restored.engine).not.toBeNull();
+  });
+});
+
+describe('lean lobby view', () => {
+  it("leaves out the last event's copy of the game state when it is the session's", () => {
+    const { store, slug } = shotFired();
+    const full = JSON.parse(JSON.stringify(store.publicLobby(slug))) as Lobby;
+    const lean = withoutRepeatedSnapshot(full);
+    expect(lean.lastEvent?.snapshotFromSession).toBe(true);
+    expect('snapshot' in (lean.lastEvent?.event as object)).toBe(false);
+    expect((lean.lastEvent?.event as TrebuchetShotEvent).trajectory).toEqual((full.lastEvent?.event as TrebuchetShotEvent).trajectory);
+    expect(JSON.stringify(lean).length).toBeLessThan(JSON.stringify(full).length * 0.75);
+    // The full view is left as it was.
+    expect((full.lastEvent?.event as TrebuchetShotEvent).snapshot).toEqual(full.gameSession?.snapshot);
+  });
+
+  it('keeps it when the game state moved on since the event (a rename)', () => {
+    const { store, slug, host } = shotFired();
+    // As stored: the event's copy and the session's are separate objects.
+    store.lobbies.set(slug, deserializeLobbyRecord(JSON.parse(JSON.stringify(serializeLobbyRecord(store.getLobby(slug))))));
+    store.renamePlayer(slug, host.playerToken, 'Alexa');
+    const full = store.publicLobby(slug);
+    expect(withoutRepeatedSnapshot(full)).toBe(full);
+  });
+
+  it('changes nothing without a last event', () => {
+    const store = new LobbyStore();
+    const full = store.publicLobby(store.createLobby());
+    expect(withoutRepeatedSnapshot(full)).toBe(full);
+  });
 });
 
 describe('presence check', () => {
@@ -181,8 +223,8 @@ describe('lobby rev on the wire (in memory)', () => {
     fetch(`${url}/api/lobbies`, { method: 'POST' })
       .then((r) => r.json())
       .then((b) => b.lobby);
-  const poll = (slug: string): Promise<Lobby> =>
-    fetch(`${url}/api/lobbies/${slug}`)
+  const poll = (slug: string, query = ''): Promise<Lobby> =>
+    fetch(`${url}/api/lobbies/${slug}${query}`)
       .then((r) => r.json())
       .then((b) => b.lobby);
 
@@ -194,11 +236,13 @@ describe('lobby rev on the wire (in memory)', () => {
     const tv = open();
     const pushed: Lobby[] = [];
     tv.on('lobby:snapshot', (lobby: Lobby) => pushed.push(lobby));
-    const screen = await ack<{ lobby: Lobby }>(tv, 'screen:join', { slug, screenId: 'scr_revtv' });
+    const screen = await ack<{ lobby: Lobby; fanout: string }>(tv, 'screen:join', { slug, screenId: 'scr_revtv' });
+    expect(screen.fanout).toBe('local');
     expect(screen.lobby.rev).toBeGreaterThan(created.rev!);
 
     const phone = open();
-    const joined = await ack<{ lobby: Lobby; playerToken: string }>(phone, 'controller:join', { slug, name: 'Ann' });
+    const joined = await ack<{ lobby: Lobby; playerToken: string; fanout: string }>(phone, 'controller:join', { slug, name: 'Ann' });
+    expect(joined.fanout).toBe('local');
     expect(joined.lobby.rev).toBeGreaterThan(screen.lobby.rev!);
     await expect.poll(() => pushed.at(-1)?.rev).toBe(joined.lobby.rev);
 
@@ -230,5 +274,39 @@ describe('lobby rev on the wire (in memory)', () => {
     expect(set.ok).toBe(true);
     await expect.poll(() => states.length).toBe(1);
     expect(states[0].rev).toBe((await poll(slug)).rev);
+  });
+
+  it('pushes the lobby when a chat message comes in over HTTP', async () => {
+    const { slug } = await newLobby();
+    const tv = open();
+    await ack(tv, 'screen:join', { slug, screenId: 'scr_revchat' });
+    const phone = open();
+    const ann = await ack<{ playerToken: string }>(phone, 'controller:join', { slug, name: 'Ann' });
+    const pushed: Lobby[] = [];
+    tv.on('lobby:snapshot', (lobby: Lobby) => pushed.push(lobby));
+    const res = await fetch(`${url}/api/lobbies/${slug}/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ playerToken: ann.playerToken, text: 'over http' })
+    });
+    expect(res.status).toBe(201);
+    await expect.poll(() => pushed.at(-1)?.chat.map((m) => m.text)).toContain('over http');
+  });
+
+  it('answers a poll that asks for it without the repeated game state', async () => {
+    const { slug } = await newLobby();
+    const phones = [open(), open()];
+    const players = [];
+    for (const [i, phone] of phones.entries()) {
+      players.push(await ack<{ playerToken: string; player: { id: string } }>(phone, 'controller:join', { slug, name: `P${i}` }));
+    }
+    await ack(phones[0], 'game:start', { slug, playerToken: players[0].playerToken });
+
+    const full = await poll(slug);
+    const lean = await poll(slug, '?lean=1');
+    expect(full.lastEvent?.event).toHaveProperty('snapshot');
+    expect(lean.lastEvent?.snapshotFromSession).toBe(true);
+    expect(lean.lastEvent?.event).not.toHaveProperty('snapshot');
+    expect(lean.gameSession).toEqual(full.gameSession);
   });
 });

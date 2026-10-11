@@ -28,11 +28,25 @@ export async function createLobby(mode?: 'local' | 'remote'): Promise<Lobby> {
 }
 
 export async function fetchLobby(slug: string): Promise<Lobby> {
-  const response = await fetch(`${REALTIME_URL}${REALTIME_API_PREFIX}/lobbies/${slug}`);
+  // `lean=1`: the last game event comes without its copy of the game state
+  // when that is the session's (it is put back below).
+  const response = await fetch(`${REALTIME_URL}${REALTIME_API_PREFIX}/lobbies/${slug}?lean=1`);
   // Keep the status: only 404/410 mean the lobby is gone.
   if (!response.ok) throw Object.assign(new Error('Lobby nicht gefunden'), { status: response.status });
   const body = (await response.json()) as { lobby: Lobby };
-  return body.lobby;
+  return withRepeatedSnapshot(body.lobby);
+}
+
+// Put back the game state a lean poll left out of the last event: it is the
+// session's snapshot.
+function withRepeatedSnapshot(lobby: Lobby): Lobby {
+  const lastEvent = lobby.lastEvent;
+  if (!lastEvent?.snapshotFromSession || !lobby.gameSession) return lobby;
+  const { snapshotFromSession: _left, ...envelope } = lastEvent;
+  return {
+    ...lobby,
+    lastEvent: { ...envelope, event: { ...(lastEvent.event as object), snapshot: lobby.gameSession.snapshot } }
+  };
 }
 
 export async function fetchGames(): Promise<GameManifest[]> {

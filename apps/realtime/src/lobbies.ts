@@ -381,8 +381,9 @@ export class LobbyStore {
     player.name = nextName;
 
     let gameEvent: TrebuchetSnapshot | null = null;
-    if (lobby.engine) {
-      gameEvent = lobby.engine.renamePlayer(player.id, nextName);
+    const engine = this.engineOf(lobby);
+    if (engine) {
+      gameEvent = engine.renamePlayer(player.id, nextName);
       this.updateGameSession(lobby, gameEvent);
     } else if (isTrebuchetSnapshot(lobby.gameSession?.snapshot)) {
       const snapshot = lobby.gameSession.snapshot;
@@ -472,7 +473,7 @@ export class LobbyStore {
   fire(slug: string, playerToken: string, angle: unknown, power: unknown): TrebuchetEvent | null {
     const lobby = this.getLobby(slug);
     const player = this.playerByToken(lobby, playerToken);
-    const event = lobby.engine?.fire(player.id, angle, power) ?? null;
+    const event = this.engineOf(lobby)?.fire(player.id, angle, power) ?? null;
     if (event) this.updateGameSession(lobby, event.snapshot);
     return event;
   }
@@ -492,7 +493,7 @@ export class LobbyStore {
   skipTurn(slug: string, turnEndsAt: number, now = Date.now()): TrebuchetEvent | null {
     const lobby = this.getLobby(slug);
     if (lobby.state !== 'playing' || turnEndsAtOf(lobby) !== turnEndsAt || turnEndsAt > now) return null;
-    const event = lobby.engine?.skipTurn() ?? null;
+    const event = this.engineOf(lobby)?.skipTurn() ?? null;
     if (event) this.updateGameSession(lobby, event.snapshot);
     return event;
   }
@@ -743,14 +744,26 @@ export class LobbyStore {
   private removePlayer(lobby: LobbyRecord, player: InternalPlayer, activity: string): PlayerRemoval {
     lobby.players.delete(player.id);
     let gameSnapshot: TrebuchetSnapshot | null = null;
-    if (lobby.engine && lobby.state === 'playing') {
-      gameSnapshot = lobby.engine.removePlayer(player.id);
+    const engine = lobby.state === 'playing' ? this.engineOf(lobby) : null;
+    if (engine) {
+      gameSnapshot = engine.removePlayer(player.id);
       this.updateGameSession(lobby, gameSnapshot);
     }
     this.addActivity(lobby, activity);
     if (lobby.hostPlayerId === player.id) this.promoteHost(lobby);
     if (lobby.players.size === 0 && lobby.state === 'playing') this.endSession(lobby);
     return { lobby: this.publicLobby(lobby), gameEvent: gameSnapshot };
+  }
+
+  // The Trebuchet engine of a running Trebuchet round. A lobby read from
+  // storage gets it rebuilt from its snapshot only here, on first use: most
+  // reads (every poll) never touch the engine.
+  private engineOf(lobby: LobbyRecord): TrebuchetEngine | null {
+    if (lobby.engine) return lobby.engine;
+    const snapshot = lobby.gameSession?.snapshot;
+    if (lobby.state !== 'playing' || !isTrebuchetSnapshot(snapshot)) return null;
+    lobby.engine = TrebuchetEngine.fromSnapshot(snapshot);
+    return lobby.engine;
   }
 
   private endSession(lobby: LobbyRecord): void {
@@ -956,7 +969,7 @@ export function serializeLobbyRecord(lobby: LobbyRecord): SerializedLobbyRecord 
 }
 
 // A copy of a lobby to change, which shares nothing it could change with the
-// original (the engine is rebuilt from the snapshot).
+// original (the engine is rebuilt from the snapshot when it is needed).
 export function cloneLobbyRecord(lobby: LobbyRecord): LobbyRecord {
   return deserializeLobbyRecord(serializeLobbyRecord(lobby));
 }
@@ -968,8 +981,31 @@ export function nextLobbyRev(rev: number, now = Date.now()): number {
   return Math.max(rev + 1, now);
 }
 
+// A lobby view without the copy of the game state its last event repeats:
+// when that copy is the session's snapshot, `snapshotFromSession` says so and
+// the client puts it back (see the web app's fetchLobby). Only for clients
+// that ask for it: older ones read the snapshot off the event.
+export function withoutRepeatedSnapshot(lobby: Lobby): Lobby {
+  const event = lobby.lastEvent?.event as { snapshot?: unknown } | undefined;
+  const sessionSnapshot = lobby.gameSession?.snapshot;
+  if (!lobby.lastEvent || !event || typeof event !== 'object' || !('snapshot' in event)) return lobby;
+  if (sessionSnapshot === undefined || !sameValue(event.snapshot, sessionSnapshot)) return lobby;
+  const { snapshot: _repeated, ...rest } = event;
+  return { ...lobby, lastEvent: { ...lobby.lastEvent, event: rest, snapshotFromSession: true } };
+}
+
+function sameValue(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  const left = a as Record<string, unknown>;
+  const right = b as Record<string, unknown>;
+  const keys = Object.keys(left);
+  if (keys.length !== Object.keys(right).length) return false;
+  return keys.every((key) => Object.prototype.hasOwnProperty.call(right, key) && sameValue(left[key], right[key]));
+}
+
 export function deserializeLobbyRecord(serialized: SerializedLobbyRecord): LobbyRecord {
-  const snapshot = serialized.gameSession?.snapshot ?? null;
   return {
     rev: serialized.rev ?? 0,
     id: serialized.id,
@@ -990,12 +1026,9 @@ export function deserializeLobbyRecord(serialized: SerializedLobbyRecord): Lobby
         }
       : null,
     lastEvent: serialized.lastEvent ?? null,
-    // Only rebuild a Trebuchet engine for a live Trebuchet snapshot — external
-    // games have no engine, and fromSnapshot would fault on their shape.
-    engine:
-      isTrebuchetSnapshot(snapshot) && serialized.state === 'playing'
-        ? TrebuchetEngine.fromSnapshot(snapshot)
-        : null,
+    // Rebuilt on first use (LobbyStore.engineOf), and only for a running
+    // Trebuchet round: external games have no engine.
+    engine: null,
     // Back-compat: records persisted before external-game support lack these.
     mode: serialized.mode ?? 'local',
     inputSeq: serialized.inputSeq ?? 0,

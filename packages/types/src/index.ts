@@ -122,7 +122,14 @@ export interface GameEventEnvelope {
   seq: number;       // monotonic per lobby; clients replay only seq > last-seen
   at: string;        // ISO
   event: unknown;    // the TrebuchetEvent (client casts)
+  // Set when a poll left the event's `snapshot` out because it is the same as
+  // the lobby's gameSession.snapshot (only for a poll that asked for that).
+  snapshotFromSession?: true;
 }
+
+// How a server's room emits reach sockets: 'redis' when they reach every
+// instance's sockets (Socket.IO Redis adapter), 'local' when only its own.
+export type FanoutMode = 'redis' | 'local';
 
 export interface GameSession<TSnapshot = unknown> {
   id: string;

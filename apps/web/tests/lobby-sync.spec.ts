@@ -1,7 +1,8 @@
 import { expect, test, type APIRequestContext, type Browser, type Page, type Route } from '@playwright/test';
 
 // How TVs and phones keep their lobby in step: an older snapshot never
-// replaces a newer one.
+// replaces a newer one, and the poll slows down while the socket carries
+// every change.
 
 const DESKTOP_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -54,6 +55,40 @@ async function holdNextPoll(page: Page, slug: string) {
       }),
     release
   };
+}
+
+// Count the page's lobby polls.
+function countPolls(page: Page, slug: string) {
+  const at: number[] = [];
+  page.on('request', (req) => {
+    if (isPoll(slug)(new URL(req.url()))) at.push(Date.now());
+  });
+  return { since: (t: number) => at.filter((x) => x >= t).length };
+}
+
+// Pass the page's socket through, telling it the server's room emits reach
+// every instance ('redis' fan-out) while `redis.on` is set. Join acks are
+// Socket.IO ack packets ("43<id>[{...}]") that carry a `fanout` field.
+async function reportFanout(page: Page) {
+  const redis = { on: true };
+  const sockets: Array<{ close: () => Promise<void> }> = [];
+  await page.routeWebSocket(/\/socket\.io\//, (ws) => {
+    const server = ws.connectToServer();
+    sockets.push({ close: () => ws.close() });
+    server.onMessage((message) => {
+      const match = typeof message === 'string' ? /^43(\d+)(\[.*)$/s.exec(message) : null;
+      if (match && redis.on) {
+        const args = JSON.parse(match[2]);
+        if (args[0] && typeof args[0] === 'object' && 'fanout' in args[0]) {
+          args[0].fanout = 'redis';
+          ws.send(`43${match[1]}${JSON.stringify(args)}`);
+          return;
+        }
+      }
+      ws.send(message);
+    });
+  });
+  return { redis, dropSockets: () => Promise.all(sockets.splice(0).map((s) => s.close())) };
 }
 
 test('a poll answered before the round started does not take it back on the TV or a phone', async ({ browser, request }) => {
@@ -109,4 +144,46 @@ test('a poll answered before the round started does not take it back on the TV o
   await tv.close();
   await alex.close();
   await bea.close();
+});
+
+test('the lobby poll slows down while the socket carries every change, and speeds up without it', async ({ browser, request }) => {
+  test.setTimeout(120_000);
+  const slug = await newLobby(request);
+  const tv = await desktopPage(browser);
+  const tvSocket = await reportFanout(tv);
+  const tvPolls = countPolls(tv, slug);
+  await tv.goto('/l/' + slug);
+  const alex = await phonePage(browser, 'Alex');
+  const alexSocket = await reportFanout(alex);
+  const alexPolls = countPolls(alex, slug);
+  await joinByLink(alex, slug);
+  await expect(tv.locator('.player-name', { hasText: 'Alex' })).toBeVisible({ timeout: 15_000 });
+
+  // Both joined with 'redis' fan-out: about one poll per 5 s each.
+  await tv.waitForTimeout(1_000);
+  let from = Date.now();
+  await tv.waitForTimeout(6_000);
+  expect(tvPolls.since(from)).toBeGreaterThanOrEqual(1);
+  expect(tvPolls.since(from)).toBeLessThanOrEqual(2);
+  expect(alexPolls.since(from)).toBeGreaterThanOrEqual(1);
+  expect(alexPolls.since(from)).toBeLessThanOrEqual(2);
+  // Changes still arrive at once, over the socket.
+  await alex.locator('.name-edit-trigger').click();
+  await alex.locator('.name-edit-form input').fill('Alexa');
+  await alex.locator('.name-edit-form').evaluate((form: HTMLFormElement) => form.requestSubmit());
+  await expect(tv.locator('.player-name', { hasText: 'Alexa' })).toBeVisible({ timeout: 2_000 });
+
+  // The connection drops, and the server they get back to only reaches its
+  // own instance's sockets: every 750 ms again.
+  tvSocket.redis.on = false;
+  alexSocket.redis.on = false;
+  await Promise.all([tvSocket.dropSockets(), alexSocket.dropSockets()]);
+  await tv.waitForTimeout(1_500);
+  from = Date.now();
+  await tv.waitForTimeout(3_000);
+  expect(tvPolls.since(from)).toBeGreaterThanOrEqual(3);
+  expect(alexPolls.since(from)).toBeGreaterThanOrEqual(3);
+
+  await tv.close();
+  await alex.close();
 });

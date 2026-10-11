@@ -15,7 +15,16 @@ import {
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState, type FormEvent, type MutableRefObject, type PointerEvent } from 'react';
 import type { Socket } from 'socket.io-client';
-import type { ControllerState, GameManifest, InputAction, JoinLobbyResponse, Lobby, Player, RenamePlayerResponse } from '@couch/types';
+import type {
+  ControllerState,
+  FanoutMode,
+  GameManifest,
+  InputAction,
+  JoinLobbyResponse,
+  Lobby,
+  Player,
+  RenamePlayerResponse
+} from '@couch/types';
 import {
   CHARGE_TIME_MS,
   ELEV_MAX,
@@ -31,8 +40,8 @@ import {
 import { GameCatalog } from '../components/GameCatalog.js';
 import { ChatPanel } from '../components/ChatPanel.js';
 import { GenericController } from '../components/GenericController.js';
-import { fetchLobby, leaveLobby, sendChat } from '../api.js';
-import { isOlderLobby } from '../lobbySync.js';
+import { leaveLobby, sendChat } from '../api.js';
+import { isOlderLobby, startLobbyPoll } from '../lobbySync.js';
 import { createSocket, emitAck } from '../socket.js';
 
 // True only for the built-in trebuchet snapshot shape. External games report
@@ -154,6 +163,9 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     lobbyRef.current = next;
     setLobby(next);
   }, []);
+  // What the latest controller:join ack said about the server's fan-out
+  // (null before one, and since the socket dropped). Sets the poll's pace.
+  const fanoutRef = useRef<FanoutMode | null>(null);
 
   // The room doesn't take this phone back (it moved on without it, or is
   // gone): show the join screen with "Try again" instead of a controller that
@@ -227,7 +239,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
         return;
       }
       const storedName = window.localStorage.getItem('couch:name') || 'Player';
-      void emitAck<JoinLobbyResponse & { ok: true; games: GameManifest[] }>(nextSocket, 'controller:join', {
+      void emitAck<JoinLobbyResponse & { ok: true; games: GameManifest[]; fanout?: FanoutMode }>(nextSocket, 'controller:join', {
         slug,
         name: storedName,
         playerToken: token,
@@ -235,6 +247,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
       })
         .then((joined) => {
           if (attempt !== rejoinAttempt) return;
+          fanoutRef.current = joined.fanout ?? null;
           setReconnecting(false);
           setPlayer(joined.player);
           takeLobby(joined.lobby);
@@ -259,7 +272,10 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     };
 
     nextSocket.on('connect', rejoinIfPossible);
-    nextSocket.on('disconnect', () => setReconnecting(true));
+    nextSocket.on('disconnect', () => {
+      fanoutRef.current = null;
+      setReconnecting(true);
+    });
 
     return () => {
       rejoinAttempt += 1; // an answer still on its way is for nobody now
@@ -309,12 +325,13 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     }
     setJoinStatus('joining');
     try {
-      const joined = await emitAck<JoinLobbyResponse & { ok: true; games: GameManifest[] }>(socket, 'controller:join', {
+      const joined = await emitAck<JoinLobbyResponse & { ok: true; games: GameManifest[]; fanout?: FanoutMode }>(socket, 'controller:join', {
         slug,
         name: name || 'Player',
         playerToken,
         screenId: seatFor(slug)
       });
+      fanoutRef.current = joined.fanout ?? null;
       setPlayer(joined.player);
       takeLobby(joined.lobby);
       setGames(joined.games);
@@ -336,23 +353,13 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     void join();
   }, [join, joinStatus, player, socket]);
 
+  // A dropped poll does not disconnect an already joined controller.
+  const isJoined = player !== null;
   useEffect(() => {
-    if (!player) return;
-    let active = true;
-    const refresh = () => {
-      void fetchLobby(slug)
-        .then((next) => active && takeLobby(next))
-        .catch(() => {
-          // A dropped poll should not disconnect an already joined controller.
-        });
-    };
-    refresh();
-    const refreshTimer = window.setInterval(refresh, 750);
-    return () => {
-      active = false;
-      window.clearInterval(refreshTimer);
-    };
-  }, [player, slug, takeLobby]);
+    if (!isJoined) return;
+    const poll = startLobbyPoll({ slug, socket, fanout: () => fanoutRef.current, onLobby: takeLobby, immediate: true });
+    return () => poll.stop();
+  }, [isJoined, slug, socket, takeLobby]);
 
   const isHost = Boolean(player && lobby?.hostPlayerId === player.id);
   const rawSnapshot = lobby?.gameSession?.snapshot;

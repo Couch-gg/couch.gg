@@ -5,7 +5,7 @@ import express from 'express';
 import { Server, type ServerOptions } from 'socket.io';
 import { GAME_MANIFESTS } from '@couch/game-runtime';
 import type { TrebuchetEvent } from '@couch/trebuchet';
-import type { ControllerEvent, ControllerPatch, GameId, GameManifest, PlayerId, ScreenId } from '@couch/types';
+import type { ControllerEvent, ControllerPatch, FanoutMode, GameId, GameManifest, PlayerId, ScreenId } from '@couch/types';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import {
   LobbyError,
@@ -14,6 +14,7 @@ import {
   cloneLobbyRecord,
   hostScreenId,
   turnEndsAtOf,
+  withoutRepeatedSnapshot,
   type LobbyRecord,
   type ManifestResolver,
   type PlayerRemoval
@@ -142,6 +143,12 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   // cache). Keep it sync — callers await ensureFresh() before hitting it.
   const catalog = (): GameManifest[] => mergeCatalog([...externalGames, ...registry.listPublic()]);
 
+  // Whether this instance's room emits reach every instance's sockets, told
+  // to clients in their join acks: while their socket carries every change
+  // they poll the lobby less often. No adapter carries emits across instances
+  // here, so a TV or phone on another instance hears nothing of them.
+  const fanoutMode = (): FanoutMode => 'local';
+
   const store = new LobbyStore(resolveManifest);
   const screens = new ScreenRegistry();
   const persistence = createProductionLobbyPersistence();
@@ -197,7 +204,9 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
       // phone that dropped shows as gone, even when the instance that saw the
       // socket go is gone before its timer fires.
       await settlePresence(slug, true);
-      res.json({ lobby: store.publicLobby(slug) });
+      const lobby = store.publicLobby(slug);
+      // `lean=1` (current clients) leaves out what the client can rebuild.
+      res.json({ lobby: req.query.lean === '1' ? withoutRepeatedSnapshot(lobby) : lobby });
     } catch (err) {
       sendHttpError(res, err);
     }
@@ -410,7 +419,13 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
           ctx = { role: 'screen', slug, screenId };
           hostCheck = null;
           socket.join([room(slug), screensRoom(slug)]);
-          ack?.({ ok: true, lobby, games: catalog(), ...(joined.screenToken ? { screenToken: joined.screenToken } : {}) });
+          ack?.({
+            ok: true,
+            lobby,
+            games: catalog(),
+            fanout: fanoutMode(),
+            ...(joined.screenToken ? { screenToken: joined.screenToken } : {})
+          });
           socket.emit('lobby:snapshot', lobby);
         } catch (err) {
           ack?.(socketError(err));
@@ -437,7 +452,7 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
         });
         ctx = { role: 'controller', slug, playerId: joined.player.id };
         socket.join([room(slug), playerRoom(slug, joined.player.id)]);
-        ack?.({ ok: true, ...joined, games: catalog() });
+        ack?.({ ok: true, ...joined, games: catalog(), fanout: fanoutMode() });
         emitLobby(slug);
         await autoStartIfFull(slug);
       } catch (err) {
@@ -805,6 +820,9 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
       const slug = req.params.slug.toUpperCase();
       const { result: message } = await mutateLobby(slug, () => store.postChat(slug, req.body?.playerToken, req.body?.text));
       io.to(room(slug)).emit('chat:message', message);
+      // TVs take chat from lobby snapshots only (like after chat:send), and
+      // while their socket carries every change they seldom poll.
+      emitLobby(slug);
       res.status(201).json({ message });
     } catch (err) {
       sendHttpError(res, err);
