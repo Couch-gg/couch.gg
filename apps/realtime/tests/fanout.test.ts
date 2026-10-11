@@ -1,5 +1,6 @@
 import net, { type AddressInfo } from 'node:net';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { createClient } from 'redis';
 import { io as connect, type Socket } from 'socket.io-client';
 import type { ExternalGameManifest, GameInputEnvelope } from '@couch/types';
 import { createRealtimeServer, type RealtimeServerInstance } from '../src/index.js';
@@ -187,5 +188,49 @@ describe.skipIf(!redisUrl)('Redis fan-out across instances', () => {
     // Leaving must reach the adapter that now holds the membership.
     joinedLate.disconnect();
     await expect.poll(() => late.io.of('/').adapter.rooms.get(`lobby:${slug}`)?.size, { timeout: 3000 }).toBe(1);
+  });
+
+  it('continues the seq of an external game that was running before the input list existed', async () => {
+    const created = await fetch(`${urlA}/api/lobbies`, { method: 'POST' }).then((r) => r.json());
+    const slug: string = created.lobby.slug;
+    const phone = open(urlA);
+    const host = await ack<{ playerToken: string }>(phone, 'controller:join', { slug, name: 'Ann' });
+    await ack(phone, 'game:select', { slug, playerToken: host.playerToken, gameId: PAD.id });
+    await ack(phone, 'game:start', { slug, playerToken: host.playerToken });
+
+    // Store the game the way the deploy before the input list did: seq and log
+    // only in the lobby blob, no list and no counter.
+    const raw = createClient({ url: redisUrl });
+    await raw.connect();
+    const key = `couch:lobby:${slug}`;
+    const blob = JSON.parse((await raw.get(key))!);
+    blob.inputSeq = 50;
+    blob.inputLog = Array.from({ length: 50 }, (_, i) => ({
+      seq: i + 1,
+      at: new Date().toISOString(),
+      playerId: 'p',
+      control: 'a',
+      action: 'press'
+    }));
+    await raw.set(key, JSON.stringify(blob), { PXAT: blob.expiresAt });
+    await raw.del([`${key}:inputs`, `${key}:inputseq`]);
+    await raw.close();
+
+    const tv = open(urlB);
+    await ack(tv, 'screen:join', { slug });
+    const received: GameInputEnvelope[] = [];
+    tv.on('game:input', (envelope: GameInputEnvelope) => received.push(envelope));
+
+    // A screen that already forwarded seq 50 drops anything at or below it.
+    const sent = await ack<{ seq: number }>(phone, 'controller:event', {
+      slug,
+      playerToken: host.playerToken,
+      event: { playerId: 'x', type: 'game', control: 'a', value: { action: 'press' }, timestamp: Date.now() }
+    });
+    expect(sent.seq).toBe(51);
+    await expect.poll(() => received.map((e) => e.seq), { timeout: 3000 }).toEqual([51]);
+
+    const polled = await fetch(`${urlB}/api/lobbies/${slug}`).then((r) => r.json());
+    expect(polled.lobby.inputLog.map((e: GameInputEnvelope) => e.seq)).toEqual(Array.from({ length: 51 }, (_, i) => i + 1));
   });
 });

@@ -422,12 +422,14 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
           }
           // Validate first, then take the seq: with Redis one script INCRs it (so
           // two instances can't stamp the same seq) and appends the input under
-          // it; else the lobby's counter and a save of the lobby blob.
+          // it, seeding a missing counter from the hydrated inputSeq; else the
+          // lobby's counter and a save of the lobby blob.
           const prepared = store.prepareGameInput(slug, playerToken, controllerEvent);
           let envelope: GameInputEnvelope;
           if (persistence.appendNextInput) {
             const at = new Date().toISOString();
-            const seq = await persistence.appendNextInput(slug, { at, ...prepared }, store.getLobby(slug).expiresAt);
+            const { expiresAt, inputSeq } = store.getLobby(slug);
+            const seq = await persistence.appendNextInput(slug, { at, ...prepared }, expiresAt, inputSeq);
             envelope = store.commitGameInput(slug, prepared, seq, at);
             ack?.({ ok: true, seq });
           } else {

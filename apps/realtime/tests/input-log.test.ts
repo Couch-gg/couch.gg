@@ -40,7 +40,7 @@ describe.skipIf(!redisUrl)('Redis input log (appendNextInput)', () => {
     const lobby = await savedLobby();
     const seqs = await Promise.all(
       Array.from({ length: 40 }, (_, i) =>
-        (i % 2 ? instanceA : instanceB).appendNextInput!(lobby.slug, input(i, { i }), lobby.expiresAt)
+        (i % 2 ? instanceA : instanceB).appendNextInput!(lobby.slug, input(i, { i }), lobby.expiresAt, 0)
       )
     );
     expect([...seqs].sort((a, b) => a - b)).toEqual(Array.from({ length: 40 }, (_, i) => i + 1));
@@ -60,8 +60,8 @@ describe.skipIf(!redisUrl)('Redis input log (appendNextInput)', () => {
   it('stores the envelope exactly as given, with or without a value', async () => {
     const lobby = await savedLobby();
     const tricky = { text: 'a "quoted" } brace, ünïcode', list: [1, 2, { deep: null }] };
-    const first = await instanceA.appendNextInput!(lobby.slug, input(1, tricky), lobby.expiresAt);
-    const second = await instanceA.appendNextInput!(lobby.slug, input(2), lobby.expiresAt);
+    const first = await instanceA.appendNextInput!(lobby.slug, input(1, tricky), lobby.expiresAt, 0);
+    const second = await instanceA.appendNextInput!(lobby.slug, input(2), lobby.expiresAt, 0);
 
     const stored = await raw.lRange(`couch:lobby:${lobby.slug}:inputs`, 0, -1);
     expect(stored).toEqual([
@@ -74,7 +74,7 @@ describe.skipIf(!redisUrl)('Redis input log (appendNextInput)', () => {
   it(`keeps the last ${INPUT_LOG_LIMIT} entries and sets the lobby's expiry on list and counter`, async () => {
     const lobby = await savedLobby();
     const total = INPUT_LOG_LIMIT + 5;
-    for (let i = 1; i <= total; i++) await instanceA.appendNextInput!(lobby.slug, input(i), lobby.expiresAt);
+    for (let i = 1; i <= total; i++) await instanceA.appendNextInput!(lobby.slug, input(i), lobby.expiresAt, 0);
 
     const loaded = await instanceA.load(lobby.slug);
     expect(loaded?.inputSeq).toBe(total);
@@ -93,10 +93,40 @@ describe.skipIf(!redisUrl)('Redis input log (appendNextInput)', () => {
 
   it('starts at seq 1 again after resetInputs', async () => {
     const lobby = await savedLobby();
-    await instanceA.appendNextInput!(lobby.slug, input(1), lobby.expiresAt);
-    await instanceA.appendNextInput!(lobby.slug, input(2), lobby.expiresAt);
+    await instanceA.appendNextInput!(lobby.slug, input(1), lobby.expiresAt, 0);
+    await instanceA.appendNextInput!(lobby.slug, input(2), lobby.expiresAt, 1);
+    // A new game drops the counter and list, then saves its lobby at seq 0.
     await instanceB.resetInputs!(lobby.slug);
-    expect(await instanceB.appendNextInput!(lobby.slug, input(3), lobby.expiresAt)).toBe(1);
+    await instanceB.save(lobby);
+    const hydrated = await instanceB.load(lobby.slug);
+    expect(hydrated?.inputSeq).toBe(0);
+    expect(await instanceB.appendNextInput!(lobby.slug, input(3), lobby.expiresAt, hydrated!.inputSeq)).toBe(1);
     expect((await instanceA.load(lobby.slug))?.inputLog.map((entry) => entry.seq)).toEqual([1]);
+  });
+
+  it('continues the seq of a game that was running before the counter existed', async () => {
+    // Before the list and counter, the seq and log lived only in the lobby blob.
+    const store = new LobbyStore();
+    const lobby = store.createLobby();
+    for (let i = 1; i <= 100; i++) store.commitGameInput(lobby.slug, { playerId: 'p0', control: 'a', action: 'press' });
+    await instanceA.save(lobby);
+
+    const hydrated = (await instanceA.load(lobby.slug))!;
+    expect(hydrated.inputSeq).toBe(100);
+    expect(await instanceA.appendNextInput!(lobby.slug, input(101), lobby.expiresAt, hydrated.inputSeq)).toBe(101);
+
+    // A later save of the blob carries that entry too; it must not show up twice.
+    store.commitGameInput(lobby.slug, { playerId: 'p0', control: 'a', action: 'press' }, 101);
+    await instanceA.save(lobby);
+    // Once the counter exists, the seq another instance passes no longer seeds it.
+    expect(await instanceB.appendNextInput!(lobby.slug, input(102), lobby.expiresAt, 0)).toBe(102);
+    for (let i = 103; i <= 130; i++) await instanceB.appendNextInput!(lobby.slug, input(i), lobby.expiresAt, 0);
+
+    // The blob's older entries stay in front of the list's: the log has no hole
+    // and keeps the usual limit.
+    const loaded = await instanceB.load(lobby.slug);
+    expect(loaded?.inputSeq).toBe(130);
+    expect(loaded?.inputLog.map((entry) => entry.seq)).toEqual(Array.from({ length: INPUT_LOG_LIMIT }, (_, i) => i + 3));
+    expect(loaded?.inputLog.at(-1)).toEqual({ seq: 130, ...input(130) });
   });
 });

@@ -36,7 +36,14 @@ export interface LobbyPersistence {
   // With these, the seq is an INCR and the log is a list the blob never touches.
   // appendNextInput takes the seq and appends the input under it in one atomic
   // script and resolves to that seq, so no seq is handed out without its entry.
-  appendNextInput?(slug: string, input: Omit<GameInputEnvelope, 'seq'>, expiresAt: number): Promise<number>;
+  // lastSeq is the hydrated lobby's inputSeq. It seeds a missing counter, so a
+  // game whose seq so far lived only in the blob continues after it.
+  appendNextInput?(
+    slug: string,
+    input: Omit<GameInputEnvelope, 'seq'>,
+    expiresAt: number,
+    lastSeq: number
+  ): Promise<number>;
   resetInputs?(slug: string): Promise<void>;
 }
 
@@ -91,19 +98,30 @@ class RedisLobbyPersistence implements LobbyPersistence {
     const lobby = deserializeLobbyRecord(parsed);
     // The input list is the authority for the running game. An empty list with no
     // counter means no input has gone through it yet, so the blob's log stands.
+    // Blob entries older than the list's first stay in front of it: a game that
+    // was running before the list existed keeps its earlier inputs in the log.
     if (rawInputs.length || rawSeq) {
-      lobby.inputLog = rawInputs.map((entry) => JSON.parse(entry) as GameInputEnvelope).sort((a, b) => a.seq - b.seq);
+      const listed = rawInputs.map((entry) => JSON.parse(entry) as GameInputEnvelope).sort((a, b) => a.seq - b.seq);
+      const firstListed = listed[0]?.seq ?? Infinity;
+      lobby.inputLog = [...lobby.inputLog.filter((entry) => entry.seq < firstListed), ...listed].slice(-INPUT_LOG_LIMIT);
       lobby.inputSeq = Math.max(Number(rawSeq ?? 0), lobby.inputLog.at(-1)?.seq ?? 0);
     }
     return lobby;
   }
 
-  async appendNextInput(slug: string, input: Omit<GameInputEnvelope, 'seq'>, expiresAt: number): Promise<number> {
+  async appendNextInput(
+    slug: string,
+    input: Omit<GameInputEnvelope, 'seq'>,
+    expiresAt: number,
+    lastSeq: number
+  ): Promise<number> {
     const client = await this.client();
     // The script puts `{"seq":N,` in front, so the rest goes without its brace.
+    // The seed must be an integer: INCR on anything else would fail every input.
+    const seed = Number.isSafeInteger(lastSeq) && lastSeq > 0 ? lastSeq : 0;
     const seq = await client.eval(APPEND_NEXT_INPUT_SCRIPT, {
       keys: [inputsKey(slug), inputSeqKey(slug)],
-      arguments: [JSON.stringify(input).slice(1), String(-INPUT_LOG_LIMIT), String(expiresAt)]
+      arguments: [JSON.stringify(input).slice(1), String(-INPUT_LOG_LIMIT), String(expiresAt), String(seed)]
     });
     return Number(seq);
   }
@@ -421,10 +439,15 @@ function inputSeqKey(slug: string): string {
 }
 
 // KEYS: input list, seq counter. ARGV: the envelope JSON minus its opening brace
-// (no seq yet), -INPUT_LOG_LIMIT, the lobby's expiry in unix ms. One script so an
-// instance dying or a dropped connection between the INCR and the RPUSH can't
-// leave a seq that screens wait on but that never reaches the log.
+// (no seq yet), -INPUT_LOG_LIMIT, the lobby's expiry in unix ms, the hydrated
+// lobby's inputSeq. One script so an instance dying or a dropped connection
+// between the INCR and the RPUSH can't leave a seq that screens wait on but that
+// never reaches the log. The SET NX seeds a missing counter: a game that started
+// before the counter existed kept its seq in the lobby blob and must continue
+// after it (screens drop every seq they have already forwarded), while a game
+// resetInputs just cleared has its blob saved at 0 and so starts at 1.
 const APPEND_NEXT_INPUT_SCRIPT = `
+redis.call('SET', KEYS[2], ARGV[4], 'NX')
 local seq = redis.call('INCR', KEYS[2])
 redis.call('RPUSH', KEYS[1], '{"seq":' .. seq .. ',' .. ARGV[1])
 redis.call('LTRIM', KEYS[1], ARGV[2], -1)
