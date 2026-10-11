@@ -141,3 +141,77 @@ test('a held button is released when the phone is backgrounded', async ({ browse
   await alex.close();
   await bea.close();
 });
+
+// Dispatch a touch pointer event with an explicit pointerId on a control.
+async function touch(page: Page, selector: string, type: string, pointerId: number, x: number, y: number) {
+  await page.evaluate(
+    ({ selector, type, pointerId, x, y }) => {
+      const el = document.querySelector(selector)!;
+      el.dispatchEvent(
+        new PointerEvent(type, {
+          pointerId,
+          pointerType: 'touch',
+          isPrimary: pointerId === 1,
+          bubbles: true,
+          cancelable: true,
+          clientX: x,
+          clientY: y
+        })
+      );
+    },
+    { selector, type, pointerId, x, y }
+  );
+}
+
+test('a second finger on the stick or d-pad neither moves nor releases it', async ({ browser }) => {
+  test.setTimeout(120_000);
+  const { tv, alex, bea, log } = await startInputLab(browser);
+
+  const stickSel = '[data-control="move"]';
+  const box = (await alex.locator(stickSel).boundingBox())!;
+  const cx = box.x + box.width / 2;
+  const cy = box.y + box.height / 2;
+  // Finger 1 grabs the stick; finger 2 lands on its left edge and lifts again.
+  await touch(alex, stickSel, 'pointerdown', 1, cx, cy);
+  await touch(alex, stickSel, 'pointerdown', 2, box.x, cy);
+  await touch(alex, stickSel, 'pointermove', 2, box.x, cy);
+  await touch(alex, stickSel, 'pointerup', 2, box.x, cy);
+  // Finger 1 still steers: push right.
+  await touch(alex, stickSel, 'pointermove', 1, box.x + box.width, cy);
+  await expect
+    .poll(async () => (await logLines(log)).filter((l) => l.control === 'move').map((l) => [l.action, l.value.x]), {
+      timeout: 10_000
+    })
+    .toEqual([['change', 1]]);
+  await touch(alex, stickSel, 'pointerup', 1, box.x + box.width, cy);
+  await expect
+    .poll(async () => (await logLines(log)).filter((l) => l.control === 'move').map((l) => [l.action, l.value.x]), {
+      timeout: 10_000
+    })
+    .toEqual([
+      ['change', 1],
+      ['release', 0]
+    ]);
+
+  const padSel = '[data-control="aim"]';
+  const padBox = (await alex.locator(padSel).boundingBox())!;
+  const px = padBox.x + padBox.width / 2;
+  await touch(alex, padSel, 'pointerdown', 3, px, padBox.y + 8);
+  await expect(alex.locator(padSel)).toHaveAttribute('data-dir', 'up');
+  await touch(alex, padSel, 'pointerdown', 4, px, padBox.y + padBox.height - 8);
+  await touch(alex, padSel, 'pointerup', 4, px, padBox.y + padBox.height - 8);
+  await expect(alex.locator(padSel)).toHaveAttribute('data-dir', 'up');
+  await touch(alex, padSel, 'pointerup', 3, px, padBox.y + 8);
+  await expect
+    .poll(async () => (await logLines(log)).filter((l) => l.control === 'aim').map((l) => [l.action, l.value.dir]), {
+      timeout: 10_000
+    })
+    .toEqual([
+      ['change', 'up'],
+      ['release', 'none']
+    ]);
+
+  await tv.close();
+  await alex.close();
+  await bea.close();
+});
