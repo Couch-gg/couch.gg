@@ -640,7 +640,7 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
         }
         const playerId = String(payload?.playerId ?? '');
         // The host screen may have moved on since the check above.
-        const { result: state } = await mutateLobby(
+        const { result: state, lobby } = await mutateLobby(
           slug,
           () => (isHostScreen(slug) ? store.setControllerState(slug, playerId, payload?.patch as ControllerPatch) : null),
           { changed: (result) => result !== null, hydrated: true }
@@ -650,7 +650,8 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
           return;
         }
         ack?.({ ok: true, state });
-        io.to(playerRoom(slug, playerId)).emit('controller:state', { playerId, state });
+        // `rev` lets the phone tell that a snapshot from before this is older.
+        io.to(playerRoom(slug, playerId)).emit('controller:state', { playerId, state, rev: lobby.rev });
       } catch (err) {
         ack?.(socketError(err));
       }
@@ -1061,7 +1062,7 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
         // lobby is the only one.
         const lobby = persistence.enabled ? cloneLobbyRecord(held) : held;
         const before = { rev: lobby.rev, expiresAt: lobby.expiresAt };
-        // Up front: `apply` sees the lobby as it will be stored.
+        // Up front, so the views `apply` builds carry the new rev.
         store.markChanged(lobby);
         let result: T;
         store.lobbies.set(normalized, lobby);

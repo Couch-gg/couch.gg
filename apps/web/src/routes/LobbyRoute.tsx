@@ -4,6 +4,7 @@ import type { ExternalGameManifest, GameManifest, Lobby } from '@couch/types';
 import type { Socket } from 'socket.io-client';
 import type { TrebuchetEvent, TrebuchetSnapshot } from '@couch/trebuchet';
 import { createLobby, fetchGames, fetchLobby } from '../api.js';
+import { isOlderLobby } from '../lobbySync.js';
 import { createSocket, emitAck } from '../socket.js';
 import { ChatPanel } from '../components/ChatPanel.js';
 import { GameCatalog } from '../components/GameCatalog.js';
@@ -140,6 +141,16 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
   const [screenId, setScreenId] = useState(ownScreenId);
   const screenIdRef = useRef(screenId);
 
+  // The lobby shown, replaced only by snapshots that are not older (see
+  // isOlderLobby). Returns whether `next` was taken.
+  const lobbyRef = useRef<Lobby | null>(null);
+  const takeLobby = useCallback((next: Lobby): boolean => {
+    if (isOlderLobby(lobbyRef.current, next)) return false;
+    lobbyRef.current = next;
+    setLobby(next);
+    return true;
+  }, []);
+
   // A shot can reach this screen via the socket (same instance, instant) or via the
   // polled/snapshot lobby state (cross-instance, ≤750ms). Dedupe by monotonic seq so
   // it animates exactly once regardless of which path wins the race.
@@ -174,7 +185,7 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
             if (joined.screenToken) keepScreenToken(slug, id, joined.screenToken);
             if (active) {
               setNotice(null);
-              if (joined.lobby) setLobby(joined.lobby);
+              if (joined.lobby) takeLobby(joined.lobby);
               if (joined.games) setGames(joined.games);
             }
             return;
@@ -218,7 +229,7 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
     // failed join or catalog fetch doesn't: reconnects, the listing check and
     // the poll get past those.
     fetchLobby(slug)
-      .then((initialLobby) => active && setLobby(initialLobby))
+      .then((initialLobby) => active && takeLobby(initialLobby))
       .catch((err) => {
         const status = statusOf(err);
         if (active && (status === 404 || status === 410)) {
@@ -237,8 +248,7 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
     // connect finds the join above still waiting for it.
     socket.on('connect', rejoin);
     socket.on('lobby:snapshot', (next: Lobby) => {
-      setLobby(next);
-      checkListed(next);
+      if (takeLobby(next)) checkListed(next);
     });
     socket.on('game:event', (p: { seq: number; event: TrebuchetEvent }) => applyGameEvent(p.seq, p.event));
     socket.on('game:control', (control: TrebuchetControlEvent) => setLastControlEvent(control));
@@ -246,9 +256,7 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
     const refreshTimer = window.setInterval(() => {
       void fetchLobby(slug)
         .then((next) => {
-          if (!active) return;
-          setLobby(next);
-          checkListed(next);
+          if (active && takeLobby(next)) checkListed(next);
         })
         .catch(() => {
           // Socket errors still surface during initial load; polling stays quiet.
@@ -261,7 +269,7 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
       socket.disconnect();
       setSocket(null);
     };
-  }, [slug, applyGameEvent]);
+  }, [slug, applyGameEvent, takeLobby]);
 
   // Replay the latest event carried inside the polled/snapshot lobby state. This is the
   // cross-instance path: when the opponent fired on a different serverless instance the

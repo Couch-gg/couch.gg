@@ -147,8 +147,9 @@ export interface ScreenPresence {
 }
 
 export interface LobbyRecord {
-  // Bumped by every committed change (see nextLobbyRev), so the commit can
-  // tell whether the stored lobby moved on since it was loaded.
+  // Bumped by every committed change (see nextLobbyRev), so clients can tell
+  // an older snapshot from a newer one and the commit can tell whether the
+  // stored lobby moved on since it was loaded.
   rev: number;
   id: string;
   slug: LobbySlug;
@@ -292,6 +293,7 @@ export class LobbyStore {
     const lobby = typeof slugOrLobby === 'string' ? this.getLobby(slugOrLobby) : slugOrLobby;
     return {
       id: lobby.id,
+      rev: lobby.rev,
       slug: lobby.slug,
       name: lobby.name,
       hostPlayerId: lobby.hostPlayerId,

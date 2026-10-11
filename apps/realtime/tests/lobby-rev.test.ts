@@ -1,4 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import type { AddressInfo } from 'node:net';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { io as connect, type Socket } from 'socket.io-client';
+import type { ExternalGameManifest, Lobby } from '@couch/types';
 import type { TrebuchetSnapshot } from '@couch/trebuchet';
 import {
   LobbyStore,
@@ -7,6 +10,25 @@ import {
   nextLobbyRev,
   serializeLobbyRecord
 } from '../src/lobbies.js';
+import { createRealtimeServer, type RealtimeServerInstance } from '../src/index.js';
+
+const PAD: ExternalGameManifest = {
+  id: 'rev-pad',
+  title: 'Rev Pad',
+  description: 'Test game.',
+  minPlayers: 1,
+  maxPlayers: 4,
+  controllerLayout: { kind: 'generic-buttons', controls: [{ control: 'a', type: 'button', label: 'A' }] },
+  aspectRatio: '16:9',
+  estimatedDurationMinutes: 1,
+  status: 'published',
+  origin: 'external',
+  entryUrl: 'https://games.example.com/pad/',
+  supportsRemote: true,
+  sdkProtocol: 1,
+  publishedAt: '2026-10-01T00:00:00.000Z',
+  thumbnail: { kind: 'css', gradient: 'linear-gradient(#000,#111)', icon: 'Zap' }
+};
 
 // A running two-player Trebuchet round with one shot fired and recorded, the
 // way the server stores it.
@@ -31,14 +53,14 @@ describe('lobby rev', () => {
     expect(nextLobbyRev(5_000, 1_000)).toBe(5_001);
   });
 
-  it('grows with every change', () => {
+  it('grows with every change and shows in the public lobby', () => {
     const store = new LobbyStore();
     const lobby = store.createLobby();
-    expect(lobby.rev).toBe(0);
+    expect(store.publicLobby(lobby).rev).toBe(0);
     store.markChanged(lobby);
-    const first = lobby.rev;
+    const first = store.publicLobby(lobby).rev!;
     store.markChanged(lobby);
-    expect(lobby.rev).toBeGreaterThan(first);
+    expect(store.publicLobby(lobby).rev).toBeGreaterThan(first);
   });
 
   it('is stored first, so the commit script can read it off the front', () => {
@@ -122,5 +144,91 @@ describe('presence check', () => {
     expect(store.hasPresenceToSettle(slug, 8_000, 1_000, 1_000)).toBe(true);
     expect(store.dropGoneScreens(slug, 8_000, 1_000)).toBe(true);
     expect(store.hasPresenceToSettle(slug, 8_000, 1_000, 1_000)).toBe(false);
+  });
+});
+
+describe('lobby rev on the wire (in memory)', () => {
+  let instance: RealtimeServerInstance;
+  let url = '';
+  const sockets: Socket[] = [];
+  const previousExternal = process.env.EXTERNAL_GAMES_JSON;
+
+  beforeAll(async () => {
+    process.env.EXTERNAL_GAMES_JSON = JSON.stringify([PAD]);
+    instance = createRealtimeServer();
+    await new Promise<void>((resolve) => instance.server.listen(0, resolve));
+    url = `http://localhost:${(instance.server.address() as AddressInfo).port}`;
+  });
+
+  afterAll(() => {
+    for (const socket of sockets) socket.disconnect();
+    instance.io.close();
+    if (previousExternal === undefined) delete process.env.EXTERNAL_GAMES_JSON;
+    else process.env.EXTERNAL_GAMES_JSON = previousExternal;
+  });
+
+  function open(): Socket {
+    const socket = connect(url, { transports: ['websocket'], forceNew: true });
+    sockets.push(socket);
+    return socket;
+  }
+
+  function ack<T>(socket: Socket, event: string, payload: unknown): Promise<T & { ok: boolean; error?: string }> {
+    return new Promise((resolve) => socket.emit(event, payload, resolve));
+  }
+
+  const newLobby = (): Promise<Lobby> =>
+    fetch(`${url}/api/lobbies`, { method: 'POST' })
+      .then((r) => r.json())
+      .then((b) => b.lobby);
+  const poll = (slug: string): Promise<Lobby> =>
+    fetch(`${url}/api/lobbies/${slug}`)
+      .then((r) => r.json())
+      .then((b) => b.lobby);
+
+  it('grows with every write, in acks, pushes and polls alike, and only with writes', async () => {
+    const created = await newLobby();
+    const slug = created.slug;
+    expect(created.rev).toBeGreaterThan(0);
+
+    const tv = open();
+    const pushed: Lobby[] = [];
+    tv.on('lobby:snapshot', (lobby: Lobby) => pushed.push(lobby));
+    const screen = await ack<{ lobby: Lobby }>(tv, 'screen:join', { slug, screenId: 'scr_revtv' });
+    expect(screen.lobby.rev).toBeGreaterThan(created.rev!);
+
+    const phone = open();
+    const joined = await ack<{ lobby: Lobby; playerToken: string }>(phone, 'controller:join', { slug, name: 'Ann' });
+    expect(joined.lobby.rev).toBeGreaterThan(screen.lobby.rev!);
+    await expect.poll(() => pushed.at(-1)?.rev).toBe(joined.lobby.rev);
+
+    // Polls change nothing, so the rev stays.
+    expect((await poll(slug)).rev).toBe(joined.lobby.rev);
+    expect((await poll(slug)).rev).toBe(joined.lobby.rev);
+
+    const chat = await ack(phone, 'chat:send', { slug, playerToken: joined.playerToken, text: 'hi' });
+    expect(chat.ok).toBe(true);
+    const afterChat = await poll(slug);
+    expect(afterChat.rev).toBeGreaterThan(joined.lobby.rev!);
+    // A refused write changes nothing either.
+    expect((await ack(phone, 'game:start', { slug, playerToken: joined.playerToken })).ok).toBe(false);
+    expect((await poll(slug)).rev).toBe(afterChat.rev);
+  });
+
+  it('sends a controller update with the rev it was stored under', async () => {
+    const { slug } = await newLobby();
+    const tv = open();
+    await ack(tv, 'screen:join', { slug, screenId: 'scr_revpad' });
+    const phone = open();
+    const host = await ack<{ playerToken: string; player: { id: string } }>(phone, 'controller:join', { slug, name: 'Ann' });
+    await ack(phone, 'game:select', { slug, playerToken: host.playerToken, gameId: PAD.id });
+    await ack(phone, 'game:start', { slug, playerToken: host.playerToken });
+    const states: Array<{ rev: number }> = [];
+    phone.on('controller:state', (message: { rev: number }) => states.push(message));
+
+    const set = await ack(tv, 'screen:controller', { slug, playerId: host.player.id, patch: { labels: { a: 'Go' } } });
+    expect(set.ok).toBe(true);
+    await expect.poll(() => states.length).toBe(1);
+    expect(states[0].rev).toBe((await poll(slug)).rev);
   });
 });
