@@ -620,4 +620,59 @@ describe('screens and the host screen (host-authoritative mode)', () => {
     expect(store.joinScreen(slug, 'scr_a', a.screenToken).changed).toBe(true);
     expect(store.publicLobby(slug).hostScreenId).toBe('scr_a');
   });
+
+  it('notes a dropped screen in the record, so a rejoin on another instance keeps it', () => {
+    const grace = 10_000;
+    const instanceA = new LobbyStore(makeResolver(TAP_RACE));
+    const { slug } = instanceA.createLobby(Date.now(), 'remote');
+    const tv = instanceA.joinScreen(slug, 'scr_tv', undefined, 'sock-1');
+    expect(instanceA.markScreenLeft(slug, 'scr_tv', 'sock-1', 1_000)).toBe(true);
+    expect(instanceA.markScreenLeft(slug, 'scr_tv', 'sock-1', 2_000)).toBe(false); // already noted
+
+    // The TV comes back on instance B, which only knows the stored record.
+    const instanceB = new LobbyStore(makeResolver(TAP_RACE));
+    instanceB.lobbies.set(slug, deserializeLobbyRecord(serializeLobbyRecord(instanceA.getLobby(slug))));
+    expect(instanceB.joinScreen(slug, 'scr_tv', tv.screenToken, 'sock-2').changed).toBe(true);
+
+    // A's grace check reads the record B saved: the TV is back, nothing goes.
+    instanceA.lobbies.set(slug, deserializeLobbyRecord(serializeLobbyRecord(instanceB.getLobby(slug))));
+    expect(instanceA.dropGoneScreens(slug, 1_000 + grace, grace)).toBe(false);
+    expect(instanceA.getLobby(slug).screens).toEqual(['scr_tv']);
+    expect(instanceA.publicLobby(slug).hostScreenId).toBe('scr_tv');
+  });
+
+  it("ignores the drop of a socket the screen already replaced (the old one's disconnect came late)", () => {
+    const store = new LobbyStore(makeResolver(TAP_RACE));
+    const { slug } = store.createLobby(Date.now(), 'local');
+    const tv = store.joinScreen(slug, 'scr_tv', undefined, 'sock-old');
+    store.joinScreen(slug, 'scr_tv', tv.screenToken, 'sock-new');
+    expect(store.markScreenLeft(slug, 'scr_tv', 'sock-old', 1_000)).toBe(false);
+    expect(store.dropGoneScreens(slug, 1_000_000, 10)).toBe(false);
+    expect(store.getLobby(slug).screens).toEqual(['scr_tv']);
+    // A screen that was never listed or never had a socket isn't noted either.
+    expect(store.markScreenLeft(slug, 'scr_other', 'sock-new', 1_000)).toBe(false);
+  });
+
+  it('drops a screen whose socket has been gone for the grace period, and lets it come back', () => {
+    const store = new LobbyStore(makeResolver(TAP_RACE));
+    const { slug } = store.createLobby(Date.now(), 'remote');
+    const a = store.joinScreen(slug, 'scr_a', undefined, 'sock-a');
+    store.joinScreen(slug, 'scr_b', undefined, 'sock-b');
+    store.joinPlayer(slug, 'Alex', undefined, 'scr_a');
+    store.markScreenLeft(slug, 'scr_a', 'sock-a', 1_000);
+    // Within the grace it keeps its place (and the host role).
+    expect(store.dropGoneScreens(slug, 10_999, 10_000)).toBe(false);
+    expect(store.publicLobby(slug).hostScreenId).toBe('scr_a');
+    expect(store.dropGoneScreens(slug, 11_000, 10_000)).toBe(true);
+    expect(store.getLobby(slug).screens).toEqual(['scr_b']);
+    expect(store.getLobby(slug).screenPresence.scr_a).toBeUndefined();
+    expect(store.publicLobby(slug).hostScreenId).toBe('scr_b');
+    // Nothing about presence is public.
+    expect(JSON.stringify(store.publicLobby(slug))).not.toContain('sock-');
+
+    // The binding stays: only the same TV can take the seat back.
+    expect(() => store.joinScreen(slug, 'scr_a', undefined, 'sock-x')).toThrow(/anderen Gerät/);
+    expect(store.joinScreen(slug, 'scr_a', a.screenToken, 'sock-a2').changed).toBe(true);
+    expect(store.publicLobby(slug).hostScreenId).toBe('scr_a');
+  });
 });

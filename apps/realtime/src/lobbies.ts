@@ -119,6 +119,14 @@ export interface SerializedLobbyRecord {
   controllerState?: Record<PlayerId, ControllerState>;
   screens?: string[];
   screenSecrets?: Record<string, string>;
+  screenPresence?: Record<string, ScreenPresence>;
+}
+
+// The socket a listed screen last joined with, and when that socket dropped
+// (null while it is connected).
+export interface ScreenPresence {
+  socketId: string;
+  leftAt: number | null;
 }
 
 export interface LobbyRecord {
@@ -143,6 +151,9 @@ export interface LobbyRecord {
   screens: string[];
   // sha256 of each screen id's secret token (see joinScreen). Never public.
   screenSecrets: Record<string, string>;
+  // Whether each listed screen is still connected, kept in the record so any
+  // instance can tell (see markScreenLeft). Never public.
+  screenPresence: Record<string, ScreenPresence>;
 }
 
 export class LobbyError extends Error {
@@ -193,7 +204,8 @@ export class LobbyStore {
       inputLog: [],
       controllerState: {},
       screens: [],
-      screenSecrets: {}
+      screenSecrets: {},
+      screenPresence: {}
     };
     this.addActivity(lobby, 'Lobby erstellt');
     this.lobbies.set(slug, lobby);
@@ -612,41 +624,70 @@ export class LobbyStore {
   // TV) and every later join with that id must present it, so the public
   // screen ids can't be taken over. Screens are remembered in join order so
   // the host screen is stable; a new one is refused once the lobby is full
-  // (nobody gets evicted). `changed` says whether the record needs saving.
+  // (nobody gets evicted). `socketId` is the joining connection, see
+  // markScreenLeft. `changed` says whether the record needs saving.
   joinScreen(
     slug: string,
     screenId: unknown,
-    screenToken: unknown
+    screenToken: unknown,
+    socketId?: string
   ): { screenId: string | null; changed: boolean; screenToken?: string } {
     const lobby = this.getLobby(slug);
     const id = cleanScreenId(screenId);
     if (!id) return { screenId: null, changed: false };
     const listed = lobby.screens.includes(id);
     const bound = lobby.screenSecrets[id];
+    if (bound && (typeof screenToken !== 'string' || !sameHash(hashScreenToken(screenToken), bound))) {
+      throw new LobbyError('Dieser Screen gehört zu einem anderen Gerät', 403);
+    }
+    if (!listed && lobby.screens.length >= MAX_LOBBY_SCREENS) throw new LobbyError('Diese Lobby hat schon genug Screens', 409);
     let minted: string | undefined;
-    if (bound) {
-      if (typeof screenToken !== 'string' || !sameHash(hashScreenToken(screenToken), bound)) {
-        throw new LobbyError('Dieser Screen gehört zu einem anderen Gerät', 403);
-      }
-    } else {
-      if ((!listed && lobby.screens.length >= MAX_LOBBY_SCREENS) || Object.keys(lobby.screenSecrets).length >= MAX_SCREEN_SECRETS) {
-        throw new LobbyError('Diese Lobby hat schon genug Screens', 409);
-      }
+    if (!bound) {
+      if (Object.keys(lobby.screenSecrets).length >= MAX_SCREEN_SECRETS) throw new LobbyError('Diese Lobby hat schon genug Screens', 409);
       minted = randomBytes(24).toString('base64url');
       lobby.screenSecrets[id] = hashScreenToken(minted);
     }
-    if (listed) return { screenId: id, changed: !!minted, screenToken: minted };
-    if (lobby.screens.length >= MAX_LOBBY_SCREENS) throw new LobbyError('Diese Lobby hat schon genug Screens', 409);
-    lobby.screens.push(id);
-    return { screenId: id, changed: true, screenToken: minted };
+    if (!listed) lobby.screens.push(id);
+    let present = false;
+    if (socketId !== undefined) {
+      const before = lobby.screenPresence[id];
+      present = before?.socketId !== socketId || before.leftAt !== null;
+      lobby.screenPresence[id] = { socketId, leftAt: null };
+    }
+    return { screenId: id, changed: !listed || !!minted || present, screenToken: minted };
   }
 
-  // A screen with no live socket left (see the server's disconnect grace).
-  // Its token binding stays, so the same TV can come back later.
+  // The socket a screen joined with dropped. Only its latest socket counts: a
+  // TV that already joined again (here or on another instance) stays as it
+  // is. Returns whether the record changed.
+  markScreenLeft(slug: string, screenId: string, socketId: string, at = Date.now()): boolean {
+    const lobby = this.lobbies.get(slug.toUpperCase());
+    const presence = lobby?.screenPresence[screenId];
+    if (!lobby || !presence || presence.socketId !== socketId || presence.leftAt !== null) return false;
+    if (!lobby.screens.includes(screenId)) return false;
+    presence.leftAt = at;
+    return true;
+  }
+
+  // Drop every screen whose socket left at least graceMs ago without the TV
+  // joining again since. Their token binding stays, so the same TV can come
+  // back later. Returns whether any screen was dropped.
+  dropGoneScreens(slug: string, now: number, graceMs: number): boolean {
+    const lobby = this.getLobby(slug);
+    const gone = lobby.screens.filter((id) => {
+      const leftAt = lobby.screenPresence[id]?.leftAt;
+      return leftAt != null && now - leftAt >= graceMs;
+    });
+    for (const id of gone) this.removeScreen(slug, id);
+    return gone.length > 0;
+  }
+
+  // Take a screen out of lobby.screens (its binding stays).
   removeScreen(slug: string, screenId: string): boolean {
     const lobby = this.getLobby(slug);
     if (!lobby.screens.includes(screenId)) return false;
     lobby.screens = lobby.screens.filter((id) => id !== screenId);
+    delete lobby.screenPresence[screenId];
     return true;
   }
 
@@ -715,7 +756,8 @@ export function serializeLobbyRecord(lobby: LobbyRecord): SerializedLobbyRecord 
     inputLog: lobby.inputLog.slice(),
     controllerState: structuredClone(lobby.controllerState),
     screens: lobby.screens.slice(),
-    screenSecrets: { ...lobby.screenSecrets }
+    screenSecrets: { ...lobby.screenSecrets },
+    screenPresence: structuredClone(lobby.screenPresence)
   };
 }
 
@@ -752,7 +794,8 @@ export function deserializeLobbyRecord(serialized: SerializedLobbyRecord): Lobby
     inputLog: serialized.inputLog ? serialized.inputLog.slice() : [],
     controllerState: serialized.controllerState ? structuredClone(serialized.controllerState) : {},
     screens: serialized.screens ? serialized.screens.slice() : [],
-    screenSecrets: serialized.screenSecrets ? { ...serialized.screenSecrets } : {}
+    screenSecrets: serialized.screenSecrets ? { ...serialized.screenSecrets } : {},
+    screenPresence: serialized.screenPresence ? structuredClone(serialized.screenPresence) : {}
   };
 }
 

@@ -162,6 +162,9 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   app.get(`${apiPrefix}/lobbies/:slug`, async (req, res) => {
     try {
       await hydrateLobby(req.params.slug);
+      // Every TV and phone polls this, so a TV that left is dropped even when
+      // the instance that saw it go is gone before its grace timer fires.
+      await dropGoneScreens(req.params.slug.toUpperCase());
       res.json({ lobby: store.publicLobby(req.params.slug) });
     } catch (err) {
       sendHttpError(res, err);
@@ -327,9 +330,15 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
     // Cached game:state host verdict, see game:state. Reset on every screen:join.
     let hostCheck: { slug: string; ok: boolean; at: number } | null = null;
     // Whether this socket is the shell of the lobby's host screen (the lobby
-    // must already be hydrated). Uncached: for rare events, not game:state.
-    const isHostScreen = (slug: string): boolean =>
-      !!ctx && ctx.role === 'screen' && ctx.slug === slug && !!ctx.screenId && hostScreenId(store.getLobby(slug)) === ctx.screenId;
+    // must already be hydrated). With no screen listed (every TV was dropped,
+    // or the TVs still run a bundle that joins without a screen id) any
+    // screen of the lobby is the host, as in the TV's own screenRole; else
+    // the round could never end. Uncached: for rare events, not game:state.
+    const isHostScreen = (slug: string): boolean => {
+      if (!ctx || ctx.role !== 'screen' || ctx.slug !== slug) return false;
+      const host = hostScreenId(store.getLobby(slug));
+      return host === null || (!!ctx.screenId && host === ctx.screenId);
+    };
     // Controls this socket has pressed/moved (relayed) and not yet released,
     // keyed `${slug}:${playerId}:${control}`. Only these releases skip the limiter.
     const held = new Set<string>();
@@ -341,7 +350,7 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
         await registry.ensureFresh();
         // A known screen id must bring the token its first join was given; a
         // new one gets its token here, in this ack only.
-        const joined = store.joinScreen(slug, payload?.screenId, payload?.screenToken);
+        const joined = store.joinScreen(slug, payload?.screenId, payload?.screenToken, socket.id);
         if (joined.changed) {
           await saveLobby(slug);
           emitLobby(slug);
@@ -350,8 +359,6 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
         const screenId = joined.screenId ?? undefined;
         ctx = { role: 'screen', slug, screenId };
         hostCheck = null;
-        // Read by the disconnect grace check (fetchSockets) on any instance.
-        socket.data.screenId = screenId;
         socket.join([room(slug), screensRoom(slug)]);
         ack?.({ ok: true, lobby, games: catalog(), ...(joined.screenToken ? { screenToken: joined.screenToken } : {}) });
         socket.emit('lobby:snapshot', lobby);
@@ -646,7 +653,7 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
 
     socket.on('disconnect', () => {
       if (ctx?.role === 'screen' && ctx.screenId) {
-        dropScreenIfGone(ctx.slug, ctx.screenId);
+        void screenLeft(ctx.slug, ctx.screenId, socket.id);
         return;
       }
       if (!ctx || ctx.role !== 'controller' || !ctx.playerId) return;
@@ -723,25 +730,38 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   }, 60_000).unref?.();
 
   // A TV whose socket dropped gets screenGraceMs to come back (a reload or a
-  // network blip rejoins with the same screen id). If by then no socket in the
-  // lobby carries that id, the TV is gone: drop it from lobby.screens so the
-  // host screen moves to a live one. fetchSockets asks every instance when the
-  // Socket.IO adapter is in place.
-  function dropScreenIfGone(slug: string, screenId: string): void {
+  // network blip rejoins with the same screen id, maybe on another instance).
+  // The drop is noted in the lobby record, not in this instance's memory: a
+  // join of that screen anywhere clears it, and once the grace has passed
+  // without one the TV is gone and leaves lobby.screens, so the host screen
+  // moves to a live one.
+  async function screenLeft(slug: string, screenId: string, socketId: string): Promise<void> {
+    try {
+      await hydrateLobby(slug);
+      if (!store.markScreenLeft(slug, screenId, socketId, Date.now())) return;
+      await saveLobby(slug);
+    } catch {
+      return; // The lobby expired meanwhile.
+    }
+    // A little past the grace, so the mark is surely old enough by then.
     setTimeout(() => {
       void (async () => {
         try {
-          const live = await io.in(screensRoom(slug)).fetchSockets();
-          if (live.some((other) => other.data?.screenId === screenId)) return;
           await hydrateLobby(slug);
-          if (!store.removeScreen(slug, screenId)) return;
-          await saveLobby(slug);
-          emitLobby(slug);
+          await dropGoneScreens(slug);
         } catch {
           // The lobby expired meanwhile.
         }
       })();
-    }, screenGraceMs).unref?.();
+    }, screenGraceMs + 100).unref?.();
+  }
+
+  // Drop the lobby's screens that left more than screenGraceMs ago (the lobby
+  // must already be hydrated) and tell everyone.
+  async function dropGoneScreens(slug: string): Promise<void> {
+    if (!store.dropGoneScreens(slug, Date.now(), screenGraceMs)) return;
+    await saveLobby(slug);
+    emitLobby(slug);
   }
 
   function emitLobby(slug: string): void {
