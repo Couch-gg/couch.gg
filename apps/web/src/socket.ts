@@ -14,26 +14,38 @@ export function createSocket(): Socket {
   });
 }
 
+// Emit an event and wait for the server's ack. Settles exactly once: with the
+// ack, or with an error after 8 s. While the socket is down the event waits
+// for the next connect (socket.io keeps retrying, so one failed attempt is no
+// reason to give up), and once the call has failed it is never sent anymore:
+// a caller that retries must not end up having it run twice.
 export function emitAck<T>(socket: Socket, event: string, payload: unknown): Promise<T> {
   return new Promise((resolve, reject) => {
-    const timeout = window.setTimeout(() => reject(new Error('Realtime connection timed out')), 8_000);
-    const send = () => socket.emit(event, payload, (response: T & { ok?: boolean; error?: string; status?: number }) => {
+    let settled = false;
+    const settle = () => {
+      settled = true;
       window.clearTimeout(timeout);
-      if (response && response.ok === false) {
-        // Keep the server's status (403, 409, ...) for callers that react to it.
-        reject(Object.assign(new Error(response.error || 'Socket event failed'), { status: response.status }));
-        return;
-      }
-      resolve(response);
-    });
-    if (socket.connected) {
-      send();
-    } else {
-      socket.once('connect', send);
-      socket.once('connect_error', (err) => {
-        window.clearTimeout(timeout);
-        reject(err);
+      socket.off('connect', send);
+    };
+    const timeout = window.setTimeout(() => {
+      if (settled) return;
+      settle();
+      reject(new Error('Realtime connection timed out'));
+    }, 8_000);
+    function send() {
+      socket.off('connect', send);
+      socket.emit(event, payload, (response: T & { ok?: boolean; error?: string; status?: number }) => {
+        if (settled) return;
+        settle();
+        if (response && response.ok === false) {
+          // Keep the server's status (403, 409, ...) for callers that react to it.
+          reject(Object.assign(new Error(response.error || 'Socket event failed'), { status: response.status }));
+          return;
+        }
+        resolve(response);
       });
     }
+    if (socket.connected) send();
+    else socket.on('connect', send);
   });
 }

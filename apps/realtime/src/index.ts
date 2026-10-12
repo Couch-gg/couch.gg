@@ -7,7 +7,16 @@ import { GAME_MANIFESTS } from '@couch/game-runtime';
 import type { TrebuchetEvent } from '@couch/trebuchet';
 import type { ControllerEvent, ControllerPatch, GameId, GameManifest, PlayerId, ScreenId } from '@couch/types';
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { LobbyError, LobbyStore, RECONNECT_GRACE_MS, hostScreenId, type LobbyRecord, type ManifestResolver } from './lobbies.js';
+import {
+  LobbyError,
+  LobbyStore,
+  RECONNECT_GRACE_MS,
+  hostScreenId,
+  turnEndsAtOf,
+  type LobbyRecord,
+  type ManifestResolver,
+  type PlayerRemoval
+} from './lobbies.js';
 import { mergeCatalog, parseExternalGamesJson } from './external-games.js';
 import { RateLimiter } from './rate-limit.js';
 import { createProductionGamePersistence, createProductionLobbyPersistence } from './persistence.js';
@@ -29,6 +38,10 @@ const MAX_EPOCH_CHARS = 32;
 // How long a TV whose socket dropped may take to come back before it is
 // dropped from lobby.screens (a reload or a blip rejoins well within this).
 const SCREEN_GRACE_MS = 10_000;
+// How long a phone whose socket dropped may take to come back before it shows
+// as gone. The platform closes long-lived connections every few minutes and
+// the phone is back within a second or two: nobody needs to hear about that.
+const DISCONNECT_QUIET_MS = 5_000;
 
 class ReportRateLimiter {
   private readonly buckets = new Map<string, { tokens: number; lastRefill: number }>();
@@ -74,6 +87,10 @@ export interface RealtimeServerOptions {
   websocketOnly?: boolean;
   /** Override SCREEN_GRACE_MS (tests). */
   screenGraceMs?: number;
+  /** Override DISCONNECT_QUIET_MS (tests). */
+  disconnectQuietMs?: number;
+  /** Override RECONNECT_GRACE_MS (tests). */
+  reconnectGraceMs?: number;
 }
 
 export interface RealtimeServerInstance {
@@ -88,6 +105,8 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   const apiPrefix = normalizeApiPrefix(options.apiPrefix ?? process.env.API_PREFIX ?? '/api');
   const socketPath = options.socketPath ?? process.env.SOCKET_PATH ?? '/socket.io';
   const screenGraceMs = options.screenGraceMs ?? SCREEN_GRACE_MS;
+  const disconnectQuietMs = options.disconnectQuietMs ?? DISCONNECT_QUIET_MS;
+  const reconnectGraceMs = options.reconnectGraceMs ?? RECONNECT_GRACE_MS;
   // Env-registered external games (ops escape hatch before the durable registry).
   // Parsed once at startup; localhost http is allowed only off Vercel (local dev).
   const externalGames = parseExternalGamesJson(process.env.EXTERNAL_GAMES_JSON, {
@@ -162,9 +181,10 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   app.get(`${apiPrefix}/lobbies/:slug`, async (req, res) => {
     try {
       await hydrateLobby(req.params.slug);
-      // Every TV and phone polls this, so a TV that left is dropped even when
-      // the instance that saw it go is gone before its grace timer fires.
-      await dropGoneScreens(req.params.slug.toUpperCase());
+      // Every TV and phone polls this, so a TV that left is dropped, and a
+      // phone that dropped shows as gone, even when the instance that saw the
+      // socket go is gone before its timer fires.
+      await settlePresence(req.params.slug.toUpperCase());
       res.json({ lobby: store.publicLobby(req.params.slug) });
     } catch (err) {
       sendHttpError(res, err);
@@ -177,6 +197,20 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
       const joined = store.joinPlayer(req.params.slug, req.body?.name, req.body?.playerToken, req.body?.screenId);
       await saveLobby(req.params.slug);
       res.status(201).json(joined);
+    } catch (err) {
+      sendHttpError(res, err);
+    }
+  });
+
+  // The phone's Leave when its socket is down or doesn't answer (see
+  // controller:leave). Body { playerToken }.
+  app.post(`${apiPrefix}/lobbies/:slug/leave`, async (req, res) => {
+    try {
+      const slug = req.params.slug.toUpperCase();
+      await hydrateLobby(slug);
+      const removal = store.leavePlayer(slug, String(req.body?.playerToken ?? ''));
+      await playerRemoved(slug, removal);
+      res.json({ ok: true });
     } catch (err) {
       sendHttpError(res, err);
     }
@@ -342,29 +376,39 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
     // Controls this socket has pressed/moved (relayed) and not yet released,
     // keyed `${slug}:${playerId}:${control}`. Only these releases skip the limiter.
     const held = new Set<string>();
+    // The screen:join still running on this socket, if any. A reconnected TV
+    // sends it right before what it held back (a game:finish), and that must
+    // not be refused as coming from a socket that hasn't joined yet.
+    let screenJoining: Promise<void> | null = null;
 
-    socket.on('screen:join', async (payload: { slug?: string; screenId?: string; screenToken?: string }, ack?: (value: unknown) => void) => {
-      try {
-        const slug = String(payload?.slug ?? '').toUpperCase();
-        await hydrateLobby(slug);
-        await registry.ensureFresh();
-        // A known screen id must bring the token its first join was given; a
-        // new one gets its token here, in this ack only.
-        const joined = store.joinScreen(slug, payload?.screenId, payload?.screenToken, socket.id);
-        if (joined.changed) {
-          await saveLobby(slug);
-          emitLobby(slug);
+    socket.on('screen:join', (payload: { slug?: string; screenId?: string; screenToken?: string }, ack?: (value: unknown) => void) => {
+      const joining = (async () => {
+        try {
+          const slug = String(payload?.slug ?? '').toUpperCase();
+          await hydrateLobby(slug);
+          await registry.ensureFresh();
+          // A known screen id must bring the token its first join was given; a
+          // new one gets its token here, in this ack only.
+          const joined = store.joinScreen(slug, payload?.screenId, payload?.screenToken, socket.id);
+          if (joined.changed) {
+            await saveLobby(slug);
+            emitLobby(slug);
+          }
+          const lobby = store.publicLobby(slug);
+          const screenId = joined.screenId ?? undefined;
+          ctx = { role: 'screen', slug, screenId };
+          hostCheck = null;
+          socket.join([room(slug), screensRoom(slug)]);
+          ack?.({ ok: true, lobby, games: catalog(), ...(joined.screenToken ? { screenToken: joined.screenToken } : {}) });
+          socket.emit('lobby:snapshot', lobby);
+        } catch (err) {
+          ack?.(socketError(err));
         }
-        const lobby = store.publicLobby(slug);
-        const screenId = joined.screenId ?? undefined;
-        ctx = { role: 'screen', slug, screenId };
-        hostCheck = null;
-        socket.join([room(slug), screensRoom(slug)]);
-        ack?.({ ok: true, lobby, games: catalog(), ...(joined.screenToken ? { screenToken: joined.screenToken } : {}) });
-        socket.emit('lobby:snapshot', lobby);
-      } catch (err) {
-        ack?.(socketError(err));
-      }
+      })();
+      screenJoining = joining;
+      void joining.finally(() => {
+        if (screenJoining === joining) screenJoining = null;
+      });
     });
 
     socket.on('controller:join', async (payload: { slug?: string; name?: string; playerToken?: string; screenId?: string }, ack?: (value: unknown) => void) => {
@@ -372,13 +416,36 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
         const slug = String(payload?.slug ?? '').toUpperCase();
         await hydrateLobby(slug);
         await registry.ensureFresh();
-        const joined = store.joinPlayer(slug, payload?.name, payload?.playerToken, payload?.screenId);
+        // A join without a token from a socket that already joined this lobby
+        // is a retry (its first ack timed out): it is the same player, not a
+        // second one that would keep the host role forever.
+        const token =
+          payload?.playerToken ||
+          (ctx?.role === 'controller' && ctx.slug === slug && ctx.playerId ? store.tokenOf(slug, ctx.playerId) : undefined);
+        const joined = store.joinPlayer(slug, payload?.name, token, payload?.screenId, socket.id);
         await saveLobby(slug);
         ctx = { role: 'controller', slug, playerId: joined.player.id };
         socket.join([room(slug), playerRoom(slug, joined.player.id)]);
         ack?.({ ok: true, ...joined, games: catalog() });
         emitLobby(slug);
         await autoStartIfFull(slug);
+      } catch (err) {
+        ack?.(socketError(err));
+      }
+    });
+
+    // The phone's Leave button. The player is gone for good, so this socket's
+    // disconnect that follows changes nothing. The phone waits for the ack
+    // before it closes the socket: a leave that arrives together with the
+    // disconnect is never run (Socket.IO drops events of a closed socket).
+    socket.on('controller:leave', async (payload: { slug?: string; playerToken?: string }, ack?: (value: unknown) => void) => {
+      try {
+        const slug = String(payload?.slug ?? '').toUpperCase();
+        await hydrateLobby(slug);
+        const removal = store.leavePlayer(slug, String(payload?.playerToken ?? ''));
+        if (ctx?.role === 'controller' && ctx.slug === slug) ctx = null;
+        await playerRemoved(slug, removal);
+        ack?.({ ok: true });
       } catch (err) {
         ack?.(socketError(err));
       }
@@ -500,18 +567,36 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
       }
     });
 
-    // An external game reports its final scores. Accepted ONLY from the trusted
-    // shell (the iframe can't reach the socket) of the lobby's host screen.
-    // Idempotent: a duplicate report acks { ok:true, finished:false }.
-    socket.on('game:finish', async (payload: { slug?: string; scores?: unknown }, ack?: (value: unknown) => void) => {
+    // The host ends the running game from their phone, for when it never ends
+    // by itself (a game that hangs, a finish report that got lost).
+    socket.on('game:end', async (payload: { slug?: string; playerToken?: string }, ack?: (value: unknown) => void) => {
       try {
         const slug = String(payload?.slug ?? '').toUpperCase();
+        await hydrateLobby(slug);
+        const lobby = store.endGame(slug, String(payload?.playerToken ?? ''));
+        await saveLobby(slug);
+        ack?.({ ok: true, lobby });
+        emitLobby(slug);
+        armTurnTimer(slug);
+      } catch (err) {
+        ack?.(socketError(err));
+      }
+    });
+
+    // An external game reports its final scores. Accepted ONLY from the trusted
+    // shell (the iframe can't reach the socket) of the lobby's host screen.
+    // Idempotent: a duplicate report, or one for a round that is over, acks
+    // { ok:true, finished:false }.
+    socket.on('game:finish', async (payload: { slug?: string; sessionId?: unknown; scores?: unknown }, ack?: (value: unknown) => void) => {
+      try {
+        const slug = String(payload?.slug ?? '').toUpperCase();
+        if (screenJoining) await screenJoining;
         if (!ctx || ctx.role !== 'screen' || ctx.slug !== slug) {
           throw new LobbyError('Nur der Screen kann das Spiel beenden', 403);
         }
         await hydrateLobby(slug);
         if (!isHostScreen(slug)) throw new LobbyError('Nur der Host-Screen kann das Spiel beenden', 403);
-        const finished = store.finishExternalGame(slug, payload?.scores);
+        const finished = store.finishExternalGame(slug, payload?.scores, payload?.sessionId);
         ack?.({ ok: true, finished });
         if (finished) {
           await saveLobby(slug);
@@ -530,6 +615,7 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
     socket.on('screen:controller', async (payload: { slug?: string; playerId?: string; patch?: unknown }, ack?: (value: unknown) => void) => {
       try {
         const slug = String(payload?.slug ?? '').toUpperCase();
+        if (screenJoining) await screenJoining;
         if (!ctx || ctx.role !== 'screen' || ctx.slug !== slug) {
           throw new LobbyError('Nur der Screen kann Controller steuern', 403);
         }
@@ -657,26 +743,7 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
         return;
       }
       if (!ctx || ctx.role !== 'controller' || !ctx.playerId) return;
-      void (async () => {
-        const at = Date.now();
-        await hydrateLobby(ctx!.slug);
-        const lobby = store.markDisconnected(ctx!.slug, ctx!.playerId!, at);
-        if (lobby) {
-          await saveLobby(ctx!.slug);
-          emitLobby(ctx!.slug);
-        }
-        setTimeout(() => {
-          void (async () => {
-            await hydrateLobby(ctx!.slug);
-            const result = store.removeIfStillDisconnected(ctx!.slug, ctx!.playerId!, at);
-            if (!result) return;
-            if (result.lobby.players.length) await saveLobby(ctx!.slug);
-            else await deleteLobby(ctx!.slug);
-            emitLobby(ctx!.slug);
-            if (result.gameEvent) io.to(room(ctx!.slug)).emit('game:event', { type: 'snapshot', snapshot: result.gameEvent });
-          })();
-        }, RECONNECT_GRACE_MS).unref?.();
-      })();
+      void controllerDropped(ctx.slug, ctx.playerId, socket.id);
     });
   });
 
@@ -691,10 +758,14 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   });
 
   app.get(`${apiPrefix}/screens/:id`, async (req, res) => {
-    await hydrateScreen(req.params.id);
-    const record = screens.get(req.params.id);
-    if (record) res.json({ screen: { ...screens.toPublic(record), expired: false } });
-    else res.json({ screen: { id: req.params.id, expiresAt: new Date().toISOString(), claimedSlug: null, expired: true } });
+    try {
+      await hydrateScreen(req.params.id);
+      const record = screens.get(req.params.id);
+      if (record) res.json({ screen: { ...screens.toPublic(record), expired: false } });
+      else res.json({ screen: { id: req.params.id, expiresAt: new Date().toISOString(), claimedSlug: null, expired: true } });
+    } catch (err) {
+      sendHttpError(res, err);
+    }
   });
 
   app.post(`${apiPrefix}/screens/:id/claim`, async (req, res) => {
@@ -729,6 +800,52 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
     screens.pruneExpired();
   }, 60_000).unref?.();
 
+  // A phone's socket dropped. The drop goes into the lobby record quietly (no
+  // activity, nobody told): the phone is usually back within a second or
+  // two. If it isn't back after disconnectQuietMs, the next poll of the lobby
+  // (on any instance) shows it as gone; this instance's timer is only the
+  // fast path. See settlePresence.
+  async function controllerDropped(slug: string, playerId: PlayerId, socketId: string): Promise<void> {
+    try {
+      await hydrateLobby(slug);
+      if (!store.noteDropped(slug, playerId, socketId, Date.now())) return;
+      await saveLobby(slug);
+    } catch (err) {
+      logUnlessGone('Disconnect failed', slug, err);
+      return;
+    }
+    // A little past the quiet window, so the drop is surely old enough by then.
+    setTimeout(() => {
+      void (async () => {
+        try {
+          await hydrateLobby(slug);
+          await settlePresence(slug);
+        } catch (err) {
+          logUnlessGone('Disconnect failed', slug, err);
+        }
+      })();
+    }, disconnectQuietMs + 100).unref?.();
+  }
+
+  async function removeIfGone(slug: string, playerId: PlayerId, since: number): Promise<void> {
+    try {
+      await hydrateLobby(slug);
+      const removal = store.removeIfStillDisconnected(slug, playerId, since);
+      if (removal) await playerRemoved(slug, removal);
+    } catch (err) {
+      logUnlessGone('Removing a player failed', slug, err);
+    }
+  }
+
+  // Save and announce a lobby a player was just taken out of. Their unit may
+  // have held the turn, so the turn timer follows the new turn.
+  async function playerRemoved(slug: string, removal: PlayerRemoval): Promise<void> {
+    await saveLobby(slug);
+    emitLobby(slug);
+    if (removal.gameEvent) io.to(room(slug)).emit('game:event', { type: 'snapshot', snapshot: removal.gameEvent });
+    armTurnTimer(slug);
+  }
+
   // A TV whose socket dropped gets screenGraceMs to come back (a reload or a
   // network blip rejoins with the same screen id, maybe on another instance).
   // The drop is noted in the lobby record, not in this instance's memory: a
@@ -748,7 +865,7 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
       void (async () => {
         try {
           await hydrateLobby(slug);
-          await dropGoneScreens(slug);
+          await settlePresence(slug);
         } catch {
           // The lobby expired meanwhile.
         }
@@ -756,12 +873,21 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
     }, screenGraceMs + 100).unref?.();
   }
 
-  // Drop the lobby's screens that left more than screenGraceMs ago (the lobby
-  // must already be hydrated) and tell everyone.
-  async function dropGoneScreens(slug: string): Promise<void> {
-    if (!store.dropGoneScreens(slug, Date.now(), screenGraceMs)) return;
+  // Act on drops the lobby record holds (the lobby must already be hydrated):
+  // screens that left more than screenGraceMs ago are dropped, phones that
+  // dropped more than disconnectQuietMs ago show as gone (and are removed
+  // after reconnectGraceMs more). Tells everyone when something changed.
+  async function settlePresence(slug: string): Promise<void> {
+    const now = Date.now();
+    const screensDropped = store.dropGoneScreens(slug, now, screenGraceMs);
+    const gone = store.markDroppedGone(slug, now, disconnectQuietMs);
+    if (!screensDropped && gone.length === 0) return;
     await saveLobby(slug);
     emitLobby(slug);
+    for (const { playerId, since } of gone) {
+      const delay = Math.max(0, since + reconnectGraceMs - Date.now());
+      setTimeout(() => void removeIfGone(slug, playerId, since), delay).unref?.();
+    }
   }
 
   function emitLobby(slug: string): void {
@@ -819,24 +945,33 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
     }
   }
 
+  // Skip the current Trebuchet turn when it runs out. The timer only knows
+  // the turn it was armed for: when it fires, the stored lobby decides (a shot
+  // or a skip on another instance moves the turn on without telling this one).
   function armTurnTimer(slug: string): void {
     const current = turnTimers.get(slug);
     if (current) clearTimeout(current);
-    const lobby = store.publicLobby(slug);
-    const snapshot = lobby.gameSession?.snapshot;
-    const rawTurnEndsAt = snapshot && typeof snapshot === 'object' && 'turnEndsAt' in snapshot ? snapshot.turnEndsAt : null;
-    const turnEndsAt = typeof rawTurnEndsAt === 'number' ? rawTurnEndsAt : null;
-    if (!turnEndsAt || lobby.state !== 'playing') return;
+    turnTimers.delete(slug);
+    const lobby = store.lobbies.get(slug.toUpperCase());
+    const turnEndsAt = lobby ? turnEndsAtOf(lobby) : null;
+    if (!turnEndsAt) return;
     const delay = Math.max(250, turnEndsAt - Date.now());
     const timer = setTimeout(() => {
+      if (turnTimers.get(slug) === timer) turnTimers.delete(slug);
       void (async () => {
         await hydrateLobby(slug);
-        const event = store.skipTurn(slug);
+        const event = store.skipTurn(slug, turnEndsAt);
         if (event) {
           await dispatchGameEvent(slug, event);
           armTurnTimer(slug);
+          return;
         }
-      })();
+        // The turn moved on meanwhile (watch the new one), or this fired a
+        // little early. Otherwise the game is over.
+        const stored = store.lobbies.get(slug.toUpperCase());
+        const latest = stored ? turnEndsAtOf(stored) : null;
+        if (latest !== null && (latest !== turnEndsAt || latest > Date.now())) armTurnTimer(slug);
+      })().catch((err) => logUnlessGone('Turn timer failed', slug, err));
     }, delay);
     timer.unref?.();
     turnTimers.set(slug, timer);
@@ -853,15 +988,13 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
     store.lobbies.delete(normalized);
   }
 
+  // Every change to a lobby goes through here, so this is also where it is
+  // kept alive (see LobbyStore.keepAlive).
   async function saveLobby(slugOrLobby: string | LobbyRecord): Promise<void> {
-    if (!persistence.enabled) return;
     const lobby = typeof slugOrLobby === 'string' ? store.getLobby(slugOrLobby) : slugOrLobby;
-    await persistence.save(lobby);
-  }
-
-  async function deleteLobby(slug: string): Promise<void> {
+    store.keepAlive(lobby);
     if (!persistence.enabled) return;
-    await persistence.delete(slug);
+    await persistence.save(lobby);
   }
 
   async function hydrateScreen(id: string): Promise<void> {
@@ -880,7 +1013,20 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   return { app, io, server, store };
 }
 
+// A promise nobody awaits must never take the process down: every socket on
+// the instance (other parties' too) and all its timers would go with it. The
+// handlers catch what they expect; this logs whatever slips through.
+let rejectionsGuarded = false;
+export function guardUnhandledRejections(): void {
+  if (rejectionsGuarded) return;
+  rejectionsGuarded = true;
+  process.on('unhandledRejection', (reason) => {
+    console.error('Unhandled rejection', reason);
+  });
+}
+
 export function startRealtimeServer(options: RealtimeServerOptions = {}): http.Server {
+  guardUnhandledRejections();
   const port = Number.parseInt(process.env.PORT ?? '4100', 10);
   const { server } = createRealtimeServer(options);
   server.listen(port, () => {
@@ -969,6 +1115,13 @@ function canonicalTrebuchetControl(control: string): string {
   if (control === 'aim') return 'trebuchet.aim';
   if (control === 'charge') return 'trebuchet.charge';
   return control;
+}
+
+// Log a failure of background work (timers, disconnect handling), except the
+// lobby having expired or gone meanwhile, which is expected.
+function logUnlessGone(what: string, slug: string, err: unknown): void {
+  if (err instanceof LobbyError && (err.status === 404 || err.status === 410)) return;
+  console.error(what, slug, err);
 }
 
 function sendHttpError(res: express.Response, err: unknown): void {

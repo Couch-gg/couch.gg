@@ -1,4 +1,6 @@
-import { createRealtimeServer } from '@couch/realtime';
+import { createRealtimeServer, guardUnhandledRejections } from '@couch/realtime';
+
+guardUnhandledRejections();
 
 const { server } = createRealtimeServer({
   apiPrefix: '/api/realtime',
