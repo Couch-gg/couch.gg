@@ -8,7 +8,7 @@ export const SCREEN_CLAIM_GRACE_MS = 60 * 1000; // keep a claimed screen this lo
 export interface ScreenRecord {
   id: ScreenId;
   createdAt: number;
-  expiresAt: number; // createdAt + SCREEN_TTL_MS
+  expiresAt: number; // SCREEN_TTL_MS after it was last registered (see registerOrReuse)
   claimedSlug: LobbySlug | null;
   claimedAt: number | null;
 }
@@ -31,10 +31,17 @@ export class ScreenRegistry {
     return record;
   }
 
+  // Reuse a live screen id (a TV that reloaded or reconnected). An unclaimed
+  // one is good for another SCREEN_TTL_MS: the TV registers again now and then
+  // while it shows its QR code, so the code keeps working however long the TV
+  // waits for a phone.
   registerOrReuse(id: string | undefined, now = Date.now()): ScreenRecord {
     if (id) {
       const existing = this.get(id, now);
-      if (existing) return existing;
+      if (existing) {
+        if (existing.claimedAt == null) existing.expiresAt = now + SCREEN_TTL_MS;
+        return existing;
+      }
     }
     return this.register(now);
   }

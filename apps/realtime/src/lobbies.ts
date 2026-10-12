@@ -40,7 +40,6 @@ const INPUT_ACTIONS: readonly InputAction[] = ['press', 'release', 'change'];
 const MAX_INPUT_VALUE_BYTES = 1024;
 const INPUT_LOG_LIMIT = 128;
 const INPUT_LOG_PUBLIC_LIMIT = 64;
-const MAX_EXTERNAL_SCORES = 8;
 
 // The snapshot union the server may hold: the built-in Trebuchet snapshot or the
 // thin external snapshot (seed + reported scores, no authoritative state).
@@ -90,14 +89,25 @@ function builtinManifestResolver(id: GameId): GameManifest | null {
 }
 
 export const LOBBY_TTL_MS = 4 * 60 * 60 * 1000;
+// Activity keeps a lobby alive for another LOBBY_TTL_MS, but never past this age.
+export const LOBBY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 export const RECONNECT_GRACE_MS = 10 * 60 * 1000;
 
 export interface InternalPlayer extends Player {
   token: PlayerToken;
   disconnectedAt: number | null;
+  // The socket this player last joined with: only its disconnect counts (see
+  // noteDropped). Absent in records persisted before it existed.
+  connectionId?: string | null;
+  // When that socket dropped, while the player still shows as connected (see
+  // noteDropped and markDroppedGone). Null or absent otherwise.
+  droppedAt?: number | null;
 }
 
 export interface SerializedLobbyRecord {
+  // Always the first key: the commit script reads it off the front of the
+  // stored JSON (see persistence.ts). Absent in records persisted before it.
+  rev?: number;
   id: string;
   slug: LobbySlug;
   name: string;
@@ -137,6 +147,10 @@ export interface ScreenPresence {
 }
 
 export interface LobbyRecord {
+  // Bumped by every committed change (see nextLobbyRev), so clients can tell
+  // an older snapshot from a newer one and the commit can tell whether the
+  // stored lobby moved on since it was loaded.
+  rev: number;
   id: string;
   slug: LobbySlug;
   name: string;
@@ -163,6 +177,13 @@ export interface LobbyRecord {
   screenPresence: Record<string, ScreenPresence>;
 }
 
+// What removing a player changed: the lobby, and the Trebuchet snapshot when
+// a running game lost a unit.
+export interface PlayerRemoval {
+  lobby: Lobby;
+  gameEvent: TrebuchetSnapshot | null;
+}
+
 export class LobbyError extends Error {
   constructor(
     message: string,
@@ -175,6 +196,9 @@ export class LobbyError extends Error {
 export class LobbyStore {
   readonly lobbies = new Map<LobbySlug, LobbyRecord>();
   private readonly resolveManifest: ManifestResolver;
+  // Counts adopt calls; each adopted lobby remembers its count (see adopt).
+  private adoptions = 0;
+  private readonly adoptedAt = new WeakMap<LobbyRecord, number>();
 
   constructor(getManifest: ManifestResolver = builtinManifestResolver) {
     this.resolveManifest = getManifest;
@@ -192,6 +216,7 @@ export class LobbyStore {
     let slug = randomSlug();
     while (this.lobbies.has(slug)) slug = randomSlug();
     const lobby: LobbyRecord = {
+      rev: 0,
       id: createId('lobby'),
       slug,
       name: createRoomName(slug),
@@ -229,10 +254,49 @@ export class LobbyStore {
     return lobby;
   }
 
+  // Something happened in the lobby: keep it for another LOBBY_TTL_MS (up to
+  // LOBBY_MAX_AGE_MS after it was created), so a long evening of play doesn't
+  // run into the TTL mid-game.
+  keepAlive(lobby: LobbyRecord, now = Date.now()): void {
+    const latest = lobby.createdAt + LOBBY_MAX_AGE_MS;
+    lobby.expiresAt = Math.max(lobby.expiresAt, Math.min(now + LOBBY_TTL_MS, latest));
+  }
+
+  // The lobby is about to be committed with a change: give it the next rev
+  // and keep it alive.
+  markChanged(lobby: LobbyRecord, now = Date.now()): void {
+    lobby.rev = nextLobbyRev(lobby.rev, now);
+    this.keepAlive(lobby, now);
+  }
+
+  // Where a read of storage starts, for adopt.
+  readMark(): number {
+    return this.adoptions;
+  }
+
+  // Keep a lobby read from (`readMark` from before the read) or committed to
+  // storage, unless the one held here is newer: a read that started before a
+  // commit can finish after it. A read that started after the held lobby was
+  // taken is what storage holds, though, even if its rev is lower (a deploy
+  // from before revs stored it). Returns the one now held.
+  adopt(record: LobbyRecord, readMark?: number): LobbyRecord {
+    const held = this.lobbies.get(record.slug);
+    if (held && held !== record && held.id === record.id && held.rev > record.rev) {
+      if (readMark === undefined || (this.adoptedAt.get(held) ?? 0) > readMark) return held;
+    }
+    this.lobbies.set(record.slug, record);
+    this.adoptedAt.set(record, ++this.adoptions);
+    return record;
+  }
+
   publicLobby(slugOrLobby: string | LobbyRecord): Lobby {
     const lobby = typeof slugOrLobby === 'string' ? this.getLobby(slugOrLobby) : slugOrLobby;
     return {
       id: lobby.id,
+      // Rev 0 is a lobby last stored by a deploy from before revs: its rev is
+      // unknown. Sent as 0 it would read as older than every rev a client saw
+      // before, and the client would drop it; without one it is taken.
+      ...(lobby.rev > 0 ? { rev: lobby.rev } : {}),
       slug: lobby.slug,
       name: lobby.name,
       hostPlayerId: lobby.hostPlayerId,
@@ -253,7 +317,8 @@ export class LobbyStore {
     };
   }
 
-  joinPlayer(slug: string, name: unknown, existingToken?: string, screenId?: unknown): JoinLobbyResponse {
+  // `connectionId` is the joining socket (none for the REST join).
+  joinPlayer(slug: string, name: unknown, existingToken?: string, screenId?: unknown, connectionId?: string): JoinLobbyResponse {
     const lobby = this.getLobby(slug);
     const seat = cleanScreenId(screenId);
     const reconnect = existingToken
@@ -261,11 +326,16 @@ export class LobbyStore {
       : undefined;
 
     if (reconnect) {
+      const wasGone = !reconnect.connected;
       reconnect.connected = true;
       reconnect.disconnectedAt = null;
+      reconnect.droppedAt = null;
+      if (connectionId) reconnect.connectionId = connectionId;
       reconnect.name = sanitizePlayerName(name || reconnect.name);
       if (seat) reconnect.screenId = seat;
-      this.addActivity(lobby, `${reconnect.name} ist wieder verbunden`);
+      // A phone back before it was even marked gone (see markDroppedGone)
+      // reconnected quietly.
+      if (wasGone) this.addActivity(lobby, `${reconnect.name} ist wieder verbunden`);
       return {
         lobby: this.publicLobby(lobby),
         player: this.publicPlayer(lobby, reconnect),
@@ -290,6 +360,7 @@ export class LobbyStore {
       colorIdx: this.nextColor(lobby),
       token: createId('token'),
       disconnectedAt: null,
+      connectionId: connectionId ?? null,
       screenId: seat
     };
     lobby.players.set(player.id, player);
@@ -313,8 +384,9 @@ export class LobbyStore {
     player.name = nextName;
 
     let gameEvent: TrebuchetSnapshot | null = null;
-    if (lobby.engine) {
-      gameEvent = lobby.engine.renamePlayer(player.id, nextName);
+    const engine = this.engineOf(lobby);
+    if (engine) {
+      gameEvent = engine.renamePlayer(player.id, nextName);
       this.updateGameSession(lobby, gameEvent);
     } else if (isTrebuchetSnapshot(lobby.gameSession?.snapshot)) {
       const snapshot = lobby.gameSession.snapshot;
@@ -338,7 +410,8 @@ export class LobbyStore {
     this.assertHost(lobby, playerToken);
     const manifest = this.manifestOrThrow(gameId);
     if (manifest.comingSoon) throw new LobbyError('Dieses Spiel ist noch nicht spielbar', 409);
-    if (lobby.state !== 'waiting') throw new LobbyError('Spielauswahl ist nur in der Lobby möglich');
+    // After a round ('ended') the host may pick the next game right away.
+    if (lobby.state === 'playing') throw new LobbyError('Spielauswahl ist nur in der Lobby möglich');
     if (lobby.mode === 'remote' && isExternalManifest(manifest) && !manifest.supportsRemote) {
       throw new LobbyError('Dieses Spiel unterstützt Remote Couch nicht', 409);
     }
@@ -403,7 +476,7 @@ export class LobbyStore {
   fire(slug: string, playerToken: string, angle: unknown, power: unknown): TrebuchetEvent | null {
     const lobby = this.getLobby(slug);
     const player = this.playerByToken(lobby, playerToken);
-    const event = lobby.engine?.fire(player.id, angle, power) ?? null;
+    const event = this.engineOf(lobby)?.fire(player.id, angle, power) ?? null;
     if (event) this.updateGameSession(lobby, event.snapshot);
     return event;
   }
@@ -417,9 +490,13 @@ export class LobbyStore {
     return this.publicPlayer(lobby, player);
   }
 
-  skipTurn(slug: string): TrebuchetEvent | null {
+  // Skip the turn that ends at `turnEndsAt`, once that time has come. A turn
+  // timer may be stale: a shot or a skip elsewhere (another instance, a
+  // removed player) already moved on, and the new turn gets its full time.
+  skipTurn(slug: string, turnEndsAt: number, now = Date.now()): TrebuchetEvent | null {
     const lobby = this.getLobby(slug);
-    const event = lobby.engine?.skipTurn() ?? null;
+    if (lobby.state !== 'playing' || turnEndsAtOf(lobby) !== turnEndsAt || turnEndsAt > now) return null;
+    const event = this.engineOf(lobby)?.skipTurn() ?? null;
     if (event) this.updateGameSession(lobby, event.snapshot);
     return event;
   }
@@ -508,26 +585,28 @@ export class LobbyStore {
 
   // Finish an external game with reported scores (from the trusted screen shell).
   // Idempotent: a duplicate report (e.g. from a second TV) is a no-op returning
-  // false. Scores are validated and filtered to the current roster.
-  finishExternalGame(slug: string, scores: unknown): boolean {
+  // false. So is a report for another round than the running one (`sessionId`,
+  // left out by older TVs): a late retry must not end the next round with the
+  // last one's scores. Scores are filtered to the current roster, one per
+  // player. Entries that don't fit (a NaN score from a game bug, a bot, a
+  // duplicate) are left out rather than refusing the whole report, which
+  // would leave the round running with nobody able to end it.
+  finishExternalGame(slug: string, scores: unknown, sessionId?: unknown): boolean {
     const lobby = this.getLobby(slug);
     const session = lobby.gameSession;
     if (!session || !isExternalSnapshot(session.snapshot)) return false;
+    if (sessionId !== undefined && sessionId !== session.id) return false;
     if (session.state === 'finished' || lobby.state === 'ended') return false;
 
-    if (!Array.isArray(scores) || scores.length > MAX_EXTERNAL_SCORES) {
-      throw new LobbyError('Ungültige Punktestände', 400);
-    }
-    const roster = new Set(lobby.players.keys());
+    if (!Array.isArray(scores)) throw new LobbyError('Ungültige Punktestände', 400);
     const clean: Array<{ playerId: PlayerId; score: number }> = [];
     for (const entry of scores) {
       if (!entry || typeof entry !== 'object') continue;
       const playerId = (entry as { playerId?: unknown }).playerId;
       const score = (entry as { score?: unknown }).score;
-      if (typeof playerId !== 'string' || typeof score !== 'number' || !Number.isFinite(score)) {
-        throw new LobbyError('Ungültige Punktestände', 400);
-      }
-      if (roster.has(playerId)) clean.push({ playerId, score });
+      if (typeof playerId !== 'string' || typeof score !== 'number' || !Number.isFinite(score)) continue;
+      if (!lobby.players.has(playerId) || clean.some((row) => row.playerId === playerId)) continue;
+      clean.push({ playerId, score });
     }
 
     session.snapshot = { ...session.snapshot, scores: clean };
@@ -559,38 +638,95 @@ export class LobbyStore {
     return message;
   }
 
-  markDisconnected(slug: string, playerId: PlayerId, at = Date.now()): Lobby | null {
+  // The socket `connectionId` of a player dropped: they show as gone now.
+  // Only the player's latest socket counts: a phone that already joined again
+  // (here or on another instance, e.g. before the server noticed its old
+  // connection die) stays connected. Returns null when nothing changed.
+  markDisconnected(slug: string, playerId: PlayerId, at = Date.now(), connectionId?: string): Lobby | null {
     const lobby = this.lobbies.get(slug.toUpperCase());
     if (!lobby) return null;
     const player = lobby.players.get(playerId);
-    if (!player) return this.publicLobby(lobby);
-    player.connected = false;
-    player.disconnectedAt = at;
-    this.addActivity(lobby, `${player.name} Verbindung verloren`);
+    if (!player || !player.connected) return null;
+    if (connectionId && player.connectionId && player.connectionId !== connectionId) return null;
+    this.showGone(lobby, player, at);
     return this.publicLobby(lobby);
   }
 
-  removeIfStillDisconnected(slug: string, playerId: PlayerId, since: number): { lobby: Lobby; gameEvent: TrebuchetSnapshot | null } | null {
+  // The socket `connectionId` of a player dropped, but they don't show as
+  // gone yet: the platform closes long-lived connections every few minutes,
+  // and the phone is back within a second or two. The drop is kept in the
+  // record, so any instance can turn it into "gone" later (markDroppedGone).
+  // Only the player's latest socket counts, as in markDisconnected. Returns
+  // whether the record changed.
+  noteDropped(slug: string, playerId: PlayerId, connectionId: string, at = Date.now()): boolean {
+    const player = this.lobbies.get(slug.toUpperCase())?.players.get(playerId);
+    if (!player || !player.connected || player.droppedAt != null) return false;
+    if (player.connectionId && player.connectionId !== connectionId) return false;
+    player.droppedAt = at;
+    return true;
+  }
+
+  // Players whose socket dropped at least quietMs ago, without them joining
+  // again since, now show as gone (from the time they dropped). Returns them.
+  markDroppedGone(slug: string, now: number, quietMs: number): Array<{ playerId: PlayerId; since: number }> {
+    const lobby = this.getLobby(slug);
+    const gone: Array<{ playerId: PlayerId; since: number }> = [];
+    for (const player of lobby.players.values()) {
+      const since = player.droppedAt;
+      if (since == null || !player.connected || now - since < quietMs) continue;
+      this.showGone(lobby, player, since);
+      gone.push({ playerId: player.id, since });
+    }
+    return gone;
+  }
+
+  // Whether dropGoneScreens or markDroppedGone would change anything now.
+  // Read-only, so a poll can check without writing the lobby.
+  hasPresenceToSettle(slug: string, now: number, graceMs: number, quietMs: number): boolean {
+    const lobby = this.getLobby(slug);
+    for (const id of lobby.screens) {
+      const leftAt = lobby.screenPresence[id]?.leftAt;
+      if (leftAt != null && now - leftAt >= graceMs) return true;
+    }
+    for (const player of lobby.players.values()) {
+      if (player.droppedAt != null && player.connected && now - player.droppedAt >= quietMs) return true;
+    }
+    return false;
+  }
+
+  // Remove a player that has been gone since `since` (and didn't come back).
+  // Returns null when nothing changed.
+  removeIfStillDisconnected(slug: string, playerId: PlayerId, since: number): PlayerRemoval | null {
     const lobby = this.lobbies.get(slug.toUpperCase());
     if (!lobby) return null;
     const player = lobby.players.get(playerId);
-    if (!player || player.connected || player.disconnectedAt !== since) {
-      return { lobby: this.publicLobby(lobby), gameEvent: null };
-    }
+    if (!player || player.connected || player.disconnectedAt !== since) return null;
+    return this.removePlayer(lobby, player, `${player.name} wurde entfernt`);
+  }
 
-    lobby.players.delete(playerId);
-    let gameSnapshot: TrebuchetSnapshot | null = null;
-    if (lobby.engine && lobby.state === 'playing') {
-      gameSnapshot = lobby.engine.removePlayer(playerId);
-      this.updateGameSession(lobby, gameSnapshot);
-    }
-    if (lobby.hostPlayerId === playerId) this.promoteHost(lobby);
-    if (lobby.players.size === 0) {
-      this.lobbies.delete(lobby.slug);
-      return null;
-    }
-    this.addActivity(lobby, `${player.name} wurde entfernt`);
-    return { lobby: this.publicLobby(lobby), gameEvent: gameSnapshot };
+  // A player left on purpose (the phone's Leave button): drop them now
+  // instead of after the reconnect grace, so the host role and the seat free
+  // up right away.
+  leavePlayer(slug: string, playerToken: string): PlayerRemoval {
+    const lobby = this.getLobby(slug);
+    const player = this.playerByToken(lobby, playerToken);
+    return this.removePlayer(lobby, player, `${player.name} hat die Lobby verlassen`);
+  }
+
+  // The host ends the running game and takes everyone back to the lobby, e.g.
+  // when the game never reported its end. No scores.
+  endGame(slug: string, playerToken: string): Lobby {
+    const lobby = this.getLobby(slug);
+    this.assertHost(lobby, playerToken);
+    if (lobby.state !== 'playing') throw new LobbyError('Kein laufendes Spiel', 409);
+    this.endSession(lobby);
+    this.addActivity(lobby, 'Spiel vom Host beendet');
+    return this.publicLobby(lobby);
+  }
+
+  // The token of a player, for a socket that joined as that player.
+  tokenOf(slug: string, playerId: PlayerId): PlayerToken | undefined {
+    return this.lobbies.get(slug.toUpperCase())?.players.get(playerId)?.token;
   }
 
   pruneExpired(now = Date.now()): number {
@@ -602,6 +738,44 @@ export class LobbyStore {
       }
     }
     return removed;
+  }
+
+  // Take a player out of the lobby (and out of a running Trebuchet game). The
+  // host role moves on. An emptied lobby is kept, so a TV still showing it
+  // keeps working and the next player to join becomes its host; a game still
+  // running in it ends, or nobody could join again.
+  private removePlayer(lobby: LobbyRecord, player: InternalPlayer, activity: string): PlayerRemoval {
+    lobby.players.delete(player.id);
+    let gameSnapshot: TrebuchetSnapshot | null = null;
+    const engine = lobby.state === 'playing' ? this.engineOf(lobby) : null;
+    if (engine) {
+      gameSnapshot = engine.removePlayer(player.id);
+      this.updateGameSession(lobby, gameSnapshot);
+    }
+    this.addActivity(lobby, activity);
+    if (lobby.hostPlayerId === player.id) this.promoteHost(lobby);
+    if (lobby.players.size === 0 && lobby.state === 'playing') this.endSession(lobby);
+    return { lobby: this.publicLobby(lobby), gameEvent: gameSnapshot };
+  }
+
+  // The Trebuchet engine of a running Trebuchet round. A lobby read from
+  // storage gets it rebuilt from its snapshot only here, on first use: most
+  // reads (every poll) never touch the engine.
+  private engineOf(lobby: LobbyRecord): TrebuchetEngine | null {
+    if (lobby.engine) return lobby.engine;
+    const snapshot = lobby.gameSession?.snapshot;
+    if (lobby.state !== 'playing' || !isTrebuchetSnapshot(snapshot)) return null;
+    lobby.engine = TrebuchetEngine.fromSnapshot(snapshot);
+    return lobby.engine;
+  }
+
+  private endSession(lobby: LobbyRecord): void {
+    lobby.engine = null;
+    if (lobby.gameSession && lobby.gameSession.state !== 'finished') {
+      lobby.gameSession.state = 'finished';
+      lobby.gameSession.endedAt = new Date().toISOString();
+    }
+    lobby.state = 'ended';
   }
 
   private updateGameSession(lobby: LobbyRecord, snapshot: TrebuchetSnapshot): void {
@@ -745,6 +919,13 @@ export class LobbyStore {
     if (next) this.addActivity(lobby, `${next.name} ist jetzt Host`);
   }
 
+  private showGone(lobby: LobbyRecord, player: InternalPlayer, at: number): void {
+    player.connected = false;
+    player.disconnectedAt = at;
+    player.droppedAt = null;
+    this.addActivity(lobby, `${player.name} Verbindung verloren`);
+  }
+
   private addActivity(lobby: LobbyRecord, text: string): void {
     lobby.activity.push({ id: createId('activity'), at: new Date().toISOString(), text });
     lobby.activity = lobby.activity.slice(-20);
@@ -761,6 +942,7 @@ export function sanitizeChatText(raw: unknown): string {
 
 export function serializeLobbyRecord(lobby: LobbyRecord): SerializedLobbyRecord {
   return {
+    rev: lobby.rev,
     id: lobby.id,
     slug: lobby.slug,
     name: lobby.name,
@@ -789,9 +971,53 @@ export function serializeLobbyRecord(lobby: LobbyRecord): SerializedLobbyRecord 
   };
 }
 
+// A copy of a lobby to change, which shares nothing it could change with the
+// original (the engine is rebuilt from the snapshot when it is needed).
+export function cloneLobbyRecord(lobby: LobbyRecord): LobbyRecord {
+  return deserializeLobbyRecord(serializeLobbyRecord(lobby));
+}
+
+// How far ahead of the clock the first rev after an unknown one (0) starts.
+const UNKNOWN_REV_LEAD_MS = 60_000;
+
+// The rev of a lobby's next committed change. Never below the clock, so it
+// still moves forward when a writer without revs (a deploy from before them)
+// stored the lobby in between and it reads as 0. The revs clients saw before
+// that write are unknown then, and another instance may have handed them out
+// from a clock ahead of this one's, so the rev after an unknown one starts
+// well ahead of the clock: from the clock alone, clients could take the
+// changes after it for older until this clock caught up.
+export function nextLobbyRev(rev: number, now = Date.now()): number {
+  return rev > 0 ? Math.max(rev + 1, now) : now + UNKNOWN_REV_LEAD_MS;
+}
+
+// A lobby view without the copy of the game state its last event repeats:
+// when that copy is the session's snapshot, `snapshotFromSession` says so and
+// the client puts it back (see the web app's fetchLobby). Only for clients
+// that ask for it: older ones read the snapshot off the event.
+export function withoutRepeatedSnapshot(lobby: Lobby): Lobby {
+  const event = lobby.lastEvent?.event as { snapshot?: unknown } | undefined;
+  const sessionSnapshot = lobby.gameSession?.snapshot;
+  if (!lobby.lastEvent || !event || typeof event !== 'object' || !('snapshot' in event)) return lobby;
+  if (sessionSnapshot === undefined || !sameValue(event.snapshot, sessionSnapshot)) return lobby;
+  const { snapshot: _repeated, ...rest } = event;
+  return { ...lobby, lastEvent: { ...lobby.lastEvent, event: rest, snapshotFromSession: true } };
+}
+
+function sameValue(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  const left = a as Record<string, unknown>;
+  const right = b as Record<string, unknown>;
+  const keys = Object.keys(left);
+  if (keys.length !== Object.keys(right).length) return false;
+  return keys.every((key) => Object.prototype.hasOwnProperty.call(right, key) && sameValue(left[key], right[key]));
+}
+
 export function deserializeLobbyRecord(serialized: SerializedLobbyRecord): LobbyRecord {
-  const snapshot = serialized.gameSession?.snapshot ?? null;
   return {
+    rev: serialized.rev ?? 0,
     id: serialized.id,
     slug: serialized.slug.toUpperCase(),
     name: serialized.name,
@@ -810,12 +1036,9 @@ export function deserializeLobbyRecord(serialized: SerializedLobbyRecord): Lobby
         }
       : null,
     lastEvent: serialized.lastEvent ?? null,
-    // Only rebuild a Trebuchet engine for a live Trebuchet snapshot — external
-    // games have no engine, and fromSnapshot would fault on their shape.
-    engine:
-      isTrebuchetSnapshot(snapshot) && serialized.state === 'playing'
-        ? TrebuchetEngine.fromSnapshot(snapshot)
-        : null,
+    // Rebuilt on first use (LobbyStore.engineOf), and only for a running
+    // Trebuchet round: external games have no engine.
+    engine: null,
     // Back-compat: records persisted before external-game support lack these.
     mode: serialized.mode ?? 'local',
     inputSeq: serialized.inputSeq ?? 0,
@@ -865,6 +1088,13 @@ export function hostScreenId(lobby: LobbyRecord): string | null {
   const host = lobby.hostPlayerId ? lobby.players.get(lobby.hostPlayerId) : undefined;
   if (host?.screenId && lobby.screens.includes(host.screenId)) return host.screenId;
   return lobby.screens[0] ?? null;
+}
+
+// When the current Trebuchet turn runs out (null without a running turn).
+export function turnEndsAtOf(lobby: LobbyRecord): number | null {
+  const snapshot = lobby.gameSession?.snapshot;
+  if (lobby.state !== 'playing' || !isTrebuchetSnapshot(snapshot)) return null;
+  return typeof snapshot.turnEndsAt === 'number' ? snapshot.turnEndsAt : null;
 }
 
 const MAX_LABEL_CHARS = 16;
