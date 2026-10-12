@@ -14,18 +14,15 @@
     "test": "pnpm test:unit && pnpm test:e2e",
     "test:unit": "pnpm build:packages && pnpm --filter @couch/trebuchet test && pnpm --filter @couch/game-runtime test && pnpm --filter @couch/game-sdk test && pnpm --filter @couch/realtime test",
     "test:e2e": "pnpm exec playwright test",
-    "typecheck": "pnpm build:packages && pnpm --filter @couch/realtime typecheck && pnpm --filter @couch/web typecheck"
+    "typecheck": "pnpm build:packages && pnpm --filter @couch/realtime typecheck && pnpm --filter @couch/web typecheck && tsc -p api/tsconfig.json"
   },
   "devDependencies": {
     "@playwright/test": "^1.56.1",
     "@types/node": "^24.10.1",
-    "@vitejs/plugin-react": "^5.1.1",
     "concurrently": "^9.2.1",
     "marked": "^18.0.5",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3",
-    "vite": "^7.2.7",
-    "vitest": "^4.0.16",
-    "wait-on": "^9.0.3"
+    "vitest": "^4.0.16"
   }
 }
