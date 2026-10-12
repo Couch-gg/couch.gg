@@ -7,8 +7,12 @@
 //
 // This is also the Wave-2 demo/e2e enabler: a static-hosted fixture game can be
 // registered via env and played end-to-end without the registry.
+//
+// Thumbnail values the catalog may not render (an unknown icon, a gradient with
+// url()) were accepted before the thumbnail rules existed, so an entry that only
+// breaks those is cleaned up (logged) instead of disappearing from the catalog.
 
-import { GAME_MANIFESTS, validateExternalManifestInput } from '@couch/game-runtime';
+import { GAME_MANIFESTS, sanitizeThumbnail, validateExternalManifestInput } from '@couch/game-runtime';
 import type { ExternalGameManifest, GameManifest } from '@couch/types';
 
 export interface ParseExternalGamesOptions {
@@ -52,7 +56,7 @@ export function parseExternalGamesJson(
   const seenIds = new Set<string>();
 
   parsed.forEach((entry, i) => {
-    const result = validateExternalManifestInput(entry, { allowHttpLocalhost });
+    const result = validateExternalManifestInput(withSafeThumbnail(entry, i, warn), { allowHttpLocalhost });
     if (!result.ok) {
       warn(`EXTERNAL_GAMES_JSON entry ${i} is invalid, skipping: ${result.errors.join('; ')}`);
       return;
@@ -73,6 +77,24 @@ export function parseExternalGamesJson(
   });
 
   return out;
+}
+
+// The entry with its thumbnail values swapped for ones the catalog renders
+// (see sanitizeThumbnail). Anything that isn't a thumbnail object is left for
+// the validator to reject as before.
+function withSafeThumbnail(entry: unknown, i: number, warn: (message: string) => void): unknown {
+  if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) return entry;
+  const thumbnail = (entry as { thumbnail?: unknown }).thumbnail;
+  if (typeof thumbnail !== 'object' || thumbnail === null || Array.isArray(thumbnail)) return entry;
+  const raw = thumbnail as Record<string, unknown>;
+  const safe = sanitizeThumbnail(raw);
+  const changed = (['icon', 'gradient', 'accent'] as const).filter((field) => {
+    const value = raw[field];
+    return value !== undefined && (typeof value === 'string' ? value.trim() : value) !== safe[field];
+  });
+  if (changed.length === 0) return entry;
+  warn(`EXTERNAL_GAMES_JSON entry ${i}: thumbnail ${changed.join(', ')} not allowed, using the fallback`);
+  return { ...entry, thumbnail: { ...safe, kind: raw.kind } };
 }
 
 // Merge the built-in manifests with the env-registered external ones. Built-ins

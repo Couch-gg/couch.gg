@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ControllerEvent, ExternalGameManifest, GameId, GameManifest } from '@couch/types';
-import { getGameManifest } from '@couch/game-runtime';
+import { FALLBACK_THUMBNAIL_GRADIENT, FALLBACK_THUMBNAIL_ICON, getGameManifest } from '@couch/game-runtime';
 import {
   LobbyStore,
   deserializeLobbyRecord,
@@ -466,6 +466,39 @@ describe('parseExternalGamesJson', () => {
     const out = parseExternalGamesJson(input, { onWarn: (m) => warnings.push(m) });
     expect(out.map((g) => g.id)).toEqual(['good-game']);
     expect(warnings.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('keeps an entry whose thumbnail breaks the catalog rules, with the fallback look', () => {
+    const input = JSON.stringify([
+      {
+        id: 'old-thumb',
+        title: 'Old Thumb',
+        description: 'Registered before the thumbnail rules.',
+        minPlayers: 1,
+        maxPlayers: 2,
+        controllerLayout: { kind: 'generic-buttons', controls: [{ control: 'go', type: 'button', label: 'Go' }] },
+        aspectRatio: '16:9',
+        estimatedDurationMinutes: 5,
+        thumbnail: {
+          kind: 'css',
+          gradient: 'url(https://tracker.example/p.gif?x=1) center/cover',
+          icon: 'createLucideIcon',
+          accent: '#62d5d5'
+        },
+        entryUrl: 'https://example.com/',
+        sdkProtocol: 1
+      }
+    ]);
+    const warnings: string[] = [];
+    const out = parseExternalGamesJson(input, { onWarn: (m) => warnings.push(m) });
+    expect(out).toHaveLength(1);
+    expect(out[0].thumbnail).toEqual({
+      kind: 'css',
+      gradient: FALLBACK_THUMBNAIL_GRADIENT,
+      icon: FALLBACK_THUMBNAIL_ICON,
+      accent: '#62d5d5'
+    });
+    expect(warnings.join(' ')).toMatch(/icon, gradient/);
   });
 
   it('returns [] for empty, malformed, or non-array input', () => {

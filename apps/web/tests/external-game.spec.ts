@@ -162,6 +162,16 @@ test('PUBLISH flow: submit via REST, play it, unpublish', async ({ browser, requ
   await expect(card).toBeVisible({ timeout: 15_000 });
   await expect(card.locator('.game-badge', { hasText: 'Community' })).toBeVisible();
 
+  // The TV reports its first load of the game (probe-result). A client
+  // address of its own keeps it out of the per-client budget the rest of the
+  // suite's TVs share (they all come from 127.0.0.1).
+  const probeIp = `10.${Math.floor(Math.random() * 256)}.${Math.floor(Math.random() * 256)}.7`;
+  const probeUrl = new RegExp(`/games/${gameId}/probe-result$`);
+  await tv.route(probeUrl, (route) =>
+    route.continue({ headers: { ...route.request().headers(), 'x-forwarded-for': probeIp } })
+  );
+  const probe = tv.waitForResponse((res) => probeUrl.test(res.url()) && res.request().method() === 'POST');
+
   // Select + start.
   await card.click();
   const start = alex.getByRole('button', { name: /Tap Race Two starten/i });
@@ -172,6 +182,18 @@ test('PUBLISH flow: submit via REST, play it, unpublish', async ({ browser, requ
   const stage = tv.locator('[data-testid="game-host-stage"]');
   await expect(stage).toBeVisible({ timeout: 20_000 });
   await expect(stage).toHaveAttribute('data-ready', 'true', { timeout: 20_000 });
+
+  // It counts: it came from the host screen (with its screen token) of the
+  // lobby running the game. The same session can't report a second time.
+  const probeResponse = await probe;
+  expect(await probeResponse.json()).toMatchObject({ counted: true, status: 'ok' });
+  const probeBody = probeResponse.request().postDataJSON();
+  expect(probeBody).toMatchObject({ slug, ok: true, screenId: expect.stringMatching(/^scr_/) });
+  const replay = await request.post(`http://127.0.0.1:4100/api/games/${gameId}/probe-result`, {
+    data: { ...probeBody, ok: false },
+    headers: { 'x-forwarded-for': probeIp }
+  });
+  expect(await replay.json()).toMatchObject({ counted: false });
 
   const frame = tv.frameLocator('iframe[title="Tap Race Two"]');
   await expect(frame.locator('[data-testid^="lane-"]', { hasText: 'Alex' })).toBeVisible({ timeout: 20_000 });

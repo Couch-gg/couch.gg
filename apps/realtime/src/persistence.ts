@@ -12,12 +12,40 @@ import { SCREEN_CLAIM_GRACE_MS, type ScreenRecord } from './screens.js';
 // Durable store for the published-games registry. Unlike lobbies/screens these
 // records have NO TTL — a published game lives until it is explicitly deleted or
 // taken down. The registry class caches on top of this and re-lists when stale.
+//
+// Every write is conditional, so an instance working from a stale cache can't
+// undo another instance's write: a new record only lands on a free id, an
+// update only replaces the exact record it read (and never brings back a
+// deleted one), and a delete only removes the record it checked.
 export interface GamePersistence {
   enabled: boolean;
   loadGame(id: string): Promise<PublishedGameRecord | null>;
-  saveGame(record: PublishedGameRecord): Promise<void>;
-  deleteGame(id: string): Promise<void>;
+  // Store a new record. False (nothing written) when the id is taken.
+  createGame(record: PublishedGameRecord): Promise<boolean>;
+  // Read-modify-write of the stored record: `change` gets it and returns the
+  // next one, or throws to write nothing. Starts over when another write got
+  // in between, so `change` may run more than once, and throws
+  // GameWriteConflictError when it keeps losing. Null (nothing written) when
+  // there is no record; returning the record unchanged writes nothing either.
+  updateGame(id: string, change: (current: PublishedGameRecord) => PublishedGameRecord): Promise<PublishedGameRecord | null>;
+  // Delete the stored record once `check` accepts it (it throws to keep the
+  // record). False when there is no record. Retries like updateGame.
+  deleteGame(id: string, check?: (current: PublishedGameRecord) => void): Promise<boolean>;
   listGames(): Promise<PublishedGameRecord[]>;
+  // Take a one-time marker for ttlMs (e.g. one probe result per game session).
+  // False when it is already taken.
+  claimOnce(key: string, ttlMs: number): Promise<boolean>;
+  // Count a hit against a limit every instance shares: the number of hits on
+  // `key` in the window of windowMs that began with its first hit.
+  countHit(key: string, windowMs: number): Promise<number>;
+}
+
+// A conditional games write lost to other writes to the same game on every
+// attempt. Nothing was written; trying again later can succeed.
+export class GameWriteConflictError extends Error {
+  constructor(id: string) {
+    super(`Games persistence: too many concurrent writes to ${id}`);
+  }
 }
 
 export interface LobbyPersistence {
@@ -283,37 +311,132 @@ const disabledGamePersistence: GamePersistence = {
   async loadGame() {
     return null;
   },
-  async saveGame() {
+  async createGame() {
     throw new Error('Games persistence is disabled');
   },
-  async deleteGame() {},
+  async updateGame() {
+    return null;
+  },
+  async deleteGame() {
+    return false;
+  },
   async listGames() {
     return [];
+  },
+  async claimOnce() {
+    return false;
+  },
+  async countHit() {
+    return 0;
   }
 };
 
 // Full submit flow without Redis (local dev + e2e). Clones on the way in and out
-// so callers can never mutate the stored record by reference.
-class InMemoryGamePersistence implements GamePersistence {
+// so callers can never mutate the stored record by reference. Each method runs
+// without an await between its read and its write, so it is atomic here.
+export class InMemoryGamePersistence implements GamePersistence {
   enabled = true;
   private readonly games = new Map<string, PublishedGameRecord>();
+  private readonly claims = new Map<string, number>(); // key → expiresAt
+  private readonly hits = new Map<string, { count: number; resetAt: number }>();
 
   async loadGame(id: string): Promise<PublishedGameRecord | null> {
     const record = this.games.get(id);
     return record ? clone(record) : null;
   }
 
-  async saveGame(record: PublishedGameRecord): Promise<void> {
+  async createGame(record: PublishedGameRecord): Promise<boolean> {
+    if (this.games.has(record.manifest.id)) return false;
     this.games.set(record.manifest.id, clone(record));
+    return true;
   }
 
-  async deleteGame(id: string): Promise<void> {
+  async updateGame(
+    id: string,
+    change: (current: PublishedGameRecord) => PublishedGameRecord
+  ): Promise<PublishedGameRecord | null> {
+    const current = this.games.get(id);
+    if (!current) return null;
+    const next = change(clone(current));
+    this.games.set(id, clone(next));
+    return clone(next);
+  }
+
+  async deleteGame(id: string, check?: (current: PublishedGameRecord) => void): Promise<boolean> {
+    const current = this.games.get(id);
+    if (!current) return false;
+    check?.(clone(current));
     this.games.delete(id);
+    return true;
   }
 
   async listGames(): Promise<PublishedGameRecord[]> {
     return [...this.games.values()].map(clone);
   }
+
+  async claimOnce(key: string, ttlMs: number): Promise<boolean> {
+    const now = Date.now();
+    pruneExpired(this.claims, (expiresAt) => expiresAt <= now);
+    if ((this.claims.get(key) ?? 0) > now) return false;
+    this.claims.set(key, now + ttlMs);
+    return true;
+  }
+
+  async countHit(key: string, windowMs: number): Promise<number> {
+    const now = Date.now();
+    pruneExpired(this.hits, (window) => window.resetAt <= now);
+    const window = this.hits.get(key);
+    if (!window || window.resetAt <= now) {
+      this.hits.set(key, { count: 1, resetAt: now + windowMs });
+      return 1;
+    }
+    window.count += 1;
+    return window.count;
+  }
+}
+
+// Drop expired entries once a map gets big, so dev servers don't grow forever.
+function pruneExpired<V>(map: Map<string, V>, expired: (value: V) => boolean): void {
+  if (map.size < 1000) return;
+  for (const [key, value] of map) if (expired(value)) map.delete(key);
+}
+
+// Conditional writes run as Lua scripts, atomic on the Redis side. Each takes
+// the raw JSON it read as the expected value, so a write that lost a race
+// changes nothing and the caller reads again. (Multi-key scripts are fine:
+// listGames already MGETs across keys, so the store is not a Redis Cluster.)
+// KEYS: game key, index. ARGV: record JSON, id.
+const CREATE_GAME_SCRIPT = `
+if not redis.call('SET', KEYS[1], ARGV[1], 'NX') then return 0 end
+redis.call('SADD', KEYS[2], ARGV[2])
+return 1`;
+// KEYS: game key. ARGV: expected JSON, next JSON.
+const REPLACE_GAME_SCRIPT = `
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+redis.call('SET', KEYS[1], ARGV[2])
+return 1`;
+// KEYS: game key, index. ARGV: expected JSON, id.
+const DELETE_GAME_SCRIPT = `
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+redis.call('DEL', KEYS[1])
+redis.call('SREM', KEYS[2], ARGV[2])
+return 1`;
+// KEYS: counter key. ARGV: window in ms.
+const COUNT_HIT_SCRIPT = `
+local hits = redis.call('INCR', KEYS[1])
+if hits == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end
+return hits`;
+// How often a read-modify-write starts over before giving up, and the longest
+// wait before a new attempt.
+const MAX_WRITE_ATTEMPTS = 8;
+const MAX_WRITE_BACKOFF_MS = 50;
+
+// Wait before attempt number `attempt` (1 = the first retry): a random share
+// of a ceiling that doubles with each lost race, so writers that collided
+// don't all come back at once and collide again.
+function writeBackoff(attempt: number): Promise<void> {
+  const ceiling = Math.min(MAX_WRITE_BACKOFF_MS, 5 * 2 ** attempt);
+  return new Promise((resolve) => setTimeout(resolve, Math.random() * ceiling));
 }
 
 class RedisGamePersistence implements GamePersistence {
@@ -331,16 +454,47 @@ class RedisGamePersistence implements GamePersistence {
 
   // Plain SET (no PXAT/EX) — published games are durable, not TTL'd. The id is
   // also added to the index SET so listGames can enumerate without SCAN.
-  async saveGame(record: PublishedGameRecord): Promise<void> {
+  async createGame(record: PublishedGameRecord): Promise<boolean> {
     const client = await this.client();
-    await client.set(gameKey(record.manifest.id), JSON.stringify(record));
-    await client.sAdd(GAMES_INDEX_KEY, record.manifest.id);
+    const created = await client.eval(CREATE_GAME_SCRIPT, {
+      keys: [gameKey(record.manifest.id), GAMES_INDEX_KEY],
+      arguments: [JSON.stringify(record), record.manifest.id]
+    });
+    return Number(created) === 1;
   }
 
-  async deleteGame(id: string): Promise<void> {
+  async updateGame(
+    id: string,
+    change: (current: PublishedGameRecord) => PublishedGameRecord
+  ): Promise<PublishedGameRecord | null> {
     const client = await this.client();
-    await client.del(gameKey(id));
-    await client.sRem(GAMES_INDEX_KEY, id);
+    for (let attempt = 0; attempt < MAX_WRITE_ATTEMPTS; attempt++) {
+      if (attempt > 0) await writeBackoff(attempt);
+      const raw = await client.get(gameKey(id));
+      if (!raw) return null;
+      const next = change(JSON.parse(raw) as PublishedGameRecord);
+      const encoded = JSON.stringify(next);
+      if (encoded === raw) return next;
+      const replaced = await client.eval(REPLACE_GAME_SCRIPT, { keys: [gameKey(id)], arguments: [raw, encoded] });
+      if (Number(replaced) === 1) return next;
+    }
+    throw new GameWriteConflictError(id);
+  }
+
+  async deleteGame(id: string, check?: (current: PublishedGameRecord) => void): Promise<boolean> {
+    const client = await this.client();
+    for (let attempt = 0; attempt < MAX_WRITE_ATTEMPTS; attempt++) {
+      if (attempt > 0) await writeBackoff(attempt);
+      const raw = await client.get(gameKey(id));
+      if (!raw) return false;
+      check?.(JSON.parse(raw) as PublishedGameRecord);
+      const deleted = await client.eval(DELETE_GAME_SCRIPT, {
+        keys: [gameKey(id), GAMES_INDEX_KEY],
+        arguments: [raw, id]
+      });
+      if (Number(deleted) === 1) return true;
+    }
+    throw new GameWriteConflictError(id);
   }
 
   // SMEMBERS + MGET, pruning any index ids whose record has vanished (e.g. a key
@@ -362,6 +516,21 @@ class RedisGamePersistence implements GamePersistence {
     });
     if (dangling.length > 0) await client.sRem(GAMES_INDEX_KEY, dangling);
     return out;
+  }
+
+  async claimOnce(key: string, ttlMs: number): Promise<boolean> {
+    const client = await this.client();
+    const claimed = await client.set(`couch:once:${key}`, '1', {
+      condition: 'NX',
+      expiration: { type: 'PX', value: ttlMs }
+    });
+    return claimed !== null;
+  }
+
+  async countHit(key: string, windowMs: number): Promise<number> {
+    const client = await this.client();
+    const hits = await client.eval(COUNT_HIT_SCRIPT, { keys: [`couch:rate:${key}`], arguments: [String(windowMs)] });
+    return Number(hits);
   }
 
   private async client(): Promise<RedisClientType> {

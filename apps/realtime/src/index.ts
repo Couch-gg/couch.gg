@@ -24,13 +24,8 @@ import { RateLimiter } from './rate-limit.js';
 import { createProductionGamePersistence, createProductionLobbyPersistence } from './persistence.js';
 import { GamesRegistry, RegistryError, adminGameView, publicGame } from './games-registry.js';
 import { ScreenRegistry } from './screens.js';
+import { clientId, clientIdKey } from './client-id.js';
 
-// Per-key token bucket for report throttling: capacity 5, refill 5 tokens/hour.
-// Same shape as RateLimiter but with report-specific constants; kept local so
-// rate-limit.ts (input-relay tuned) stays untouched. Keyed `report:<ip>`.
-const REPORT_CAPACITY = 5;
-const REPORT_REFILL_PER_MS = 5 / 3_600_000; // 5 per 3600s
-const REPORT_IDLE_PRUNE_MS = 3_600_000;
 // Largest host-authoritative state broadcast (serialized), see game:state.
 const MAX_STATE_BYTES = 32_768;
 // How long a socket's "is this the host screen" verdict is trusted.
@@ -47,36 +42,6 @@ const DISCONNECT_QUIET_MS = 5_000;
 // How often a lobby write that keeps finding the lobby changed under it (by
 // another instance) loads and applies again before it gives up.
 const MAX_COMMIT_ATTEMPTS = 8;
-
-class ReportRateLimiter {
-  private readonly buckets = new Map<string, { tokens: number; lastRefill: number }>();
-  private lastPrune = 0;
-
-  allow(key: string, now = Date.now()): boolean {
-    this.pruneIdle(now);
-    let bucket = this.buckets.get(key);
-    if (!bucket) {
-      bucket = { tokens: REPORT_CAPACITY, lastRefill: now };
-      this.buckets.set(key, bucket);
-    }
-    const elapsed = now - bucket.lastRefill;
-    if (elapsed > 0) {
-      bucket.tokens = Math.min(REPORT_CAPACITY, bucket.tokens + elapsed * REPORT_REFILL_PER_MS);
-      bucket.lastRefill = now;
-    }
-    if (bucket.tokens < 1) return false;
-    bucket.tokens -= 1;
-    return true;
-  }
-
-  private pruneIdle(now: number): void {
-    if (now - this.lastPrune < REPORT_IDLE_PRUNE_MS) return;
-    this.lastPrune = now;
-    for (const [key, bucket] of this.buckets) {
-      if (now - bucket.lastRefill > REPORT_IDLE_PRUNE_MS) this.buckets.delete(key);
-    }
-  }
-}
 
 // A game event a lobby change made, with the seq it was stored under.
 interface StampedGameEvent {
@@ -140,6 +105,8 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   // from other serverless instances within the 30s window.
   const gamesPersistence = createProductionGamePersistence();
   const registry = new GamesRegistry(gamesPersistence);
+  // Keys the client ids that reports and probe results are counted by.
+  const clientKey = clientIdKey();
 
   // Resolver the store uses instead of the throwing getGameManifest: built-ins
   // first, then env-registered externals, then the durable registry (sync cache
@@ -171,9 +138,6 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   // Host-authoritative state broadcasts: ~30/s sustained per lobby (a 30 Hz
   // snapshot loop), bursts to 60.
   const stateLimiter = new RateLimiter({ playerCapacity: 60, playerRefillPerSec: 30, slugCapacity: 60, slugRefillPerSec: 30 });
-  // Per-IP report throttle: 5 reports/hour. Same token-bucket shape as the input
-  // limiter but with report-specific capacity/refill, keyed `report:<ip>`.
-  const reportLimiter = new ReportRateLimiter();
 
   const app = express();
   app.use(cors({ origin: clientOrigin }));
@@ -273,9 +237,10 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   });
 
   // Self-service update by management token. Body { manifest } re-validated.
+  // Like every registry write below, it works on the stored record, not on
+  // this instance's cache, so no ensureFresh() first.
   app.patch(`${apiPrefix}/games/:id`, async (req, res) => {
     try {
-      await registry.ensureFresh();
       const token = String(req.header('x-management-token') ?? '');
       const record = await registry.update(req.params.id, token, req.body?.manifest);
       res.json({ game: publicGame(record) });
@@ -287,7 +252,6 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   // Self-service delete by management token.
   app.delete(`${apiPrefix}/games/:id`, async (req, res) => {
     try {
-      await registry.ensureFresh();
       const token = String(req.header('x-management-token') ?? '');
       await registry.remove(req.params.id, token);
       res.status(204).end();
@@ -296,35 +260,47 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
     }
   });
 
-  // Community report. Per-IP throttled; at 3 reports the game auto-hides.
+  // Community report. Each client (a keyed hash of its IP, see client-id.ts)
+  // counts once per game and has a budget of 5 reports/hour shared by every
+  // instance; at 3 clients the game auto-hides.
   app.post(`${apiPrefix}/games/:id/report`, async (req, res) => {
     try {
-      await registry.ensureFresh();
-      const ip = clientIp(req);
-      if (!reportLimiter.allow(`report:${ip}`)) {
+      const client = clientId(clientIp(req), clientKey);
+      if (!(await registry.allowRequest('report', client))) {
         res.status(429).json({ error: 'too many reports' });
         return;
       }
-      const record = await registry.report(req.params.id);
-      res.json({ ok: true, hidden: record.hidden });
+      const { record, counted } = await registry.report(req.params.id, client);
+      res.json({ ok: true, hidden: record.hidden, counted });
     } catch (err) {
       sendHttpError(res, err);
     }
   });
 
-  // First-load probe result from a real TV. Only counts if a live lobby with the
-  // given slug is currently playing this game — otherwise 202-ignored, which
-  // prevents drive-by probe spoofing of an arbitrary game's health.
+  // First-load probe result from a real TV. It counts only when it comes from
+  // the host screen (its id and the token it joined with) of a lobby that is
+  // playing this game right now, read from the store so a TV whose request
+  // lands on another instance counts too, and only once per game session.
+  // Anything else is acknowledged as not counted (202), which stops drive-by
+  // probe spoofing of an arbitrary game's health; the per-client budget stops
+  // floods, and failures count once per client (see registry.probeResult).
   app.post(`${apiPrefix}/games/:id/probe-result`, async (req, res) => {
     try {
-      await registry.ensureFresh();
+      const gameId = req.params.id;
       const slug = String(req.body?.slug ?? '').toUpperCase();
       const ok = req.body?.ok === true;
-      if (!isLiveLobbyPlaying(slug, req.params.id)) {
+      const client = clientId(clientIp(req), clientKey);
+      if (!(await registry.allowRequest('probe', client))) {
+        res.status(429).json({ error: 'too many probe results' });
+        return;
+      }
+      if (slug) await hydrateLobby(slug);
+      const sessionId = slug ? probedSession(slug, gameId, req.body?.screenId, req.body?.screenToken) : null;
+      if (!sessionId || !(await registry.claimProbe(gameId, sessionId))) {
         res.status(202).json({ ok: true, counted: false });
         return;
       }
-      const record = await registry.probeResult(req.params.id, ok);
+      const record = await registry.probeResult(gameId, ok, client);
       res.json({ ok: true, counted: true, status: record.probe.status });
     } catch (err) {
       sendHttpError(res, err);
@@ -346,7 +322,6 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   app.post(`${apiPrefix}/admin/games/:id/takedown`, async (req, res) => {
     try {
       if (!requireAdmin(req, res)) return;
-      await registry.ensureFresh();
       const record = await registry.setHidden(req.params.id, true);
       res.json({ game: adminGameView(record) });
     } catch (err) {
@@ -354,10 +329,11 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
     }
   });
 
+  // A restore also clears the reports and probe failures (see setHidden), so
+  // a game delisted by them really comes back.
   app.post(`${apiPrefix}/admin/games/:id/restore`, async (req, res) => {
     try {
       if (!requireAdmin(req, res)) return;
-      await registry.ensureFresh();
       const record = await registry.setHidden(req.params.id, false);
       res.json({ game: adminGameView(record) });
     } catch (err) {
@@ -368,7 +344,6 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   app.post(`${apiPrefix}/admin/games/:id/feature`, async (req, res) => {
     try {
       if (!requireAdmin(req, res)) return;
-      await registry.ensureFresh();
       const featured = req.body?.featured === true;
       const record = await registry.setFeatured(req.params.id, featured);
       res.json({ game: adminGameView(record) });
@@ -953,17 +928,23 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
     }
   }
 
-  // True when a non-expired lobby with this slug is currently playing gameId.
-  // Gates probe-result so a report only counts against a game someone is actually
-  // running — a drive-by POST for an idle game is ignored.
-  function isLiveLobbyPlaying(slug: string, gameId: string): boolean {
-    if (!slug) return false;
+  // The session id of gameId running in this lobby (already hydrated) when the
+  // caller is its host screen, else null. Gates probe-result so a result only
+  // counts against a game someone is actually running, from the TV running it.
+  // A lobby that lists no screen (its TVs joined without a screen id) has no
+  // host screen to ask for, so there any caller passes, as in isHostScreen.
+  function probedSession(slug: string, gameId: string, screenId: unknown, screenToken: unknown): string | null {
+    let lobby: LobbyRecord;
     try {
-      const lobby = store.getLobby(slug);
-      return lobby.state === 'playing' && lobby.currentGameId === gameId;
+      lobby = store.getLobby(slug);
     } catch {
-      return false;
+      return null;
     }
+    const session = lobby.gameSession;
+    if (lobby.state !== 'playing' || lobby.currentGameId !== gameId || session?.gameId !== gameId) return null;
+    const host = hostScreenId(lobby);
+    if (host !== null && (screenId !== host || !store.screenTokenMatches(slug, host, screenToken))) return null;
+    return session.id;
   }
 
   // Stamp the game event a change made (if it made one) with a monotonic seq

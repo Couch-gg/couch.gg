@@ -839,6 +839,12 @@ export class LobbyStore {
     return { screenId: id, changed: !listed || !!minted || present, screenToken: minted };
   }
 
+  // Whether `token` is the secret this screen id was bound to on its first join.
+  screenTokenMatches(slug: string, screenId: string, token: unknown): boolean {
+    const bound = this.getLobby(slug).screenSecrets[screenId];
+    return !!bound && typeof token === 'string' && sameHash(hashScreenToken(token), bound.hash);
+  }
+
   // The socket a screen joined with dropped. Only its latest socket counts: a
   // TV that already joined again (here or on another instance) stays as it
   // is. Returns whether the record changed.
