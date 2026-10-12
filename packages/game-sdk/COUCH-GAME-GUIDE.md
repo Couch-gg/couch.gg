@@ -100,8 +100,10 @@ non-negotiable, and it has hard consequences:
 
    You can avoid the fetch entirely by inlining the manifest as a JS object and
    passing it straight to `CouchSDK.init({ manifest })` — the SDK never fetches
-   it for you. The starter template fetches it (with the CORS note) to keep one
-   source of truth, but inlining is a valid choice.
+   it for you. The quick start below does that. The starter template fetches
+   `couch.game.json` (with the CORS note) to keep one source of truth, and falls
+   back to a copy inside `index.html` when the fetch fails, because browsers
+   refuse `fetch()` on a page opened from disk (`file://`).
 
 5. **Autoplay audio is allowed** (`allow="autoplay"`), but start muted or on the
    first input to respect browser policies.
@@ -119,8 +121,15 @@ skeleton:
 <body>
   <script src="https://couch-gg.vercel.app/sdk/v1/couch-sdk.js"></script>
   <script>
+    // Inlined, not fetched, so the page also runs when opened from disk
+    // (browsers refuse fetch() on file://). Keep it in step with couch.game.json.
+    const manifest = {
+      id: 'tap-race', title: 'Tap Race', description: 'First to 30 taps wins.',
+      minPlayers: 1, maxPlayers: 8, aspectRatio: '16:9', estimatedDurationMinutes: 2,
+      controllerLayout: { kind: 'generic-buttons', controls: [{ control: 'tap', type: 'button', label: 'TAP!' }] },
+      entryUrl: 'https://your-host.example.com/index.html', sdkProtocol: 1
+    };
     async function main() {
-      const manifest = await (await fetch('./couch.game.json')).json();
       const couch = await CouchSDK.init({
         manifest,
         onInput(input) {
@@ -128,9 +137,10 @@ skeleton:
           console.log(input.playerId, 'pressed', input.control);
         },
         onPlayersChanged(players) {
-          console.log('roster:', players.map((p) => p.name));
+          console.log('roster now:', players.map((p) => p.name));
         }
       });
+      console.log('starting roster:', couch.players.map((p) => p.name));
       // ... render your game using couch.players, couch.seed, etc.
     }
     main();
@@ -141,10 +151,16 @@ skeleton:
 
 `CouchSDK.init` **resolves when the platform host has finished the handshake**
 (embedded) or **immediately with the built-in dev simulator** (when you open the
-file directly at top level). It never rejects — the host owns timeout UX.
+file directly at top level). It never rejects — the host owns timeout UX. In an
+iframe that no couch.gg host answers (an online code playground, an AI chat's
+preview pane), it waits about 10 seconds for one, logs a warning and then starts
+the dev simulator inside that frame.
 
 The SDK global is `CouchSDK` (an IIFE bundle). The URL
-`https://couch-gg.vercel.app/sdk/v1/couch-sdk.js` is stable.
+`https://couch-gg.vercel.app/sdk/v1/couch-sdk.js` is stable: `/sdk/v1/` is
+updated in place with backward-compatible changes, so a game that hot-links it
+gets SDK fixes without redeploying. A copy you download and serve yourself stays
+at the version you copied.
 
 ---
 
@@ -168,6 +184,8 @@ interface CouchInitOptions {
 ```
 
 The convenience callbacks are exactly equivalent to subscribing via `couch.on(...)`.
+Like every event, they only report what happens after `init` resolves: the
+starting roster is `couch.players`, not an `onPlayersChanged` call.
 
 ### 4.2 The `CouchGame` handle
 
@@ -185,9 +203,13 @@ interface CouchGame {
   readonly reducedMotion: boolean;   // true if the player prefers reduced motion — honour it
   readonly manifest: CouchManifest;  // the manifest the host echoed back (may be enriched)
   readonly lastSeq: number;          // highest input seq seen so far, or -1 before any input
+  readonly screen: { id: string | null; isHost: boolean }; // this TV (section 6, host mode)
+  readonly localPlayers: CouchPlayer[]; // players sitting at this screen
 
   on<E>(event: E, cb: (payload) => void): () => void;  // returns an unsubscribe fn
   gameOver(scores: CouchScore[] | Record<string, number>): void;  // call ONCE
+  setController(playerId: string, patch: CouchControllerPatch): void;  // section 4.6
+  broadcast(state: unknown): void;   // host screen only (section 6, host mode)
 }
 ```
 
@@ -210,11 +232,13 @@ interface CouchGame {
 | Event            | Payload                        | When |
 |------------------|--------------------------------|------|
 | `input`          | `CouchInputEnvelope`           | A player used a control. |
-| `playersChanged` | `CouchPlayer[]` (full roster)  | Any join/leave/rename/connect change. |
+| `playersChanged` | `CouchPlayer[]` (full roster)  | Any join/leave/rename/connect change after init. Not fired for the starting roster: read `couch.players` once `init` resolves. |
 | `pause`          | `{ reason: string }`           | Host tab hidden (`reason: 'host-hidden'`). |
 | `resume`         | `void`                         | Host tab visible again. |
-| `abort`          | `{ reason: string }`           | Session torn down (`reason: 'host-unmounted'`). |
+| `abort`          | `{ reason: string }`           | Session torn down (`reason: 'host-unmounted'`), once, as your frame is removed (section 8). |
 | `latency`        | `CouchLatency`                 | New measurement from the host screen (section 6). |
+| `state`          | `{ epoch, seq, at, state }`    | Non-host screens: a snapshot from the host screen (section 6). |
+| `screenChanged`  | `{ id, isHost }`               | This screen became (or stopped being) the host screen. |
 
 ```ts
 const off = couch.on('input', (e) => { /* ... */ });
@@ -223,6 +247,12 @@ const off = couch.on('input', (e) => { /* ... */ });
 
 Note: `pause`/`resume`/`abort` have no convenience-callback slot except pause and
 resume — subscribe to `abort` explicitly via `on('abort', ...)` if you need it.
+
+A listener that throws does not stop the other listeners of that event. Its
+error is logged with `console.error` and still reported as an uncaught error,
+so your `window` `error` handler and error trackers see it. `on()` with an event
+name this SDK doesn't know logs a warning and returns an unsubscribe function
+that does nothing.
 
 ### 4.4 Types
 
@@ -236,7 +266,7 @@ interface CouchPlayer {
 
 interface CouchInputEnvelope {
   seq: number;        // monotonic per-lobby sequence — host guarantees strict order
-  at: number;         // host-clock timestamp in MILLISECONDS
+  at: number;         // ms since epoch when the realtime SERVER accepted it — for intervals between inputs; order by `seq`
   playerId: string;   // authoritative; derived server-side from the player's token
   control: string;    // matches a manifest controllerLayout.controls[].control
   action: 'press' | 'release' | 'change';
@@ -257,8 +287,52 @@ couch.gameOver({ p1: 30, p2: 12 });
 - Both forms are accepted; the record form is normalised to the array form
   (`playerId` string, `score` number).
 - **Call it exactly once.** A second call logs a warning and is ignored.
+- In a remote couch only the host screen's `gameOver` ends the round; a
+  non-host screen's call waits and only counts if that screen becomes the host
+  while the round is still running. So make sure the host screen calls it.
 - After this, the platform shows your winner screen for ~5 seconds, then returns
   to the catalog (section 9).
+
+### 4.6 `setController` — talk back to a player's phone
+
+Every phone starts with the labels from your manifest. When players have
+different roles, tell each phone what its buttons do:
+
+```ts
+// Co-op: the knight blocks and bashes, the ranger fires and rolls.
+couch.setController(knight.id, { labels: { a: 'SHIELD', b: 'BASH' } });
+couch.setController(ranger.id, { labels: { a: 'FIRE', b: 'ROLL' } });
+
+// After BASH: grey it out for 3 s and buzz the phone.
+couch.setController(knight.id, { cooldowns: { b: 3000 }, vibrate: 60 });
+
+// Out of arrows: disable FIRE until further notice; [] re-enables everything.
+couch.setController(ranger.id, { disabled: ['a'] });
+```
+
+| Field | Type | Behaviour |
+|-------|------|-----------|
+| `labels` | `Record<control, string>` | Replaces this player's labels (1–16 chars each). Persists until you change it. |
+| `disabled` | `control[]` | Replaces the set of greyed-out controls. Persists. |
+| `cooldowns` | `Record<control, ms>` | Starts a cooldown now (≤ 60 000 ms); the button drains and ignores presses until it ends. One-shot. |
+| `vibrate` | `ms` or `ms[]` | Vibrates once (≤ 10 steps of ≤ 1000 ms), where the phone supports it. One-shot. |
+
+- Omitted fields keep their current value; control names must be ones your
+  manifest declares, or the platform rejects the patch (the reason is logged in
+  the TV's console).
+- A control that becomes disabled while held sends its `release`, so you never
+  get a stuck input from it.
+- Everything resets when a new round starts. In the dev simulator the fake
+  phones show labels, disabled controls and cooldowns too.
+- The dev simulator and the `/dev` test harness check each patch with the same
+  rules as the platform (known control names, labels 1–16 characters, the limits
+  in the table, a player id from `couch.players`). A patch that breaks one is
+  rejected whole, and the reason shows in the browser console (simulator) or
+  under the test stage (`/dev`).
+- Budget: about 20 updates per second per lobby. Send changes, not every frame.
+- In a remote couch every screen may run your code; the platform only forwards
+  the host screen's `setController` calls (`couch.screen.isHost`), so each one
+  reaches the phone once.
 
 ---
 
@@ -284,6 +358,8 @@ envelope is exactly the `data` object shown:
 | `hold`   | `press`, then repeated `change`, then `release` | `change` → `{ progress }` (0–1); `release` → `{ heldMs }` |
 | `slider` | repeated `change` while dragging, plus a final `change` on release | `{ value }` (a number, snapped to `min`/`max`/`step`) |
 | `select` | `change` on each tap          | `{ value }` (the chosen option string) |
+| `stick`  | repeated `change` while the thumb moves, then `release` | `change` → `{ x, y }` (each -1..1, y is up); `release` → `{ x: 0, y: 0 }` |
+| `dpad`   | `change` each time the direction changes, then `release` | `change` → `{ dir }` (`'up'`, `'up-right'`, `'right'`, `'down-right'`, `'down'`, `'down-left'`, `'left'`, `'up-left'`); `release` → `{ dir: 'none' }` (thumb lifted or back in the centre) |
 
 Cadence details (so you know how often events arrive):
 
@@ -294,18 +370,42 @@ Cadence details (so you know how often events arrive):
   even if it was coalesced away. So the last value is authoritative.
 - **button**: `press` on pointer-down, `release` on pointer-up/leave.
 - **select**: one `change` per tap with the picked option.
+- **stick**: `change` at most every **~66 ms** (about 15/s), only when the
+  position moved; the thumb lifting always sends `release` at rest.
+- **dpad**: one `change` per new direction, never repeats while held. If the
+  rate limit drops a change, the previous direction stays in effect until the
+  phone's resend lands (see below), the next direction change, or the release.
+
+If the rate limit drops a `change` (stick, d-pad, slider, hold), the phone
+resends it about **100 ms** later as long as it is still that control's newest
+value, so a held position catches up instead of staying stale until the next
+move. The release of a held control is never dropped by the rate limit, and the
+phone releases every held control when it is locked, backgrounded or loses
+focus. A `release` is always the last thing you get for a control the player let
+go of.
+
+**Layout hint.** Set `controllerLayout.orientation: 'landscape'` for action
+games: the phone then shows a left and a right thumb zone. Sticks and d-pads go
+left and everything else right, unless a control sets `zone: 'left' | 'right'`.
 
 The dev simulator emits the **same** shapes, so what you test locally matches
-production.
+production — from its fake phones and from the keyboard alike.
 
 ### 5.3 Ordering and timestamps
 
 - `seq` is a **strict monotonic per-lobby** counter. The host guarantees order.
-  Use it to break ties or to ignore stale inputs; `couch.lastSeq` tracks the
-  latest.
-- `at` is a **millisecond** timestamp on the host clock. (The wire format inside
-  the platform is an ISO string, but the SDK hands you a number — do not
-  re-parse it.)
+  It is the order the platform accepted the inputs in, so use it to see who
+  buzzed first, to break ties or to ignore stale inputs; `couch.lastSeq` tracks
+  the latest.
+- `at` is a **millisecond** timestamp (ms since epoch) taken by the realtime
+  **server** when it accepted the input. (The wire format inside the platform is
+  an ISO string, but the SDK hands you a number — do not re-parse it.) Use it for
+  the time between inputs: reaction times, double-tap timing. Not for their
+  order: it comes from whichever server instance took the input, and their
+  clocks can differ slightly, so two close inputs can carry `at` values in the
+  opposite order of their `seq`. Compare it only with other inputs' `at`;
+  `at - Date.now()` on the big screen is off by however far that screen's clock
+  is from the server's. In the dev simulator it is the local clock.
 - `playerId` is authoritative and server-derived. Never trust a client-supplied
   player id; use the envelope's `playerId`.
 
@@ -337,9 +437,10 @@ couch.on('latency', (l) => { if (l.measuredTier === 'remote') showLagHint(); });
 Inputs are pushed to every screen over a socket. In production the server runs
 on several serverless instances and shares pushes between them over Redis
 pub/sub, so a phone and a TV on different instances still get socket delivery.
-Every input is also written to an ordered log that screens poll every 750 ms;
-that poll is the fallback when a push is lost, and `transport: 'poll'` tells you
-you are running on it.
+Every input is also written to an ordered log that screens poll: every 750 ms,
+or every 5 s while their socket is up and pushes reach every instance, with an
+extra poll as soon as a seq goes missing. That poll is the fallback when a push
+is lost, and `transport: 'poll'` tells you you are running on it.
 
 ### The `supportsRemote: true` contract
 
@@ -356,6 +457,57 @@ If you set `supportsRemote: true` in your manifest, you are promising your game 
 - **No wall-clock dependence for game logic.** Do not branch on `Date.now()` or
   animation-frame timing for anything that determines the result. Use `seq`
   ordering and the seed.
+
+### Host-authoritative mode (action games in a remote couch)
+
+Determinism is the only way to run a game on several screens if every screen
+simulates. An action game can instead let **one** screen simulate and the others
+just draw what it sends:
+
+```ts
+const couch = await CouchSDK.init({ manifest });
+
+// Register both roles up front and ask couch.screen.isHost every time: the
+// host role can move to this screen (or away from it) mid-game.
+couch.on('input', (e) => {
+  if (couch.screen.isHost) applyInput(e); // non-host screens get inputs too: ignore them
+});
+couch.on('state', ({ state }) => {
+  if (couch.screen.isHost) return;
+  adopt(state); // keep the latest snapshot, so a promoted screen continues from it
+  render(state);
+});
+setInterval(() => {
+  if (!couch.screen.isHost) return;
+  step(); // simulate everything from every player's inputs
+  render(snapshot());
+  couch.broadcast(snapshot()); // ≤ 32 KB, ≤ 30 per second
+}, 33);
+
+// Who sits in front of this screen (split-screen, camera follow, HUD):
+const mine = couch.localPlayers;
+```
+
+- `couch.screen` is `{ id, isHost }`. Exactly one screen per lobby is the host:
+  the screen the host player scanned, else the first screen that opened the
+  lobby. On a local couch it is the only screen. If the host moves (the host
+  player re-scans another TV, or the host TV goes away for good), you get
+  `on('screenChanged', screen)`, and a newly promoted host continues from the
+  last state it adopted. That is why the example checks `isHost` on every tick
+  instead of branching once at start-up.
+- Every player carries `screenId`: the TV whose QR code they scanned (`null` if
+  they joined by invite link). `couch.localPlayers` filters to this screen.
+- `on('state')` gets `{ epoch, seq, at, state }`; older or duplicate snapshots
+  are dropped for you. `epoch` changes when the host's game starts over (its TV
+  reloaded, or another screen became the host) and `seq` restarts with it. The
+  host never receives its own broadcast. Broadcasts are not stored: a screen
+  that joins late gets the next one. `broadcast()` on a non-host screen does
+  nothing (it warns once in the console).
+- Latency is one hop from the host screen through the server to the others,
+  so the non-host screens see the game slightly behind the host. Inputs from
+  players at a non-host screen travel phone → server → host screen first.
+- Set `supportsRemote: true` when your game handles both roles; you don't have
+  to be deterministic in this mode.
 
 If your game needs twitch timing, **omit `supportsRemote`** (or set it `false`).
 The platform will then refuse to select your game in a remote lobby (it throws
@@ -382,7 +534,9 @@ numeric string is a type error, not a number. Strings are trimmed.
 | `controllerLayout.kind` | string | Must be exactly `'generic-buttons'`. |
 | `controllerLayout.controls` | array | 1–12 controls. |
 | `controls[].control` | string | Matches `^[a-z0-9._-]{1,32}$`. Unique within the layout. |
-| `controls[].type` | string | One of `button` \| `hold` \| `slider` \| `select`. |
+| `controllerLayout.orientation` | string | Optional. `'portrait'` (default) or `'landscape'`. |
+| `controls[].type` | string | One of `button` \| `hold` \| `slider` \| `select` \| `stick` \| `dpad`. |
+| `controls[].zone` | string | Optional. `'left'` or `'right'` (used by landscape layouts). |
 | `controls[].label` | string | 1–16 chars after trim. |
 | `controls[].min` / `max` | number | **Required for `slider`.** `min < max`. |
 | `controls[].step` | number | Optional for `slider`; if present, `> 0`. |
@@ -390,9 +544,9 @@ numeric string is a type error, not a number. Strings are trimmed.
 | `aspectRatio` | string | `'16:9'` or `'4:3'`. |
 | `estimatedDurationMinutes` | integer | 1–60. |
 | `thumbnail.kind` | string | Must be `'css'`. |
-| `thumbnail.gradient` | string | 1–120 chars (a CSS gradient string). |
-| `thumbnail.icon` | string | 1–40 chars (an icon name). |
-| `thumbnail.accent` | string | Optional. |
+| `thumbnail.gradient` | string | 1–120 chars: one CSS `linear-`, `radial-` or `conic-gradient(...)` of colors, angles and stops. See 7.5. |
+| `thumbnail.icon` | string | One of the catalog icon names in 7.5 (case-insensitive). |
+| `thumbnail.accent` | string | Optional. The icon color: a hex color, a color name or an `rgb()`/`hsl()` color. |
 | `entryUrl` | string | See 7.2. |
 | `sdkProtocol` | number | Must be exactly `1`. |
 | `supportsRemote` | boolean | Optional; must be a boolean if present. See section 6. |
@@ -452,12 +606,44 @@ s, c, l, j, new, test
 `origin`, `status`, and `publishedAt` are stamped by the server on publish — do
 **not** include them yourself.
 
+### 7.5 Thumbnail icons and gradients
+
+Your catalog card is drawn on every TV and phone in the lobby, so the thumbnail
+only accepts known values.
+
+`thumbnail.icon` must be one of these names. Case and hyphens don't matter
+(`Gamepad2`, `gamepad2` and `gamepad-2` are the same icon):
+
+```
+atom, bike, bird, blocks, bomb, bot, brain, brush, bug, cake, car, castle,
+cat, coins, compass, crosshair, crown, dice5, dices, dog, drum, fish, flag,
+flame, gamepad, gamepad2, gem, ghost, globe, guitar, heart, joystick, key,
+laugh, lightbulb, magnet, map, medal, mic, moon, mountain, music, orbit,
+palette, partypopper, pencil, pizza, plane, puzzle, rabbit, rocket, shapes,
+shield, ship, skull, smile, snowflake, sparkles, star, sun, sword, swords,
+target, timer, trophy, turtle, wandsparkles, zap
+```
+
+`thumbnail.gradient` must be a single `linear-gradient(...)`,
+`radial-gradient(...)` or `conic-gradient(...)` (a `repeating-` one works too)
+built from colors, angles, positions and stops. Inside it, only the color
+functions `rgb()`, `rgba()`, `hsl()`, `hsla()`, `hwb()`, `lab()`, `lch()`,
+`oklab()` and `oklch()` are allowed: no `url()`, `image-set()`, `var()`, quotes
+or backslashes, and nothing after the closing parenthesis.
+
+Submitting or updating a manifest that breaks these rules fails with a 422. A
+game published before these rules keeps its catalog card, drawn with the
+`gamepad2` icon and a plain gradient in place of the values that aren't allowed.
+
 ---
 
 ## 8. Player lifecycle
 
-- **1–8 players**, bounded by your `minPlayers`/`maxPlayers`. The platform will
-  not start below `minPlayers` and will not admit above `maxPlayers`.
+- **1–8 players**, bounded by your `minPlayers`/`maxPlayers`. The host can start
+  your game once `minPlayers` players have joined, and the platform will not
+  admit more than `maxPlayers`.
+- The starting roster is `couch.players` when `init` resolves; `playersChanged`
+  does not fire for it.
 - Players **join and leave mid-game**. You are notified via `playersChanged`
   (full roster) every time the roster changes. Re-read `couch.players` or use the
   payload — do not assume the roster you saw at init is final.
@@ -467,13 +653,16 @@ s, c, l, j, new, test
 - **`pause` / `resume`**: the host fires `pause` (`reason: 'host-hidden'`) when
   the big-screen tab is backgrounded and `resume` when it returns. Pause your
   animation loop and timers so nothing advances while nobody can see it.
-- **`abort`** (`reason: 'host-unmounted'`) fires when the session is torn down
-  (lobby closed, game switched). Stop everything; do not call `gameOver` after an
-  abort.
+- **`abort`** (`reason: 'host-unmounted'`) fires once when the session is torn
+  down (lobby closed, game switched, or the stage closing after your game-over
+  screen). Stop everything; do not call `gameOver` after an abort. The SDK fires
+  it from your page's `pagehide` as the frame is removed, so keep the handler
+  short and synchronous: timers or requests it starts may never complete.
 
 Design guidance: key every bit of per-player state off `player.id` (never array
 index — indices shift when someone leaves). Handle a player count of 1 gracefully
-(solo play against the clock or a target), since `minPlayers` can be 1.
+(solo play against the clock or a target): with `minPlayers: 1` the host can
+start alone, and in any game the others can leave until one player remains.
 
 ---
 
@@ -499,16 +688,21 @@ after `gameOver` — the controllers move on. Highest `score` wins by convention
 
 From `rate-limit.ts`, `lobbies.ts`, and `GameHostStage.tsx`:
 
-- **Per-player input rate**: token bucket, capacity **20** (burst), refill **10
+- **Per-player input rate**: token bucket, capacity **40** (burst), refill **20
   tokens/second**. Inputs beyond this from one player are silently dropped
-  (not an error) — the controller stream stays healthy.
-- **Per-lobby aggregate input rate**: capacity **60** (burst), refill **30
-  tokens/second** across all players.
+  (not an error) — the controller stream stays healthy. The `release` of a
+  control the phone is holding is exempt and always delivered.
+- **Per-lobby aggregate input rate**: capacity **320** (burst), refill **160
+  tokens/second** across all players (the per-player budget times 8 players).
 - **Input `value` size**: the `data` payload is JSON-encoded and capped at
   **1024 bytes**; larger is rejected with a 413. Keep control values tiny (a
   number, a short string).
 - **Inbound message size (game → host)**: messages you post to the host are
   capped at **8192 bytes** (serialized); oversized messages are dropped.
+- **State broadcasts (`broadcast`)**: **32 KB** per snapshot, **30 per second**
+  sustained per lobby (burst 60); extra snapshots are dropped.
+- **Controller updates (`setController`)**: capacity **40**, refill **20 per
+  second** per lobby; extra updates are dropped.
 - **Inbound message rate (game → host)**: **60 messages per rolling second**;
   beyond that they are dropped.
 - **Handshake / ready timeout**: **15 seconds**. If the host does not receive
@@ -519,7 +713,7 @@ From `rate-limit.ts`, `lobbies.ts`, and `GameHostStage.tsx`:
 
 These are per serverless instance; do not treat them as a hard global quota, but
 do design well within them. For a mash game, sending one `press` per tap is far
-under 10/s per player in practice.
+under 20/s per player in practice.
 
 ---
 
@@ -535,11 +729,32 @@ server) so it runs **at the top level** (not inside an iframe). Because
 overlay with fake phones, add/remove-player buttons, pause/resume, and a seed
 box. `CouchSDK.init` resolves immediately with `mode: 'dev'`.
 
-- The simulator seeds **2 fake players** and renders one fake phone per player
-  with your declared controls.
+Browsers refuse `fetch()` on a page opened from disk, so a game that fetches
+`couch.game.json` stays blank there. Inline the manifest (as the quick start
+does), fall back to an inline copy when the fetch fails (as the starter
+template does), or serve the folder with any static server (`npx serve .`).
+
+Inside an iframe that is not a couch.gg screen (an online playground, an AI
+chat's preview), the SDK first waits about 10 seconds for a couch.gg host, then
+logs a warning and starts the same simulator in the frame. Open the page
+top-level to skip the wait.
+
+- The simulator starts with **2 fake players** (in `couch.players` when `init`
+  resolves) and renders one fake phone per player with your declared controls.
 - Player 1 also takes **keyboard** input: number keys `1`–`9` press the Nth
   button/hold control, `Space` holds the first hold control, `Arrow Up/Down`
-  nudge the first slider.
+  nudge the first slider, `W`/`A`/`S`/`D` steer the first stick or d-pad. A
+  hold sends the same `change` ticks and `release` `{ heldMs }` from the
+  keyboard as from its fake phone.
+- As on a phone, a held control is released the moment `setController`
+  disables it or starts its cooldown, and everything held is released when the
+  window loses focus or is hidden. A key still down after that must be let go
+  and pressed again.
+- The seed box: type a seed and press Enter to set `couch.seed`. Your game sees
+  it the next time it reads `couch.seed` (e.g. when it starts a new round);
+  reload for a new random seed.
+- `couch.setController` is checked as on the platform (section 4.6): a patch the
+  platform would reject logs the reason with `console.error` and changes nothing.
 - Calling `couch.gameOver(scores)` shows a game-over toast in the simulator.
 
 This is the fastest loop and the one your coding agent should use to iterate.
@@ -633,7 +848,8 @@ So the practical rule: keep your `entryUrl` live and make sure `init()` reaches
       manifest).
 - [ ] No `localStorage` / `cookie` / `alert` / `window.open` anywhere.
 - [ ] All per-player state keyed off `player.id`.
-- [ ] `playersChanged` handled (join/leave mid-game).
+- [ ] The starting roster is drawn from `couch.players` after `init`, and
+      `playersChanged` handled (join/leave mid-game).
 - [ ] A winner/results screen is drawn, and it reads well for ~5 s after
       `gameOver`.
 - [ ] `gameOver(scores)` called exactly once, higher score = better.
@@ -649,6 +865,13 @@ So the practical rule: keep your `entryUrl` live and make sure `init()` reaches
   `Access-Control-Allow-Origin: *`.
   Fix: add the wildcard CORS header (section 2), or inline the manifest and skip
   the fetch.
+
+- **Blank page when you open `index.html` from disk; the console says the `file`
+  URL scheme is not supported (Chrome/Edge) or "CORS request not HTTP" (Firefox).**
+  Cause: browsers refuse `fetch()` on `file://` pages, so fetching
+  `couch.game.json` throws before `CouchSDK.init` runs.
+  Fix: inline the manifest, fall back to an inline copy (the starter template
+  does), or serve the folder with a static server (`npx serve .`).
 
 - **Game throws immediately, often `SecurityError`.**
   Cause: something touched `localStorage` / `sessionStorage` / `document.cookie`

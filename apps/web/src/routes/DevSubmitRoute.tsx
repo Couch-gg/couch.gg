@@ -8,6 +8,7 @@ import type {
   Player
 } from '@couch/types';
 import { validateExternalManifestInput, type ExternalManifestInput } from '@couch/game-runtime';
+import { checkControllerPatch } from '@couch/game-sdk';
 import { GameHostStage, type GameHostStageHandle, type GameHostEvent } from '../components/GameHostStage.js';
 import { GenericController } from '../components/GenericController.js';
 import { deleteGame, submitGame, updateGame } from '../gamesApi.js';
@@ -115,6 +116,7 @@ export function DevSubmitRoute({ navigate }: { navigate: (to: string) => void })
   const [handshake, setHandshake] = useState<HandshakeStatus>('idle');
   const [handshakeError, setHandshakeError] = useState<string | null>(null);
   const [gameOverScores, setGameOverScores] = useState<Array<{ playerId: string; score: number }> | null>(null);
+  const [controllerError, setControllerError] = useState<string | null>(null);
 
   const [publishing, setPublishing] = useState(false);
   const [publishError, setPublishError] = useState<string | null>(null);
@@ -181,6 +183,7 @@ export function DevSubmitRoute({ navigate }: { navigate: (to: string) => void })
     setHandshake('waiting');
     setHandshakeError(null);
     setGameOverScores(null);
+    setControllerError(null);
     setTesting(true);
   };
 
@@ -189,6 +192,7 @@ export function DevSubmitRoute({ navigate }: { navigate: (to: string) => void })
     setHandshake('idle');
     setHandshakeError(null);
     setGameOverScores(null);
+    setControllerError(null);
   };
 
   const onStageEvent = useCallback((event: GameHostEvent) => {
@@ -200,8 +204,18 @@ export function DevSubmitRoute({ navigate }: { navigate: (to: string) => void })
     } else if (event.kind === 'gameOver') {
       const detail = event.detail as { scores?: Array<{ playerId: string; score: number }> } | undefined;
       setGameOverScores(detail?.scores ?? []);
+    } else if (event.kind === 'controller') {
+      // No phones here, so nothing reaches the server that would reject a bad
+      // couch.setController patch. Check it with the same rules instead, so
+      // the creator learns why before a live couch drops it. The line shows
+      // the latest patch only: a good one clears an earlier rejection.
+      const { playerId, patch } = event.detail as { playerId: string; patch: unknown };
+      const checked = checkControllerPatch(patch, testManifest?.controllerLayout.controls.map((c) => c.control) ?? []);
+      if (!FAKE_PLAYERS.some((p) => p.id === playerId)) setControllerError(`no player "${playerId}"`);
+      else if (!checked.ok) setControllerError(checked.error);
+      else setControllerError(null);
     }
-  }, []);
+  }, [testManifest]);
 
   const sendFakeInput = useCallback((playerId: string, control: string, action: InputAction, data?: unknown) => {
     seqRef.current += 1;
@@ -567,6 +581,11 @@ export function DevSubmitRoute({ navigate }: { navigate: (to: string) => void })
         {testing && handshakeLine && (
           <p className={handshake === 'error' ? 'error-line' : handshake === 'ready' ? 'dev-valid-line' : 'dev-hint'}>
             {handshakeLine}
+          </p>
+        )}
+        {testing && controllerError && (
+          <p className="error-line">
+            setController rejected: {controllerError}. A live couch rejects the whole patch.
           </p>
         )}
         {testing && gameOverScores && (

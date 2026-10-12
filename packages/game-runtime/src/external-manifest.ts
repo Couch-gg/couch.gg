@@ -10,6 +10,8 @@
 // correct up front — there is NO coercion (a numeric string is a type error, not
 // a number). The returned value is normalized: strings are trimmed.
 
+import { isSafeThumbnailAccent, isSafeThumbnailGradient, thumbnailIconName } from './thumbnail.js';
+
 // Slugs a creator may not claim: the built-in games plus reserved route/API
 // segments that would collide with platform paths.
 export const RESERVED_GAME_IDS: readonly string[] = [
@@ -42,10 +44,12 @@ export interface ExternalManifestInput {
   maxPlayers: number;
   controllerLayout: {
     kind: 'generic-buttons';
+    orientation?: 'portrait' | 'landscape';
     controls: Array<{
       control: string;
-      type: 'button' | 'hold' | 'slider' | 'select';
+      type: 'button' | 'hold' | 'slider' | 'select' | 'stick' | 'dpad';
       label: string;
+      zone?: 'left' | 'right';
       min?: number;
       max?: number;
       step?: number;
@@ -72,7 +76,9 @@ export type ValidateExternalManifestResult =
 
 const ID_RE = /^[a-z0-9][a-z0-9-]{2,31}$/;
 const CONTROL_NAME_RE = /^[a-z0-9._-]{1,32}$/;
-const CONTROL_TYPES = ['button', 'hold', 'slider', 'select'] as const;
+const CONTROL_TYPES = ['button', 'hold', 'slider', 'select', 'stick', 'dpad'] as const;
+const ZONES = ['left', 'right'] as const;
+const ORIENTATIONS = ['portrait', 'landscape'] as const;
 const ASPECT_RATIOS = ['16:9', '4:3'] as const;
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -213,6 +219,9 @@ export function validateExternalManifestInput(
     if (layout.kind !== 'generic-buttons') {
       errors.push("controllerLayout.kind must be 'generic-buttons'");
     }
+    if (layout.orientation !== undefined && !(ORIENTATIONS as readonly unknown[]).includes(layout.orientation)) {
+      errors.push("controllerLayout.orientation must be 'portrait' or 'landscape' when present");
+    }
     const controls = layout.controls;
     if (!Array.isArray(controls)) {
       errors.push('controllerLayout.controls must be an array');
@@ -233,6 +242,10 @@ export function validateExternalManifestInput(
           const name = ctrl.control;
           if (!CONTROL_NAME_RE.test(name)) {
             errors.push(`controllerLayout.controls[${i}].control must match /^[a-z0-9._-]{1,32}$/`);
+          } else if (name in Object.prototype) {
+            // 'constructor' / '__proto__' would read through every plain-object
+            // lookup keyed by control name (labels, cooldowns) on the phone.
+            errors.push(`controllerLayout.controls[${i}].control "${name}" is reserved`);
           } else if (seenNames.has(name)) {
             errors.push(`controllerLayout.controls[${i}].control "${name}" is duplicated`);
           } else {
@@ -243,7 +256,10 @@ export function validateExternalManifestInput(
         const type = ctrl.type;
         const typeOk = typeof type === 'string' && (CONTROL_TYPES as readonly string[]).includes(type);
         if (!typeOk) {
-          errors.push(`controllerLayout.controls[${i}].type must be one of button|hold|slider|select`);
+          errors.push(`controllerLayout.controls[${i}].type must be one of button|hold|slider|select|stick|dpad`);
+        }
+        if (ctrl.zone !== undefined && !(ZONES as readonly unknown[]).includes(ctrl.zone)) {
+          errors.push(`controllerLayout.controls[${i}].zone must be 'left' or 'right' when present`);
         }
         // label
         if (typeof ctrl.label !== 'string') {
@@ -319,15 +335,23 @@ export function validateExternalManifestInput(
     if (thumbnail.kind !== 'css') {
       errors.push("thumbnail.kind must be 'css'");
     }
+    // The catalog renders these on every TV and phone, see ./thumbnail.ts.
     if (typeof thumbnail.gradient !== 'string') {
       errors.push('thumbnail.gradient must be a string');
-    } else if (thumbnail.gradient.length === 0 || thumbnail.gradient.length > 120) {
+    } else if (thumbnail.gradient.trim().length === 0 || thumbnail.gradient.trim().length > 120) {
       errors.push('thumbnail.gradient must be 1-120 characters');
+    } else if (!isSafeThumbnailGradient(thumbnail.gradient)) {
+      errors.push(
+        'thumbnail.gradient must be one linear-, radial- or conic-gradient(...) of colors, angles and stops (no url(), var() or image-set())'
+      );
     }
     if (typeof thumbnail.icon !== 'string') {
       errors.push('thumbnail.icon must be a string');
-    } else if (thumbnail.icon.length === 0 || thumbnail.icon.length > 40) {
-      errors.push('thumbnail.icon must be 1-40 characters');
+    } else if (thumbnailIconName(thumbnail.icon) === null) {
+      errors.push('thumbnail.icon must be a catalog icon such as "zap" or "gamepad2" (all names: guide section 7.5)');
+    }
+    if (thumbnail.accent !== undefined && !isSafeThumbnailAccent(thumbnail.accent)) {
+      errors.push('thumbnail.accent must be a hex color, a color name or an rgb()/hsl() color when present');
     }
   }
 
@@ -448,6 +472,7 @@ export function validateExternalManifestInput(
     maxPlayers: maxPlayers as number,
     controllerLayout: {
       kind: 'generic-buttons',
+      ...(normalizedLayout.orientation !== undefined ? { orientation: normalizedLayout.orientation } : {}),
       controls: normalizedLayout.controls.map((ctrl) => {
         const out: ExternalManifestInput['controllerLayout']['controls'][number] = {
           control: ctrl.control,
@@ -458,6 +483,7 @@ export function validateExternalManifestInput(
         if (ctrl.max !== undefined) out.max = ctrl.max;
         if (ctrl.step !== undefined) out.step = ctrl.step;
         if (ctrl.options !== undefined) out.options = ctrl.options.slice();
+        if (ctrl.zone !== undefined) out.zone = ctrl.zone;
         return out;
       })
     },
@@ -467,7 +493,7 @@ export function validateExternalManifestInput(
       kind: 'css',
       gradient: (normalizedThumb.gradient as string).trim(),
       icon: (normalizedThumb.icon as string).trim(),
-      ...(typeof normalizedThumb.accent === 'string' ? { accent: normalizedThumb.accent } : {})
+      ...(typeof normalizedThumb.accent === 'string' ? { accent: normalizedThumb.accent.trim() } : {})
     },
     entryUrl,
     sdkProtocol: 1

@@ -14,7 +14,8 @@ Prefer to read it yourself first? The rendered guide for humans is at
 ## What's here
 
 - `index.html` — the game. Loads the SDK, reads the manifest, counts taps, draws
-  a winner screen, calls `couch.gameOver`. ~150 lines, commented.
+  a winner screen, calls `couch.gameOver`. ~150 lines, commented. It also holds
+  a copy of the manifest, used when you open the file straight from disk.
 - `couch.game.json` — the manifest. Valid per the platform validator; edit it.
 
 ## 1. Copy it, open it, play it in the simulator
@@ -35,7 +36,10 @@ add/remove-player buttons, and pause/resume.
 - Player 1 also responds to the **keyboard**: press `1` to tap.
 - First to 30 taps triggers the winner screen and a game-over toast.
 
-No account, no server, no build step.
+No account, no server, no build step. Browsers refuse `fetch()` on `file://`
+pages, so a page opened from disk can't read `couch.game.json`; the starter then
+uses the copy of it inside `index.html` (`<script id="manifest-copy">`). Served
+by any static server (`npx serve .`), it reads `couch.game.json` itself.
 
 ## 2. Edit and test
 
@@ -44,7 +48,9 @@ No account, no server, no build step.
 - Add controls by editing `controllerLayout.controls` in `couch.game.json`
   (types: `button`, `hold`, `slider`, `select`). The simulator renders them
   automatically; handle their inputs in `onInput`. See the guide's input model
-  section for the exact payload each control type emits.
+  section for the exact payload each control type emits. If you open the file
+  from disk, paste the edited `couch.game.json` into `manifest-copy` in
+  `index.html` too.
 - When ready, paste your manifest into **https://couch-gg.vercel.app/dev** to
   validate it against the real platform and test your hosted game end-to-end.
 

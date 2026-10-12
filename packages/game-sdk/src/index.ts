@@ -9,6 +9,7 @@
  * Two runtimes, one API:
  *   - Embedded (window.self !== window.top): talks to the couch.gg host over the
  *     protocol-v1 postMessage bridge. `mode` is 'live' or 'test' (host-declared).
+ *     If no host answers the handshake (~10 s), falls back to the simulator.
  *   - Standalone (window.self === window.top): boots the built-in dev simulator,
  *     `mode` is 'dev'. `init()` resolves immediately.
  */
@@ -16,6 +17,7 @@
 import {
   PROTOCOL_VERSION,
   isHostMessage,
+  type CouchControllerPatch,
   type CouchInputEnvelope,
   type CouchLatency,
   type CouchLatencyTier,
@@ -23,7 +25,9 @@ import {
   type CouchMessage,
   type CouchMode,
   type CouchPlayer,
-  type CouchScore
+  type CouchScore,
+  type CouchScreen,
+  type CouchStateEnvelope
 } from './protocol';
 import { createSimulator, type Simulator } from './simulator';
 
@@ -34,8 +38,10 @@ export const SDK_VERSION = '0.1.0';
 
 /** How often the game re-sends `couch:hello` until the host answers (ms). */
 const HELLO_INTERVAL_MS = 250;
-/** Max hello attempts before the SDK stops pinging (but keeps listening). */
+/** Max hello attempts before the SDK gives up on a host. */
 const HELLO_MAX_ATTEMPTS = 40;
+/** How long the last hello may wait for its answer before the dev fallback (ms). */
+const HELLO_GRACE_MS = 1_000;
 
 /** Scores accepted by `gameOver`: array form or a playerId->score record. */
 export type CouchScoreInput = CouchScore[] | Record<string, number>;
@@ -47,7 +53,9 @@ export type CouchEventName =
   | 'pause'
   | 'resume'
   | 'abort'
-  | 'latency';
+  | 'latency'
+  | 'state'
+  | 'screenChanged';
 
 /** Payload shape per event. */
 export interface CouchEventMap {
@@ -57,6 +65,8 @@ export interface CouchEventMap {
   resume: void;
   abort: { reason: string };
   latency: CouchLatency;
+  state: CouchStateEnvelope;
+  screenChanged: CouchScreen;
 }
 
 /** Options passed to `CouchSDK.init`. */
@@ -65,7 +75,10 @@ export interface CouchInitOptions {
   manifest: CouchManifest;
   /** Convenience callback for forwarded inputs (same as `on('input')`). */
   onInput?: (input: CouchInputEnvelope) => void;
-  /** Convenience callback for roster changes (same as `on('playersChanged')`). */
+  /**
+   * Convenience callback for roster changes after init (same as
+   * `on('playersChanged')`). The starting roster is `couch.players`.
+   */
   onPlayersChanged?: (players: CouchPlayer[]) => void;
   /** Convenience callback for pause (same as `on('pause')`). */
   onPause?: (payload: { reason: string }) => void;
@@ -93,6 +106,16 @@ export interface CouchGame {
   readonly manifest: CouchManifest;
   /** Highest input `seq` seen so far (or -1 before any input). */
   readonly lastSeq: number;
+  /** This screen: its id and whether it is the host screen (see `broadcast`). */
+  readonly screen: CouchScreen;
+  /** Players sitting at this screen (all players on a local couch). */
+  readonly localPlayers: CouchPlayer[];
+  /**
+   * Host-authoritative mode: on the host screen, send the game state to every
+   * other screen (they get it via `on('state')`). Ignored with a warning on a
+   * non-host screen. Keep it small (≤ 32 KB) and ≤ 30 per second.
+   */
+  broadcast(state: unknown): void;
   /** Subscribe to an event. Returns an unsubscribe function. */
   on<E extends CouchEventName>(
     event: E,
@@ -100,6 +123,13 @@ export interface CouchGame {
   ): () => void;
   /** Report final scores exactly once. Array or Record form. */
   gameOver(scores: CouchScoreInput): void;
+  /**
+   * Tell one player's phone what to show: per-player labels, greyed-out
+   * controls, cooldowns, a vibration. Omitted fields keep their value.
+   *   couch.setController(p.id, { labels: { a: 'SHIELD', b: 'BASH' } });
+   *   couch.setController(p.id, { cooldowns: { b: 3000 }, vibrate: 80 });
+   */
+  setController(playerId: string, patch: CouchControllerPatch): void;
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +153,10 @@ class CouchCore {
   reducedMotion = false;
   manifest: CouchManifest;
   lastSeq = -1;
+  screen: CouchScreen = { id: null, isHost: true };
+  private lastStateEpoch: string | null = null;
+  private lastStateSeq = -1;
+  private warnedNonHostBroadcast = false;
 
   private readonly listeners: Record<CouchEventName, Set<Listener>> = {
     input: new Set(),
@@ -130,10 +164,13 @@ class CouchCore {
     pause: new Set(),
     resume: new Set(),
     abort: new Set(),
-    latency: new Set()
+    latency: new Set(),
+    state: new Set(),
+    screenChanged: new Set()
   };
 
   private gameOverSent = false;
+  private aborted = false;
 
   /** How outbound messages leave this game. Swapped for the simulator sink. */
   send: (msg: CouchMessage) => void;
@@ -144,6 +181,13 @@ class CouchCore {
   }
 
   on(event: CouchEventName, cb: Listener): () => void {
+    // Plain-JS games get no compile error for a typo or for an event a newer
+    // SDK added: warn instead of crashing at setup.
+    if (!Object.prototype.hasOwnProperty.call(this.listeners, event)) {
+      // eslint-disable-next-line no-console
+      console.warn(`[couch] on('${String(event)}'): unknown event — ignoring. Known: ${Object.keys(this.listeners).join(', ')}.`);
+      return () => {};
+    }
     const set = this.listeners[event];
     set.add(cb);
     return () => {
@@ -154,7 +198,14 @@ class CouchCore {
   private emit(event: CouchEventName, payload: unknown): void {
     // Copy to a snapshot so unsubscribing during emit is safe.
     for (const cb of [...this.listeners[event]]) {
-      cb(payload);
+      // One throwing listener must not starve the others of this event.
+      try {
+        cb(payload);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(`[couch] a '${event}' listener threw:`, err);
+        reportUncaught(err);
+      }
     }
   }
 
@@ -195,13 +246,60 @@ class CouchCore {
     this.emit('resume', undefined);
   }
 
+  /** Notify once: the host's message and the page teardown may both report it. */
   abort(reason: string): void {
+    if (this.aborted) return;
+    this.aborted = true;
     this.emit('abort', { reason });
   }
 
   setLatency(latency: CouchLatency): void {
     this.latency = latency;
     this.emit('latency', latency);
+  }
+
+  get localPlayers(): CouchPlayer[] {
+    if (this.latencyTier === 'local' || this.screen.id === null) return this.players;
+    return this.players.filter((p) => p.screenId === this.screen.id);
+  }
+
+  broadcast(state: unknown): void {
+    if (!this.screen.isHost) {
+      // Once: a frame loop on a screen that just lost the host role would
+      // otherwise log 30 warnings a second.
+      if (!this.warnedNonHostBroadcast) {
+        this.warnedNonHostBroadcast = true;
+        // eslint-disable-next-line no-console
+        console.warn('[couch] broadcast() on a non-host screen — ignoring. Check couch.screen.isHost.');
+      }
+      return;
+    }
+    this.send({ v: PROTOCOL_VERSION, type: 'couch:broadcast', state });
+  }
+
+  /** Deliver host state; stale or duplicate envelopes are dropped. */
+  receiveState(envelope: CouchStateEnvelope): void {
+    // A new epoch is a new run of the host's game (it reloaded, or the host
+    // moved) whose counter starts over.
+    const epoch = typeof envelope.epoch === 'string' ? envelope.epoch : '';
+    if (epoch !== this.lastStateEpoch) {
+      this.lastStateEpoch = epoch;
+      this.lastStateSeq = -1;
+    }
+    if (envelope.seq <= this.lastStateSeq) return;
+    this.lastStateSeq = envelope.seq;
+    this.emit('state', envelope);
+  }
+
+  setScreen(screen: CouchScreen): void {
+    this.screen = screen;
+    // A new host screen starts its own broadcast counter.
+    this.lastStateSeq = -1;
+    this.emit('screenChanged', screen);
+  }
+
+  setController(playerId: string, patch: CouchControllerPatch): void {
+    this.send({ v: PROTOCOL_VERSION, type: 'couch:setController', playerId: String(playerId), patch });
   }
 
   gameOver(scores: CouchScoreInput): void {
@@ -213,6 +311,20 @@ class CouchCore {
     this.gameOverSent = true;
     const normalized = normalizeScores(scores);
     this.send({ v: PROTOCOL_VERSION, type: 'couch:gameOver', scores: normalized });
+  }
+}
+
+/**
+ * Hand a listener's exception to the page as an uncaught error, so the game's
+ * window 'error' handler and error trackers still see it.
+ */
+function reportUncaught(err: unknown): void {
+  if (typeof reportError === 'function') {
+    reportError(err);
+  } else {
+    setTimeout(() => {
+      throw err;
+    });
   }
 }
 
@@ -257,11 +369,23 @@ function makeHandle(core: CouchCore): CouchGame {
     get lastSeq() {
       return core.lastSeq;
     },
+    get screen() {
+      return core.screen;
+    },
+    get localPlayers() {
+      return core.localPlayers;
+    },
+    broadcast(state) {
+      core.broadcast(state);
+    },
     on(event, cb) {
       return core.on(event, cb as Listener);
     },
     gameOver(scores) {
       core.gameOver(scores);
+    },
+    setController(playerId, patch) {
+      core.setController(playerId, patch);
     }
   };
 }
@@ -292,12 +416,34 @@ function initEmbedded(opts: CouchInitOptions): Promise<CouchGame> {
     let resolved = false;
     let helloAttempts = 0;
     let helloTimer: ReturnType<typeof setInterval> | undefined;
+    let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
 
     const stopHello = (): void => {
       if (helloTimer !== undefined) {
         clearInterval(helloTimer);
         helloTimer = undefined;
       }
+      if (fallbackTimer !== undefined) {
+        clearTimeout(fallbackTimer);
+        fallbackTimer = undefined;
+      }
+    };
+
+    // Nobody answered: this frame is not a couch.gg screen but some other page's
+    // iframe (an online playground, an AI chat's preview). The host only sends
+    // couch:init in reply to a hello, so once the last one has had time to be
+    // answered no host can start this game any more: run the simulator here.
+    const fallBackToDev = (): void => {
+      fallbackTimer = undefined;
+      if (resolved) return;
+      resolved = true;
+      window.removeEventListener('message', onMessage);
+      // eslint-disable-next-line no-console
+      console.warn(
+        '[couch] No couch.gg host answered, so the dev simulator runs in this frame. ' +
+          'Open the game top-level to skip the wait.'
+      );
+      resolve(initDev(opts));
     };
 
     const sendHello = (): void => {
@@ -309,9 +455,17 @@ function initEmbedded(opts: CouchInitOptions): Promise<CouchGame> {
         wantsProtocol: 1
       });
       if (helloAttempts >= HELLO_MAX_ATTEMPTS) {
-        // Stop pinging, but KEEP the listener alive — the host owns timeout UX.
         stopHello();
+        fallbackTimer = setTimeout(fallBackToDev, HELLO_GRACE_MS);
       }
+    };
+
+    // The host posts couch:abort when it unmounts the stage, but by then the
+    // iframe is already detached and the message never arrives. The frame's
+    // own teardown is the signal that does: pagehide fires as it is removed.
+    const onPageHide = (e: PageTransitionEvent): void => {
+      if (e.persisted) return; // kept in the back/forward cache: it may come back
+      core.abort('host-unmounted');
     };
 
     const onMessage = (e: MessageEvent): void => {
@@ -334,6 +488,8 @@ function initEmbedded(opts: CouchInitOptions): Promise<CouchGame> {
           core.reducedMotion = msg.reducedMotion;
           core.latencyTier = msg.latencyTier;
           core.players = msg.players ?? [];
+          core.screen = msg.screen ?? { id: null, isHost: true };
+          window.addEventListener('pagehide', onPageHide);
 
           // Auto-acknowledge so the host reveals the game.
           core.send({ v: PROTOCOL_VERSION, type: 'couch:ready' });
@@ -364,6 +520,12 @@ function initEmbedded(opts: CouchInitOptions): Promise<CouchGame> {
         case 'couch:latency':
           core.setLatency(msg.latency);
           break;
+        case 'couch:state':
+          core.receiveState(msg.envelope);
+          break;
+        case 'couch:screen':
+          core.setScreen(msg.screen);
+          break;
         default:
           // Exhaustiveness guard.
           assertNever(msg);
@@ -392,6 +554,8 @@ function initDev(opts: CouchInitOptions): Promise<CouchGame> {
   const core = new CouchCore(opts.manifest, (msg) => {
     if (msg.type === 'couch:gameOver') {
       simulator?.showGameOver(msg.scores);
+    } else if (msg.type === 'couch:setController') {
+      simulator?.setController(msg.playerId, msg.patch);
     }
   });
   bindConvenienceCallbacks(core, opts);
@@ -419,7 +583,11 @@ function initDev(opts: CouchInitOptions): Promise<CouchGame> {
         core.seed = seed;
       },
       dispatchInput: (input) => core.dispatchInput(input),
-      setPlayers: (players) => core.setPlayers(players),
+      // The starting roster arrives silently, as couch:init's does in a live
+      // couch: playersChanged only reports changes after init.
+      seedPlayers: (players) => {
+        core.players = players;
+      },
       addPlayer: (player) => core.addPlayer(player),
       removePlayer: (playerId) => core.removePlayer(playerId),
       pause: (reason) => core.pause(reason),
@@ -445,7 +613,8 @@ export const CouchSDK = {
   /**
    * Initialise the SDK. Resolves when the host has sent `couch:init` (embedded)
    * or immediately with a simulator (standalone). Never rejects — the host owns
-   * handshake-timeout UX.
+   * handshake-timeout UX. An embedded game that no host answers resolves with the
+   * simulator after the last hello (~10 s), with a console warning.
    */
   init(options: CouchInitOptions): Promise<CouchGame> {
     const embedded =

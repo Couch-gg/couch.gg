@@ -150,6 +150,166 @@ describe('CouchSDK.init — embedded handshake', () => {
   });
 });
 
+describe('CouchSDK.init — no host answers', () => {
+  it('warns and falls back to the simulator after the last hello, then ignores a late init', async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const h = embed();
+    let settled = false;
+    const p = CouchSDK.init({ manifest }).then((c) => {
+      settled = true;
+      return c;
+    });
+
+    // 40 hellos (one now, 39 more every 250 ms), then a grace period for the last answer.
+    vi.advanceTimersByTime(39 * 250);
+    expect(h.posted.filter((m) => m.type === 'couch:hello')).toHaveLength(40);
+    vi.advanceTimersByTime(999);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(warn).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(1);
+    const couch = await p;
+    expect(couch.mode).toBe('dev');
+    expect(couch.players).toHaveLength(2);
+    expect(document.getElementById('couch-sim-root')).not.toBeNull();
+    expect(warn.mock.calls.some((c) => String(c[0]).includes('No couch.gg host answered'))).toBe(true);
+
+    // No host can take over a game that already fell back.
+    h.deliver(initMessage());
+    expect(couch.mode).toBe('dev');
+    expect(h.posted.some((m) => m.type === 'couch:ready')).toBe(false);
+    warn.mockRestore();
+    h.restore();
+  });
+
+  it('a host answering the last hello within the grace period still wins', async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const h = embed();
+    const p = CouchSDK.init({ manifest });
+    vi.advanceTimersByTime(39 * 250 + 500);
+    h.deliver(initMessage());
+    const couch = await p;
+    vi.advanceTimersByTime(5_000);
+    expect(couch.mode).toBe('live');
+    expect(warn).not.toHaveBeenCalled();
+    expect(document.getElementById('couch-sim-root')).toBeNull();
+    warn.mockRestore();
+    h.restore();
+  });
+});
+
+describe('CouchSDK abort on teardown', () => {
+  it('fires abort once when the frame is torn down (pagehide), even if the host message also lands', async () => {
+    const h = embed();
+    const p = CouchSDK.init({ manifest });
+    h.deliver(initMessage());
+    const couch = await p;
+    const aborted = vi.fn();
+    couch.on('abort', aborted);
+
+    window.dispatchEvent(new Event('pagehide'));
+    expect(aborted).toHaveBeenCalledTimes(1);
+    expect(aborted).toHaveBeenCalledWith({ reason: 'host-unmounted' });
+
+    h.deliver({ v: 1, type: 'couch:abort', reason: 'host-unmounted' });
+    window.dispatchEvent(new Event('pagehide'));
+    expect(aborted).toHaveBeenCalledTimes(1);
+    h.restore();
+  });
+
+  it('ignores a pagehide into the back/forward cache (the page may come back)', async () => {
+    const h = embed();
+    const p = CouchSDK.init({ manifest });
+    h.deliver(initMessage());
+    const couch = await p;
+    const aborted = vi.fn();
+    couch.on('abort', aborted);
+
+    window.dispatchEvent(Object.assign(new Event('pagehide'), { persisted: true }));
+    expect(aborted).not.toHaveBeenCalled();
+    h.restore();
+  });
+});
+
+describe('CouchSDK listener isolation', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('a throwing listener is logged, reported as uncaught, and the others still run', async () => {
+    const h = embed();
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const reported = vi.fn();
+    vi.stubGlobal('reportError', reported);
+    const p = CouchSDK.init({
+      manifest,
+      onInput(i) {
+        throw new Error(`game bug ${i.seq}`);
+      }
+    });
+    h.deliver(initMessage());
+    const couch = await p;
+    const seen: number[] = [];
+    couch.on('input', (i) => seen.push(i.seq));
+
+    for (const seq of [1, 2]) {
+      h.deliver({ v: 1, type: 'couch:input', input: { seq, at: seq, playerId: 'p1', control: 'tap', action: 'press' } });
+    }
+    expect(seen).toEqual([1, 2]);
+    expect(couch.lastSeq).toBe(2);
+    expect(error).toHaveBeenCalledTimes(2);
+    expect(String(error.mock.calls[0][0])).toContain("'input' listener threw");
+    // Handed to the page's error handlers (window 'error', error trackers).
+    expect(reported.mock.calls.map((c) => (c[0] as Error).message)).toEqual(['game bug 1', 'game bug 2']);
+    error.mockRestore();
+    h.restore();
+  });
+
+  it('without reportError the error is rethrown from a timer, after the other listeners ran', async () => {
+    const h = embed();
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.stubGlobal('reportError', undefined);
+    const p = CouchSDK.init({ manifest });
+    h.deliver(initMessage());
+    const couch = await p;
+    vi.useFakeTimers();
+    const seen: number[] = [];
+    couch.on('input', () => {
+      throw new Error('game bug');
+    });
+    couch.on('input', (i) => seen.push(i.seq));
+
+    h.deliver({ v: 1, type: 'couch:input', input: { seq: 1, at: 1, playerId: 'p1', control: 'tap', action: 'press' } });
+    expect(seen).toEqual([1]);
+    expect(() => vi.runAllTimers()).toThrow('game bug');
+    error.mockRestore();
+    h.restore();
+  });
+
+  it('on() with an unknown event warns and returns a no-op unsubscribe', async () => {
+    const h = embed();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const p = CouchSDK.init({ manifest });
+    h.deliver(initMessage());
+    const couch = await p;
+    const on = couch.on as (event: string, cb: () => void) => () => void;
+
+    // A typo (never a name a future SDK might add) and two Object.prototype names.
+    for (const name of ['inptu', 'toString', 'constructor']) {
+      const off = on(name, () => {});
+      expect(typeof off).toBe('function');
+      expect(() => off()).not.toThrow();
+    }
+    expect(warn).toHaveBeenCalledTimes(3);
+    expect(String(warn.mock.calls[0][0])).toContain("on('inptu'): unknown event");
+    warn.mockRestore();
+    h.restore();
+  });
+});
+
 describe('CouchSDK input delivery', () => {
   it('3. inputs dispatch in order to onInput + on("input"); unsubscribe works', async () => {
     const h = embed();
@@ -209,6 +369,128 @@ describe('CouchSDK latency', () => {
     expect(couch.latencyTier).toBe('local');
 
     h.restore();
+  });
+});
+
+describe('CouchSDK setController', () => {
+  it('posts couch:setController to the host with the player id and patch', async () => {
+    const h = embed();
+    const p = CouchSDK.init({ manifest });
+    h.deliver(initMessage());
+    const couch = await p;
+
+    couch.setController('p1', { labels: { tap: 'SHIELD' }, cooldowns: { tap: 2000 }, vibrate: [40, 20, 40] });
+    expect(h.posted.at(-1)).toEqual({
+      v: 1,
+      type: 'couch:setController',
+      playerId: 'p1',
+      patch: { labels: { tap: 'SHIELD' }, cooldowns: { tap: 2000 }, vibrate: [40, 20, 40] }
+    });
+    h.restore();
+  });
+});
+
+describe('CouchSDK host-authoritative mode', () => {
+  const seated: CouchPlayer[] = [
+    { id: 'p1', name: 'One', colorIdx: 0, connected: true, screenId: 'scr_a' },
+    { id: 'p2', name: 'Two', colorIdx: 1, connected: true, screenId: 'scr_b' }
+  ];
+
+  it('host screen broadcasts; localPlayers are the players at this screen', async () => {
+    const h = embed();
+    const p = CouchSDK.init({ manifest });
+    h.deliver(initMessage({ latencyTier: 'remote', players: seated, screen: { id: 'scr_a', isHost: true } }));
+    const couch = await p;
+
+    expect(couch.screen).toEqual({ id: 'scr_a', isHost: true });
+    expect(couch.localPlayers.map((pl) => pl.id)).toEqual(['p1']);
+    couch.broadcast({ x: 1 });
+    expect(h.posted.at(-1)).toEqual({ v: 1, type: 'couch:broadcast', state: { x: 1 } });
+    h.restore();
+  });
+
+  it('a mirror screen ignores broadcast() and gets on("state") in seq order', async () => {
+    const h = embed();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const p = CouchSDK.init({ manifest });
+    h.deliver(initMessage({ latencyTier: 'remote', players: seated, screen: { id: 'scr_b', isHost: false } }));
+    const couch = await p;
+    const seen: number[] = [];
+    couch.on('state', (e) => seen.push(e.seq));
+
+    const before = h.posted.length;
+    couch.broadcast({ x: 1 });
+    expect(h.posted.length).toBe(before);
+    expect(warn).toHaveBeenCalled();
+
+    for (const seq of [1, 3, 2, 3, 4]) h.deliver({ v: 1, type: 'couch:state', envelope: { seq, at: 0, state: { seq } } });
+    expect(seen).toEqual([1, 3, 4]);
+
+    // Becoming the host (host player moved here) is announced and resets the counter.
+    const changed = vi.fn();
+    couch.on('screenChanged', changed);
+    h.deliver({ v: 1, type: 'couch:screen', screen: { id: 'scr_b', isHost: true } });
+    expect(changed).toHaveBeenCalledWith({ id: 'scr_b', isHost: true });
+    expect(couch.screen.isHost).toBe(true);
+    warn.mockRestore();
+    h.restore();
+  });
+
+  it('restarts the seq check when the epoch changes (host reloaded or moved)', async () => {
+    const h = embed();
+    const p = CouchSDK.init({ manifest });
+    h.deliver(initMessage({ latencyTier: 'remote', players: seated, screen: { id: 'scr_b', isHost: false } }));
+    const couch = await p;
+    const seen: string[] = [];
+    couch.on('state', (e) => seen.push(`${e.epoch}:${e.seq}`));
+
+    const state = (epoch: string, seq: number) =>
+      h.deliver({ v: 1, type: 'couch:state', envelope: { epoch, seq, at: 0, state: {} } });
+    for (let seq = 1; seq <= 500; seq++) state('first', seq);
+    // The host TV reloads: a new run whose counter starts at 1 again.
+    state('second', 1);
+    state('second', 2);
+    state('second', 2);
+    expect(seen.slice(-3)).toEqual(['first:500', 'second:1', 'second:2']);
+    h.restore();
+  });
+
+  it('warns once, not every frame, when a non-host screen broadcasts', async () => {
+    const h = embed();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const p = CouchSDK.init({ manifest });
+    h.deliver(initMessage({ latencyTier: 'remote', players: seated, screen: { id: 'scr_b', isHost: false } }));
+    const couch = await p;
+    const before = h.posted.length;
+    for (let i = 0; i < 30; i++) couch.broadcast({ i });
+    expect(h.posted.length).toBe(before);
+    expect(warn.mock.calls.filter((call) => String(call[0]).includes('broadcast()'))).toHaveLength(1);
+    warn.mockRestore();
+    h.restore();
+  });
+
+  it('a local couch (or an older host without screen info) is the host and seats everyone', async () => {
+    const h = embed();
+    const p = CouchSDK.init({ manifest });
+    h.deliver(initMessage());
+    const couch = await p;
+    expect(couch.screen).toEqual({ id: null, isHost: true });
+    expect(couch.localPlayers.map((pl) => pl.id)).toEqual(['p1', 'p2']);
+    h.restore();
+  });
+});
+
+describe('dev simulator setController', () => {
+  it('reads labels as own keys, so a control named "constructor" keeps its label', async () => {
+    standalone();
+    const protoManifest: CouchManifest = {
+      ...manifest,
+      controllerLayout: { kind: 'generic-buttons', controls: [{ control: 'constructor', type: 'button', label: 'Build' }] }
+    };
+    const couch = await CouchSDK.init({ manifest: protoManifest });
+    couch.setController('sim-p1', { disabled: [] });
+    const btn = document.querySelector<HTMLButtonElement>('[data-player-id="sim-p1"] .couch-sim-pad-button')!;
+    expect(btn.textContent).toBe('Build');
   });
 });
 
@@ -346,6 +628,29 @@ describe('CouchSDK dev mode', () => {
     expect(root!.querySelector('.couch-sim-pad-hold')).not.toBeNull();
     expect(root!.querySelector('.couch-sim-pad-slider')).not.toBeNull();
     expect(root!.querySelector('.couch-sim-pad-select')).not.toBeNull();
+  });
+
+  it('the starting roster is couch.players, not a playersChanged (as in a live couch)', async () => {
+    standalone();
+    const changed = vi.fn();
+    // A callback that reads the handle must never run before init returns it.
+    let couch: Awaited<ReturnType<typeof CouchSDK.init>> | undefined;
+    const p = CouchSDK.init({
+      manifest,
+      onPlayersChanged: (players) => changed(players.map((pl) => pl.id), couch!.players.length)
+    });
+    expect(p).toBeInstanceOf(Promise);
+    couch = await p;
+    expect(changed).not.toHaveBeenCalled();
+    expect(couch.players.map((pl) => pl.id)).toEqual(['sim-p1', 'sim-p2']);
+
+    const root = document.getElementById('couch-sim-root')!;
+    const addBtn = [...root.querySelectorAll<HTMLButtonElement>('.couch-sim-btn')].find((b) =>
+      b.textContent?.includes('Add player')
+    )!;
+    addBtn.dispatchEvent(new Event('click', { bubbles: true }));
+    expect(changed).toHaveBeenCalledTimes(1);
+    expect(changed).toHaveBeenCalledWith(['sim-p1', 'sim-p2', 'sim-p3'], 3);
   });
 
   it('dev-mode simulator drives inputs + roster + gameOver through the core', async () => {

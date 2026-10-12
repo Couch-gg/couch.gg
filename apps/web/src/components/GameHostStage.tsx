@@ -8,7 +8,9 @@ import type {
   CouchLatency,
   CouchManifest,
   CouchPlayer,
-  CouchScore
+  CouchScore,
+  CouchScreen,
+  CouchStateEnvelope
 } from '@couch/game-sdk';
 import { emitAck } from '../socket.js';
 import type { InputSource } from '../hooks/useExternalGameInputs.js';
@@ -22,7 +24,7 @@ import type { InputSource } from '../hooks/useExternalGameInputs.js';
  * in place of the live socket/probe side effects).
  */
 export interface GameHostEvent {
-  kind: 'ready' | 'error' | 'gameOver';
+  kind: 'ready' | 'error' | 'gameOver' | 'controller';
   detail?: unknown;
 }
 
@@ -52,6 +54,13 @@ export interface GameHostStageProps {
    * surfaced through `onEvent` so the test page owns the side effects.
    */
   mode: 'live' | 'test';
+  /** This TV's screen id (live mode), for host-authoritative games. */
+  screenId?: string;
+  /**
+   * The secret this TV's screen id was bound to on its first join. The probe
+   * result only counts with it: it must come from the lobby's host screen.
+   */
+  screenToken?: string;
   /** Lifecycle callback (fires in both modes; the only channel in test mode). */
   onEvent?: (event: GameHostEvent) => void;
 }
@@ -72,8 +81,14 @@ const LATENCY_WINDOW = 20;
 const LOCAL_DELIVERY_MS = 100;
 /** Max serialized inbound message size we accept (bytes-ish, via string length). */
 const MAX_INBOUND_BYTES = 8_192;
-/** Inbound rate cap: drop messages beyond this many per rolling second. */
+/** couch:broadcast carries a whole game state, so it gets a larger cap (matches the server). */
+const MAX_BROADCAST_BYTES = 32_768;
+/** Inbound rate cap for the frequent messages (broadcast, setController), per rolling second. */
 const MAX_INBOUND_PER_SEC = 60;
+/** Inputs held for a game that hasn't been initialised yet (still loading, or reloaded). */
+const MAX_PENDING_INPUTS = 256;
+/** How soon an unanswered or failed game:finish is sent again. */
+const FINISH_RETRY_MS = 2_000;
 
 const API_BASE = (() => {
   // Mirror api.ts URL resolution without importing its internals: probe-result
@@ -99,8 +114,16 @@ function toCouchPlayer(player: Player): CouchPlayer {
     id: player.id,
     name: player.name,
     colorIdx: player.colorIdx,
-    connected: player.connected
+    connected: player.connected,
+    screenId: player.screenId ?? null
   };
+}
+
+/** This screen's role: host if it is the lobby's host screen (or the lobby has none yet). */
+function screenRole(lobby: Lobby, screenId: string | undefined): CouchScreen {
+  if (!screenId) return { id: null, isHost: true };
+  const host = lobby.hostScreenId ?? null;
+  return { id: screenId, isHost: host === null || host === screenId };
 }
 
 /** aspectRatio '16:9' | '4:3' -> numeric ratio for letterboxing math. */
@@ -121,7 +144,7 @@ function normalizeScores(raw: unknown): CouchScore[] {
   for (const entry of raw) {
     if (entry && typeof entry === 'object') {
       const e = entry as { playerId?: unknown; score?: unknown };
-      if (typeof e.playerId === 'string' && typeof e.score === 'number') {
+      if (typeof e.playerId === 'string' && typeof e.score === 'number' && Number.isFinite(e.score)) {
         out.push({ playerId: e.playerId, score: e.score });
       }
     }
@@ -134,7 +157,7 @@ function normalizeScores(raw: unknown): CouchScore[] {
 // ---------------------------------------------------------------------------
 
 export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>(function GameHostStage(
-  { manifest, lobby, socket, mode, onEvent },
+  { manifest, lobby, socket, mode, screenId, screenToken, onEvent },
   ref
 ) {
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
@@ -145,12 +168,39 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
 
   // Refs so the single message listener never needs to re-subscribe.
   const initializedRef = useRef(false); // sent couch:init at least once
+  // Inputs that arrived before couch:init: the game listens only from its
+  // hello on, so they wait here and follow the init in order.
+  const pendingInputsRef = useRef<CouchHostToGameMessage[]>([]);
   const readyRef = useRef(false);
-  const finishedRef = useRef(false); // game:finish sent (idempotent guard)
+  const finishedRef = useRef(false); // the server took this round's game:finish
+  // The game's final scores, until the server has taken them. Only the host
+  // screen may report them; `refusedFor` is the host screen the server said
+  // this isn't (a stale view), `retryAt` holds back a resend after a failure.
+  const pendingFinishRef = useRef<{
+    scores: CouchScore[];
+    session: string;
+    refusedFor?: string | null;
+    retryAt: number;
+  } | null>(null);
+  const finishingRef = useRef(false); // a game:finish is waiting for its ack
+  const finishRetryRef = useRef<number | null>(null);
+  // False once the stage is gone. An answer that arrives after that is not
+  // acted on: the stage's lobby view is frozen, and a new round may run.
+  const mountedRef = useRef(true);
   const probedRef = useRef(false); // probe-result sent (once)
   const knownPlayersRef = useRef<Map<string, CouchPlayer>>(new Map());
 
   const modeRef = useRef(mode);
+  const screenIdRef = useRef(screenId);
+  screenIdRef.current = screenId;
+  const screenTokenRef = useRef(screenToken);
+  screenTokenRef.current = screenToken;
+  const screenKeyRef = useRef('');
+  // One run of this screen's broadcasts: receivers restart their seq check
+  // when it changes, so a reloaded host isn't ignored until it passes its old
+  // counter. Random per mount; never derived from the clock (TVs disagree).
+  const epochRef = useRef(Math.random().toString(36).slice(2, 12));
+  const broadcastSeqRef = useRef(0);
   const socketRef = useRef<Socket | null | undefined>(socket);
   const onEventRef = useRef(onEvent);
   const manifestRef = useRef(manifest);
@@ -173,6 +223,8 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
   }, []);
 
   // --- probe-result: fire-and-forget, swallow ALL errors (endpoint may 404). ---
+  // The server counts it only from the lobby's host screen, so it carries this
+  // TV's screen id and token; any other screen's result is simply not counted.
   const sendProbeResult = useCallback((ok: boolean) => {
     if (modeRef.current === 'test') return; // /dev harness reports via onEvent
     if (probedRef.current) return;
@@ -181,7 +233,12 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
       void fetch(`${API_BASE}/games/${manifestRef.current.id}/probe-result`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ slug: lobbyRef.current.slug, ok })
+        body: JSON.stringify({
+          slug: lobbyRef.current.slug,
+          ok,
+          screenId: screenIdRef.current,
+          screenToken: screenTokenRef.current
+        })
       }).catch(() => {
         /* endpoint arrives a later wave; ignore */
       });
@@ -189,6 +246,60 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
       /* never throw out of a lifecycle path */
     }
   }, []);
+
+  // --- game:finish: only the host screen reports (the server refuses the
+  // others). A screen that isn't the host keeps the scores and sends them if
+  // it becomes the host while the game is still running (the host TV left).
+  // The round counts as finished only once the server took the report: one
+  // lost to a reconnect or a timeout is sent again (finishing is idempotent),
+  // until the server answers or the round is over anyway. The report names
+  // its round, so the server never ends another one with it.
+  const sendFinish = useCallback(() => {
+    const pending = pendingFinishRef.current;
+    const sock = socketRef.current;
+    const l = lobbyRef.current;
+    if (!mountedRef.current || !pending || !sock || finishedRef.current || finishingRef.current) return;
+    if (pending.session !== (l.gameSession?.id ?? '') || l.state !== 'playing') {
+      pendingFinishRef.current = null; // that round is over (or a new one started)
+      return;
+    }
+    // Refused as not the host: wait for the lobby to name another host screen.
+    const hostScreen = l.hostScreenId ?? null;
+    if (pending.refusedFor !== undefined) {
+      if (pending.refusedFor === hostScreen) return;
+      pending.refusedFor = undefined;
+    }
+    if (!screenRole(l, screenIdRef.current).isHost) return;
+    if (Date.now() < pending.retryAt) return; // the retry timer sends it
+    finishingRef.current = true;
+    void emitAck<{ finished?: boolean }>(sock, 'game:finish', { slug: l.slug, sessionId: pending.session, scores: pending.scores })
+      .then(() => {
+        // Finished now, or already before (by another screen's report).
+        finishedRef.current = true;
+        pendingFinishRef.current = null;
+      })
+      .catch((err: unknown) => {
+        if (!mountedRef.current) return;
+        const status = (err as { status?: number } | null)?.status;
+        if (status === 403) {
+          pending.refusedFor = hostScreen;
+        } else if (status === 400 || status === 404 || status === 410) {
+          pendingFinishRef.current = null; // the lobby is gone, or will never take it
+        } else {
+          pending.retryAt = Date.now() + FINISH_RETRY_MS;
+          if (finishRetryRef.current != null) window.clearTimeout(finishRetryRef.current);
+          finishRetryRef.current = window.setTimeout(() => {
+            finishRetryRef.current = null;
+            sendFinishRef.current();
+          }, FINISH_RETRY_MS);
+        }
+      })
+      .finally(() => {
+        finishingRef.current = false;
+      });
+  }, []);
+  const sendFinishRef = useRef(sendFinish);
+  sendFinishRef.current = sendFinish;
 
   // --- Build & send couch:init (idempotent; SDK ignores duplicate inits). ---
   const sendInit = useCallback(() => {
@@ -211,10 +322,16 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
         typeof window !== 'undefined' && typeof window.matchMedia === 'function'
           ? window.matchMedia('(prefers-reduced-motion: reduce)').matches
           : false,
-      latencyTier
+      latencyTier,
+      screen: screenRole(l, screenIdRef.current)
     };
+    screenKeyRef.current = JSON.stringify(init.screen);
     initializedRef.current = true;
     post(init);
+    // Inputs held back for this game follow its init, in order.
+    const held = pendingInputsRef.current;
+    pendingInputsRef.current = [];
+    for (const message of held) post(message);
   }, [post]);
 
   // --- Inbound message handling (single listener, identity + shape + rate). ---
@@ -242,16 +359,20 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
       } catch {
         return;
       }
-      if (serialized.length > MAX_INBOUND_BYTES) return;
+      if (serialized.length > (data.type === 'couch:broadcast' ? MAX_BROADCAST_BYTES : MAX_INBOUND_BYTES)) return;
 
-      // Rate guard: rolling 1s window.
-      const now = Date.now();
-      if (now - windowStart >= 1_000) {
-        windowStart = now;
-        windowCount = 0;
+      // Rate guard (rolling 1s window) for the frequent messages only: a game
+      // broadcasting at frame rate must not crowd out its own gameOver (the
+      // round would never end) or its handshake.
+      if (data.type === 'couch:broadcast' || data.type === 'couch:setController') {
+        const now = Date.now();
+        if (now - windowStart >= 1_000) {
+          windowStart = now;
+          windowCount = 0;
+        }
+        windowCount += 1;
+        if (windowCount > MAX_INBOUND_PER_SEC) return;
       }
-      windowCount += 1;
-      if (windowCount > MAX_INBOUND_PER_SEC) return;
 
       handleGameMessage(data as CouchGameToHostMessage);
     };
@@ -277,18 +398,50 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
           const scores = normalizeScores((msg as { scores?: unknown }).scores);
           onEventRef.current?.({ kind: 'gameOver', detail: { scores } });
           if (modeRef.current === 'test') break; // /dev owns the finish
-          if (finishedRef.current) break;
-          finishedRef.current = true;
-          const sock = socketRef.current;
-          if (sock) {
-            // Screen sockets are authorized server-side; fire-and-forget.
-            void emitAck(sock, 'game:finish', { slug: lobbyRef.current.slug, scores }).catch(() => {
-              /* server logs; nothing to do client-side */
-            });
-          }
+          if (finishedRef.current || pendingFinishRef.current) break;
+          pendingFinishRef.current = { scores, session: lobbyRef.current.gameSession?.id ?? '', retryAt: 0 };
+          sendFinish();
           break;
         }
-        case 'couch:error': {
+        case 'couch:broadcast': {
+          if (modeRef.current === 'test') break; // one screen in /dev: nobody to tell
+          const sock = socketRef.current;
+          if (!sock) break;
+          // Only other screens receive it: nobody to tell on a one-screen couch.
+          if ((lobbyRef.current.screens?.length ?? 0) < 2) break;
+          broadcastSeqRef.current += 1;
+          // Fire-and-forget at frame rate: no ack wait; the server rejects a
+          // non-host screen, which the SDK already prevents. Volatile: each
+          // snapshot replaces the last, so while the socket is down frames are
+          // dropped instead of buffered and flushed all at once on reconnect.
+          sock.volatile.emit('game:state', {
+            slug: lobbyRef.current.slug,
+            epoch: epochRef.current,
+            seq: broadcastSeqRef.current,
+            state: (msg as { state?: unknown }).state ?? null
+          });
+          break;
+        }
+        case 'couch:setController': {
+          const { playerId, patch } = msg as { playerId?: unknown; patch?: unknown };
+          if (typeof playerId !== 'string' || !patch || typeof patch !== 'object') break;
+          onEventRef.current?.({ kind: 'controller', detail: { playerId, patch } });
+          if (modeRef.current === 'test') break; // /dev shows it; no phones to update
+          // In a remote couch every screen may run the game: only the host
+          // screen's calls go to the phones, so each one lands once.
+          if (!screenRole(lobbyRef.current, screenIdRef.current).isHost) break;
+          const sock = socketRef.current;
+          if (!sock) break;
+          // The server validates the patch against the manifest; log its
+          // reason so a creator sees the mistake in the TV console.
+          void emitAck(sock, 'screen:controller', { slug: lobbyRef.current.slug, playerId, patch }).catch((err: unknown) => {
+            const message = err instanceof Error ? err.message : 'setController failed';
+            // eslint-disable-next-line no-console
+            console.warn('[GameHostStage] setController rejected:', message);
+          });
+          break;
+        }
+                case 'couch:error': {
           const message = String((msg as { message?: unknown }).message ?? 'Game reported an error');
           setToast(message);
           onEventRef.current?.({ kind: 'error', detail: message });
@@ -303,7 +456,7 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
 
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
-  }, [sendInit, sendProbeResult]);
+  }, [sendInit, sendProbeResult, sendFinish]);
 
   // --- Ready timeout: no couch:ready within 15s -> error overlay + probe fail. ---
   useEffect(() => {
@@ -334,7 +487,13 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
     if (!changed) {
       for (const [id, p] of next) {
         const before = prev.get(id);
-        if (!before || before.connected !== p.connected || before.name !== p.name || before.colorIdx !== p.colorIdx) {
+        if (
+          !before ||
+          before.connected !== p.connected ||
+          before.name !== p.name ||
+          before.colorIdx !== p.colorIdx ||
+          before.screenId !== p.screenId
+        ) {
           changed = true;
           break;
         }
@@ -353,6 +512,34 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
     knownPlayersRef.current = next;
   }, [lobby.players, post]);
 
+  // --- Host screen changes (host player moved, first screen left) -> couch:screen. ---
+  useEffect(() => {
+    if (!initializedRef.current) return;
+    const screen = screenRole(lobby, screenId);
+    const key = JSON.stringify(screen);
+    if (key === screenKeyRef.current) return;
+    screenKeyRef.current = key;
+    post({ v: 1, type: 'couch:screen', screen });
+  }, [lobby, screenId, post]);
+
+  // --- A finish this screen held back goes out once it is the host screen. ---
+  useEffect(() => {
+    if (mode === 'live') sendFinish();
+  }, [lobby, screenId, mode, sendFinish]);
+
+  // --- Host-authoritative state from the host screen -> couch:state. ---
+  useEffect(() => {
+    if (mode !== 'live' || !socket) return;
+    const onState = (envelope: CouchStateEnvelope) => {
+      if (typeof envelope?.seq !== 'number') return;
+      post({ v: 1, type: 'couch:state', envelope });
+    };
+    socket.on('game:state', onState);
+    return () => {
+      socket.off('game:state', onState);
+    };
+  }, [mode, socket, post]);
+
   // --- visibilitychange -> pause/resume. ---
   useEffect(() => {
     const onVisibility = () => {
@@ -368,8 +555,12 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
 
   // --- Teardown: abort on unmount. ---
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
+      mountedRef.current = false;
       post({ v: 1, type: 'couch:abort', reason: 'host-unmounted' });
+      if (finishRetryRef.current != null) window.clearTimeout(finishRetryRef.current);
+      finishRetryRef.current = null;
     };
   }, [post]);
 
@@ -437,7 +628,7 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
         samples.push({ ms: Math.max(0, Date.now() + clock.offset - Date.parse(envelope.at)), source });
         if (samples.length > LATENCY_WINDOW) samples.shift();
       }
-      post({
+      const message: CouchHostToGameMessage = {
         v: 1,
         type: 'couch:input',
         input: {
@@ -448,7 +639,14 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
           action: envelope.action,
           value: envelope.value
         }
-      });
+      };
+      if (initializedRef.current) {
+        post(message);
+        return;
+      }
+      // The game isn't listening yet: keep the input for after its init.
+      const held = pendingInputsRef.current;
+      if (held.length < MAX_PENDING_INPUTS) held.push(message);
     },
     [post]
   );

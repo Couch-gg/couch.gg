@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Input Lab</title>
+  <style>
+    body { margin: 0; background: #111; color: #eee; font: 14px ui-monospace, monospace; }
+    #log { white-space: pre-wrap; padding: 12px; }
+  </style>
+</head>
+<body>
+  <!-- One JSON line per input: { playerId, control, action, value }.
+       Talks back to the phones like a co-op game would: every player gets
+       their own FIRE label, and firing starts a cooldown with a buzz. -->
+  <!-- Host-authoritative mode: which screen am I, who sits here, and (on the
+       other screens) the last state the host screen broadcast. -->
+  <div data-testid="screen-role"></div>
+  <div data-testid="local-players"></div>
+  <div data-testid="mirror"></div>
+  <div id="log" data-testid="log"></div>
+  <script src="./couch-sdk.js"></script>
+  <script>
+    async function main() {
+      const manifest = await fetch('./couch.game.json').then((r) => r.json());
+      const log = document.getElementById('log');
+      const heroLabels = ['SHIELD', 'ROLL', 'HEAL', 'DASH'];
+      const labelPlayers = (players) =>
+        players.forEach((p, i) => couch.setController(p.id, { labels: { fire: heroLabels[i % heroLabels.length] } }));
+      const couch = await CouchSDK.init({
+        manifest,
+        onPlayersChanged: (players) => labelPlayers(players),
+        onInput(input) {
+          if (input.control === 'fire' && input.action === 'press') {
+            couch.setController(input.playerId, { cooldowns: { fire: 1500 }, vibrate: 40 });
+          }
+          log.textContent += JSON.stringify({
+            playerId: input.playerId,
+            control: input.control,
+            action: input.action,
+            value: input.value
+          }) + '\n';
+        }
+      });
+      window.couch = couch;
+      labelPlayers(couch.players);
+      // The host tearing the stage down must reach the game (the e2e reads this).
+      couch.on('abort', (e) => console.log('[input-lab] abort ' + e.reason));
+
+      const show = (id, text) => (document.querySelector('[data-testid="' + id + '"]').textContent = text);
+      const renderScreen = () => {
+        show('screen-role', couch.screen.isHost ? 'host' : 'mirror');
+        show('local-players', couch.localPlayers.map((p) => p.name).join(','));
+      };
+      renderScreen();
+      couch.on('playersChanged', renderScreen);
+      couch.on('screenChanged', renderScreen);
+      // The host screen counts presses and broadcasts the count (on each press
+      // and as a 10 Hz heartbeat, asking isHost every tick); mirrors show it and
+      // note which broadcast run (epoch) and seq they last took.
+      let inputs = 0;
+      couch.on('input', (input) => {
+        if (input.action !== 'press') return;
+        inputs += 1;
+        if (couch.screen.isHost) couch.broadcast({ inputs });
+      });
+      setInterval(() => {
+        if (couch.screen.isHost) couch.broadcast({ inputs });
+      }, 100);
+      const mirror = document.querySelector('[data-testid="mirror"]');
+      couch.on('state', (envelope) => {
+        show('mirror', 'inputs:' + envelope.state.inputs);
+        if (mirror.dataset.epoch !== envelope.epoch) mirror.dataset.firstSeq = String(envelope.seq);
+        mirror.dataset.epoch = envelope.epoch;
+        mirror.dataset.seq = String(envelope.seq);
+      });
+    }
+    main();
+  </script>
+</body>
+</html>

@@ -505,6 +505,12 @@ button:disabled {
   padding: 16px;
 }
 
+/* A running game the TV can't show yet (its catalog entry is still loading). */
+.stage-pending {
+  display: grid;
+  place-items: center;
+}
+
 .surface-topline {
   display: flex;
   justify-content: space-between;
@@ -522,6 +528,11 @@ button:disabled {
   max-width: 720px;
   margin: 6px 0 0;
   color: var(--muted);
+}
+
+.surface-topline .screen-notice {
+  color: var(--accent);
+  font-weight: 700;
 }
 
 .state-live,
@@ -2790,4 +2801,151 @@ a.game-card.publish-card {
 
 .publish-card-thumb {
   background: linear-gradient(135deg, rgba(248, 237, 207, 0.14), rgba(16, 18, 17, 0.4));
+}
+
+/* --- Generic controller: thumbstick, d-pad, landscape zones --- */
+.generic-analog-row {
+  display: flex;
+  justify-content: center;
+  gap: 18px;
+  margin-bottom: 14px;
+}
+
+.generic-stick-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+.generic-stick,
+.generic-dpad {
+  position: relative;
+  width: 148px;
+  height: 148px;
+  border: 2px solid #0c0e0d;
+  background: radial-gradient(circle at 50% 45%, #2c2d24 0%, #15160f 70%);
+  box-shadow:
+    inset 0 2px 0 rgba(255, 255, 255, 0.08),
+    inset 0 -3px 0 rgba(0, 0, 0, 0.55),
+    0 3px 0 #0a0c0b;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.generic-stick {
+  border-radius: 50%;
+}
+
+.generic-stick-knob {
+  position: absolute;
+  left: 25%;
+  top: 25%;
+  width: 50%;
+  height: 50%;
+  border-radius: 50%;
+  border: 2px solid #0c0e0d;
+  background: linear-gradient(180deg, #3a3b30 0%, #24251c 100%);
+  box-shadow: inset 0 2px 0 rgba(255, 255, 255, 0.14), 0 3px 0 #0a0c0b;
+  pointer-events: none;
+}
+
+.generic-dpad {
+  border-radius: 12px;
+}
+
+.generic-dpad-arm {
+  position: absolute;
+  width: 34%;
+  height: 34%;
+  border-radius: 6px;
+  background: linear-gradient(180deg, #2c2d24 0%, #1d1e17 100%);
+  box-shadow: inset 0 2px 0 rgba(255, 255, 255, 0.12), 0 2px 0 #0a0c0b;
+  pointer-events: none;
+}
+
+.generic-dpad-arm.up { left: 33%; top: 4%; }
+.generic-dpad-arm.down { left: 33%; bottom: 4%; }
+.generic-dpad-arm.left { left: 4%; top: 33%; }
+.generic-dpad-arm.right { right: 4%; top: 33%; }
+
+.generic-dpad-arm.lit {
+  background: var(--team, #f2c94c);
+  box-shadow: 0 0 10px var(--team, #f2c94c);
+}
+
+.generic-stick.disabled,
+.generic-dpad.disabled {
+  opacity: 0.45;
+}
+
+.generic-zones {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 18px;
+  align-items: center;
+}
+
+.generic-zone {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+}
+
+@media (orientation: portrait) {
+  .generic-landscape .generic-zones {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* A landscape-hinted game on a phone held sideways: use the whole width so the
+   two thumb zones sit under the thumbs, and size the pads to the short side. */
+@media (orientation: landscape) {
+  .controller-shell:has(.generic-landscape) {
+    padding:
+      calc(8px + env(safe-area-inset-top)) calc(12px + env(safe-area-inset-right))
+      calc(8px + env(safe-area-inset-bottom)) calc(12px + env(safe-area-inset-left));
+  }
+
+  .controller-card:has(.generic-landscape) {
+    width: 100%;
+    max-width: none;
+    padding: 10px 14px;
+  }
+
+  .generic-landscape .generic-zones {
+    min-height: calc(100vh - 150px);
+  }
+
+  .generic-landscape .generic-zone-left {
+    justify-content: flex-start;
+  }
+
+  .generic-landscape .generic-zone-right {
+    justify-content: flex-end;
+  }
+
+  .generic-landscape .generic-stick,
+  .generic-landscape .generic-dpad {
+    width: min(148px, 38vh);
+    height: min(148px, 38vh);
+  }
+
+  .generic-landscape .generic-btn {
+    min-width: min(84px, 22vh);
+    min-height: min(84px, 22vh);
+  }
+}
+
+/* Game-set cooldown (couch.setController): a dark curtain that drains down. */
+.generic-cooldown {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.62);
+  pointer-events: none;
 }

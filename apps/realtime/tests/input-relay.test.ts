@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import type { ControllerEvent, ExternalGameManifest, GameId, GameManifest } from '@couch/types';
-import { getGameManifest } from '@couch/game-runtime';
+import { FALLBACK_THUMBNAIL_GRADIENT, FALLBACK_THUMBNAIL_ICON, getGameManifest } from '@couch/game-runtime';
 import {
   LobbyStore,
   deserializeLobbyRecord,
+  hostScreenId,
   isTrebuchetSnapshot,
   serializeLobbyRecord,
   type ManifestResolver
@@ -370,64 +371,75 @@ describe('selectGame remote gating', () => {
 });
 
 describe('RateLimiter', () => {
-  it('sustains 10 inputs/sec for a single player', () => {
+  it('sustains 20 inputs/sec for a single player (a stick plus buttons)', () => {
     const rl = new RateLimiter();
     let now = 1_000_000;
     let allowed = 0;
-    // 30 ticks, one every 100ms → exactly 10/s. Bucket starts full (20) so all pass.
-    for (let i = 0; i < 30; i++) {
+    // 60 ticks, one every 50ms → exactly 20/s. Bucket starts full (40) so all pass.
+    for (let i = 0; i < 60; i++) {
       if (rl.allow('ROOM', 'p1', now)) allowed++;
-      now += 100;
+      now += 50;
     }
-    expect(allowed).toBe(30);
+    expect(allowed).toBe(60);
   });
 
-  it('drops a burst beyond the per-player capacity of 20', () => {
+  it('drops a burst beyond the per-player capacity of 40', () => {
     const rl = new RateLimiter();
     const now = 2_000_000;
     let allowed = 0;
-    for (let i = 0; i < 25; i++) {
+    for (let i = 0; i < 45; i++) {
       if (rl.allow('ROOM', 'p1', now)) allowed++;
     }
-    // Capacity 20 with no time elapsed → 20 allowed, 5 dropped.
-    expect(allowed).toBe(20);
+    expect(allowed).toBe(40);
   });
 
-  it('enforces the per-slug aggregate capacity of 60 across players', () => {
+  it('enforces the per-slug aggregate capacity of 320 across players', () => {
     const rl = new RateLimiter();
     const now = 3_000_000;
     let allowed = 0;
-    // 8 players each firing 10 instantly = 80 attempts. Per-player cap (20) never
-    // binds here; the slug aggregate cap (60) does.
-    for (let p = 0; p < 8; p++) {
-      for (let i = 0; i < 10; i++) {
+    // 10 player ids each firing 40 instantly = 400 attempts. Per-player cap (40)
+    // never binds here; the slug aggregate cap (8 x 40 = 320) does.
+    for (let p = 0; p < 10; p++) {
+      for (let i = 0; i < 40; i++) {
         if (rl.allow('ROOM', `p${p}`, now)) allowed++;
       }
     }
-    expect(allowed).toBe(60);
+    expect(allowed).toBe(320);
+  });
+
+  it('fits a full lobby of 8 sticks at 15 changes/s plus buttons without drops', () => {
+    const rl = new RateLimiter();
+    let now = 3_500_000;
+    let dropped = 0;
+    // 10 s of 8 players each sending 20 inputs/s (a stick at ~15/s plus taps).
+    for (let tick = 0; tick < 200; tick++) {
+      for (let p = 0; p < 8; p++) {
+        if (!rl.allow('ROOM', `p${p}`, now)) dropped++;
+      }
+      now += 50;
+    }
+    expect(dropped).toBe(0);
   });
 
   it('refills tokens over time', () => {
     const rl = new RateLimiter();
     let now = 4_000_000;
-    // Drain the player bucket (20).
-    for (let i = 0; i < 20; i++) rl.allow('ROOM', 'p1', now);
+    for (let i = 0; i < 40; i++) rl.allow('ROOM', 'p1', now);
     expect(rl.allow('ROOM', 'p1', now)).toBe(false);
-    // After 1s, ~10 tokens refill (player refill 10/s).
+    // After 1s, 20 tokens refill (player refill 20/s).
     now += 1000;
     let allowed = 0;
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < 25; i++) {
       if (rl.allow('ROOM', 'p1', now)) allowed++;
     }
-    expect(allowed).toBe(10);
+    expect(allowed).toBe(20);
   });
 
   it('keeps per-player buckets independent', () => {
     const rl = new RateLimiter();
     const now = 5_000_000;
-    for (let i = 0; i < 20; i++) rl.allow('ROOM', 'p1', now);
+    for (let i = 0; i < 40; i++) rl.allow('ROOM', 'p1', now);
     expect(rl.allow('ROOM', 'p1', now)).toBe(false);
-    // A different player in the same slug still has their own bucket.
     expect(rl.allow('ROOM', 'p2', now)).toBe(true);
   });
 });
@@ -482,10 +494,295 @@ describe('parseExternalGamesJson', () => {
     expect(warnings.length).toBeGreaterThanOrEqual(1);
   });
 
+  it('keeps an entry whose thumbnail breaks the catalog rules, with the fallback look', () => {
+    const input = JSON.stringify([
+      {
+        id: 'old-thumb',
+        title: 'Old Thumb',
+        description: 'Registered before the thumbnail rules.',
+        minPlayers: 1,
+        maxPlayers: 2,
+        controllerLayout: { kind: 'generic-buttons', controls: [{ control: 'go', type: 'button', label: 'Go' }] },
+        aspectRatio: '16:9',
+        estimatedDurationMinutes: 5,
+        thumbnail: {
+          kind: 'css',
+          gradient: 'url(https://tracker.example/p.gif?x=1) center/cover',
+          icon: 'createLucideIcon',
+          accent: '#62d5d5'
+        },
+        entryUrl: 'https://example.com/',
+        sdkProtocol: 1
+      }
+    ]);
+    const warnings: string[] = [];
+    const out = parseExternalGamesJson(input, { onWarn: (m) => warnings.push(m) });
+    expect(out).toHaveLength(1);
+    expect(out[0].thumbnail).toEqual({
+      kind: 'css',
+      gradient: FALLBACK_THUMBNAIL_GRADIENT,
+      icon: FALLBACK_THUMBNAIL_ICON,
+      accent: '#62d5d5'
+    });
+    expect(warnings.join(' ')).toMatch(/icon, gradient/);
+  });
+
   it('returns [] for empty, malformed, or non-array input', () => {
     expect(parseExternalGamesJson('', { onWarn: silent })).toEqual([]);
     expect(parseExternalGamesJson(undefined, { onWarn: silent })).toEqual([]);
     expect(parseExternalGamesJson('{not json', { onWarn: silent })).toEqual([]);
     expect(parseExternalGamesJson('{"id":"x"}', { onWarn: silent })).toEqual([]);
+  });
+});
+
+describe('setControllerState (couch.setController)', () => {
+  it('keeps labels/disabled across patches and replaces one-shot effects', () => {
+    const { store, slug, tokens } = startedExternal();
+    const first = store.setControllerState(slug, tokens[0].id, { labels: { tap: 'SHIELD' }, cooldowns: { tap: 3000 }, vibrate: 80 });
+    expect(first).toEqual({ seq: 1, labels: { tap: 'SHIELD' }, disabled: [], cooldowns: { tap: 3000 }, vibrate: [80] });
+
+    const second = store.setControllerState(slug, tokens[0].id, { disabled: ['gear'] });
+    expect(second).toEqual({ seq: 2, labels: { tap: 'SHIELD' }, disabled: ['gear'], cooldowns: {}, vibrate: null });
+    expect(store.publicLobby(slug).controllerState?.[tokens[1].id]).toBeUndefined();
+  });
+
+  it('rejects unknown controls and out-of-range values', () => {
+    const { store, slug, tokens } = startedExternal();
+    expect(() => store.setControllerState(slug, tokens[0].id, { labels: { nope: 'X' } })).toThrow(/Unbekannte/);
+    expect(() => store.setControllerState(slug, tokens[0].id, { labels: { tap: 'A'.repeat(17) } })).toThrow(/Label/);
+    expect(() => store.setControllerState(slug, tokens[0].id, { cooldowns: { tap: 120_000 } })).toThrow(/Cooldown/);
+    expect(() => store.setControllerState(slug, tokens[0].id, { vibrate: [] })).toThrow(/vibrate/);
+    expect(() => store.setControllerState(slug, 'player_ghost', { labels: { tap: 'X' } })).toThrow(/Spieler/);
+  });
+
+  it('stores labels/cooldowns for prototype-named controls as own keys', () => {
+    // A manifest that predates the validator's reserved-name rule.
+    const PROTO: ExternalGameManifest = {
+      ...TAP_RACE,
+      id: 'proto-pad',
+      controllerLayout: {
+        kind: 'generic-buttons',
+        controls: [
+          { control: '__proto__', type: 'button', label: 'P' },
+          { control: 'constructor', type: 'button', label: 'C' }
+        ]
+      }
+    };
+    const store = new LobbyStore(makeResolver(PROTO));
+    const lobby = store.createLobby(Date.now(), 'local');
+    const host = store.joinPlayer(lobby.slug, 'Alex');
+    store.joinPlayer(lobby.slug, 'Bea');
+    store.selectGame(lobby.slug, host.playerToken, PROTO.id);
+    store.startGame(lobby.slug, host.playerToken);
+
+    const state = store.setControllerState(lobby.slug, host.player.id, {
+      labels: { ['__proto__']: 'SHIELD', constructor: 'BASH' },
+      cooldowns: { ['__proto__']: 500 }
+    });
+    expect(Object.hasOwn(state.labels, '__proto__')).toBe(true);
+    expect(state.labels['__proto__']).toBe('SHIELD');
+    expect(state.labels.constructor).toBe('BASH');
+    expect(Object.hasOwn(state.cooldowns, '__proto__')).toBe(true);
+    expect(Object.hasOwn(state.cooldowns, 'constructor')).toBe(false);
+    expect(JSON.parse(JSON.stringify(state)).labels).toEqual({ ['__proto__']: 'SHIELD', constructor: 'BASH' });
+  });
+
+  it('is cleared when a new round starts and survives persistence', () => {
+    const { store, slug, tokens, host } = startedExternal();
+    store.setControllerState(slug, tokens[0].id, { labels: { tap: 'SHIELD' } });
+    const restored = deserializeLobbyRecord(serializeLobbyRecord(store.getLobby(slug)));
+    expect(restored.controllerState[tokens[0].id].labels).toEqual({ tap: 'SHIELD' });
+
+    store.finishExternalGame(slug, []);
+    store.getLobby(slug).state = 'waiting';
+    store.startGame(slug, host.playerToken);
+    expect(store.getLobby(slug).controllerState).toEqual({});
+  });
+});
+
+describe('screens and the host screen (host-authoritative mode)', () => {
+  it("picks the host player's screen, else the first screen that joined", () => {
+    const store = new LobbyStore(makeResolver(TAP_RACE));
+    const lobby = store.createLobby(Date.now(), 'remote');
+    expect(store.publicLobby(lobby.slug).hostScreenId).toBeNull();
+
+    store.joinScreen(lobby.slug, 'scr_guest', undefined);
+    const hostScreen = store.joinScreen(lobby.slug, 'scr_host', undefined);
+    expect(store.joinScreen(lobby.slug, 'scr_host', hostScreen.screenToken).changed).toBe(false); // already known
+    expect(store.joinScreen(lobby.slug, 'not a screen id', undefined)).toEqual({ screenId: null, changed: false });
+    expect(store.publicLobby(lobby.slug).hostScreenId).toBe('scr_guest');
+
+    const host = store.joinPlayer(lobby.slug, 'Alex', undefined, 'scr_host');
+    const guest = store.joinPlayer(lobby.slug, 'Bea', undefined, 'scr_guest');
+    const pub = store.publicLobby(lobby.slug);
+    expect(pub.hostScreenId).toBe('scr_host');
+    expect(pub.players.map((p) => [p.name, p.screenId])).toEqual([
+      ['Alex', 'scr_host'],
+      ['Bea', 'scr_guest']
+    ]);
+    expect(hostScreenId(store.getLobby(lobby.slug))).toBe('scr_host');
+
+    // Seats survive persistence; a reconnect without a seat keeps the old one.
+    const restored = deserializeLobbyRecord(serializeLobbyRecord(store.getLobby(lobby.slug)));
+    expect(restored.screens).toEqual(['scr_guest', 'scr_host']);
+    store.joinPlayer(lobby.slug, 'Bea', guest.playerToken);
+    expect(store.getLobby(lobby.slug).players.get(guest.player.id)?.screenId).toBe('scr_guest');
+    expect(host.player.screenId).toBe('scr_host');
+  });
+
+  it('binds a screen id to the token from its first join', () => {
+    const store = new LobbyStore(makeResolver(TAP_RACE));
+    const { slug } = store.createLobby(Date.now(), 'remote');
+    const first = store.joinScreen(slug, 'scr_tv', undefined);
+    expect(first).toMatchObject({ screenId: 'scr_tv', changed: true });
+    expect(typeof first.screenToken).toBe('string');
+    expect(first.screenToken!.length).toBeGreaterThanOrEqual(32);
+
+    // Rejoin (reload/reconnect): the token is required, and not handed out again.
+    expect(() => store.joinScreen(slug, 'scr_tv', undefined)).toThrow(/anderen Gerät/);
+    expect(() => store.joinScreen(slug, 'scr_tv', 'guessed')).toThrow(/anderen Gerät/);
+    expect(store.joinScreen(slug, 'scr_tv', first.screenToken)).toEqual({ screenId: 'scr_tv', changed: false, screenToken: undefined });
+
+    // Only the hash is kept, it survives persistence, and it is never public.
+    const record = store.getLobby(slug);
+    expect(Object.values(record.screenSecrets)).not.toContain(first.screenToken);
+    const restored = deserializeLobbyRecord(serializeLobbyRecord(record));
+    expect(restored.screenSecrets).toEqual(record.screenSecrets);
+    expect(JSON.stringify(store.publicLobby(slug))).not.toContain(record.screenSecrets.scr_tv.hash);
+  });
+
+  it('refuses a new screen once the lobby is full instead of evicting one', () => {
+    const store = new LobbyStore(makeResolver(TAP_RACE));
+    const { slug } = store.createLobby(Date.now(), 'remote');
+    for (let i = 0; i < 8; i++) store.joinScreen(slug, `scr_tv${i}`, undefined);
+    expect(() => store.joinScreen(slug, 'scr_late', undefined)).toThrow(/genug Screens/);
+    expect(store.getLobby(slug).screens).toEqual(['scr_tv0', 'scr_tv1', 'scr_tv2', 'scr_tv3', 'scr_tv4', 'scr_tv5', 'scr_tv6', 'scr_tv7']);
+    expect(store.publicLobby(slug).hostScreenId).toBe('scr_tv0');
+    expect(store.getLobby(slug).screenSecrets.scr_late).toBeUndefined();
+  });
+
+  it('falls back to a live screen when the host seat is removed, and the TV can come back', () => {
+    const store = new LobbyStore(makeResolver(TAP_RACE));
+    const { slug } = store.createLobby(Date.now(), 'remote');
+    const a = store.joinScreen(slug, 'scr_a', undefined);
+    store.joinScreen(slug, 'scr_b', undefined);
+    store.joinPlayer(slug, 'Alex', undefined, 'scr_a');
+    expect(store.publicLobby(slug).hostScreenId).toBe('scr_a');
+
+    expect(store.removeScreen(slug, 'scr_a')).toBe(true);
+    expect(store.removeScreen(slug, 'scr_a')).toBe(false);
+    expect(store.publicLobby(slug).hostScreenId).toBe('scr_b');
+
+    // The same TV rejoins with its token and is the host seat again; nobody
+    // else can claim its id meanwhile.
+    expect(() => store.joinScreen(slug, 'scr_a', undefined)).toThrow(/anderen Gerät/);
+    expect(store.joinScreen(slug, 'scr_a', a.screenToken).changed).toBe(true);
+    expect(store.publicLobby(slug).hostScreenId).toBe('scr_a');
+  });
+
+  it('notes a dropped screen in the record, so a rejoin on another instance keeps it', () => {
+    const grace = 10_000;
+    const instanceA = new LobbyStore(makeResolver(TAP_RACE));
+    const { slug } = instanceA.createLobby(Date.now(), 'remote');
+    const tv = instanceA.joinScreen(slug, 'scr_tv', undefined, 'sock-1');
+    expect(instanceA.markScreenLeft(slug, 'scr_tv', 'sock-1', 1_000)).toBe(true);
+    expect(instanceA.markScreenLeft(slug, 'scr_tv', 'sock-1', 2_000)).toBe(false); // already noted
+
+    // The TV comes back on instance B, which only knows the stored record.
+    const instanceB = new LobbyStore(makeResolver(TAP_RACE));
+    instanceB.lobbies.set(slug, deserializeLobbyRecord(serializeLobbyRecord(instanceA.getLobby(slug))));
+    expect(instanceB.joinScreen(slug, 'scr_tv', tv.screenToken, 'sock-2').changed).toBe(true);
+
+    // A's grace check reads the record B saved: the TV is back, nothing goes.
+    instanceA.lobbies.set(slug, deserializeLobbyRecord(serializeLobbyRecord(instanceB.getLobby(slug))));
+    expect(instanceA.dropGoneScreens(slug, 1_000 + grace, grace)).toBe(false);
+    expect(instanceA.getLobby(slug).screens).toEqual(['scr_tv']);
+    expect(instanceA.publicLobby(slug).hostScreenId).toBe('scr_tv');
+  });
+
+  it("ignores the drop of a socket the screen already replaced (the old one's disconnect came late)", () => {
+    const store = new LobbyStore(makeResolver(TAP_RACE));
+    const { slug } = store.createLobby(Date.now(), 'local');
+    const tv = store.joinScreen(slug, 'scr_tv', undefined, 'sock-old');
+    store.joinScreen(slug, 'scr_tv', tv.screenToken, 'sock-new');
+    expect(store.markScreenLeft(slug, 'scr_tv', 'sock-old', 1_000)).toBe(false);
+    expect(store.dropGoneScreens(slug, 1_000_000, 10)).toBe(false);
+    expect(store.getLobby(slug).screens).toEqual(['scr_tv']);
+    // A screen that was never listed or never had a socket isn't noted either.
+    expect(store.markScreenLeft(slug, 'scr_other', 'sock-new', 1_000)).toBe(false);
+  });
+
+  it('drops a screen whose socket has been gone for the grace period, and lets it come back', () => {
+    const store = new LobbyStore(makeResolver(TAP_RACE));
+    const { slug } = store.createLobby(Date.now(), 'remote');
+    const a = store.joinScreen(slug, 'scr_a', undefined, 'sock-a');
+    store.joinScreen(slug, 'scr_b', undefined, 'sock-b');
+    store.joinPlayer(slug, 'Alex', undefined, 'scr_a');
+    store.markScreenLeft(slug, 'scr_a', 'sock-a', 1_000);
+    // Within the grace it keeps its place (and the host role).
+    expect(store.dropGoneScreens(slug, 10_999, 10_000)).toBe(false);
+    expect(store.publicLobby(slug).hostScreenId).toBe('scr_a');
+    expect(store.dropGoneScreens(slug, 11_000, 10_000)).toBe(true);
+    expect(store.getLobby(slug).screens).toEqual(['scr_b']);
+    expect(store.getLobby(slug).screenPresence.scr_a).toBeUndefined();
+    expect(store.publicLobby(slug).hostScreenId).toBe('scr_b');
+    // Nothing about presence is public.
+    expect(JSON.stringify(store.publicLobby(slug))).not.toContain('sock-');
+
+    // The binding stays: only the same TV can take the seat back.
+    expect(() => store.joinScreen(slug, 'scr_a', undefined, 'sock-x')).toThrow(/anderen Gerät/);
+    expect(store.joinScreen(slug, 'scr_a', a.screenToken, 'sock-a2').changed).toBe(true);
+    expect(store.publicLobby(slug).hostScreenId).toBe('scr_a');
+  });
+
+  it('forgets the oldest bindings of screens that left, so throwaway ids cannot lock new TVs out', () => {
+    const store = new LobbyStore(makeResolver(TAP_RACE));
+    const { slug } = store.createLobby(Date.now(), 'remote');
+    const tv = store.joinScreen(slug, 'scr_tv', undefined, 'sock-tv', 1);
+    // Alex sat at a TV that left: its id is still his seat.
+    const seat = store.joinScreen(slug, 'scr_seat', undefined, 'sock-seat', 2);
+    store.joinPlayer(slug, 'Alex', undefined, 'scr_seat');
+    store.removeScreen(slug, 'scr_seat');
+
+    // 40 throwaway ids join and leave (one after another, newest last).
+    for (let i = 0; i < 40; i++) {
+      store.joinScreen(slug, `scr_junk${i}`, undefined, `sock-junk${i}`, 10 + i);
+      store.removeScreen(slug, `scr_junk${i}`);
+    }
+    const fresh = store.joinScreen(slug, 'scr_new', undefined, 'sock-new', 100);
+    expect(typeof fresh.screenToken).toBe('string');
+    const secrets = store.getLobby(slug).screenSecrets;
+    expect(Object.keys(secrets).length).toBeLessThanOrEqual(32);
+    expect(secrets.scr_junk0).toBeUndefined();
+    expect(secrets.scr_junk39).toBeDefined();
+    expect(store.getLobby(slug).screens).toEqual(['scr_tv', 'scr_new']);
+
+    // Listed screens and seats keep their binding.
+    expect(() => store.joinScreen(slug, 'scr_tv', undefined)).toThrow(/anderen Gerät/);
+    expect(() => store.joinScreen(slug, 'scr_seat', undefined)).toThrow(/anderen Gerät/);
+    expect(store.joinScreen(slug, 'scr_tv', tv.screenToken).screenId).toBe('scr_tv');
+    expect(store.joinScreen(slug, 'scr_seat', seat.screenToken).screenId).toBe('scr_seat');
+
+    // A forgotten TV that comes back is simply bound anew.
+    const back = store.joinScreen(slug, 'scr_junk0', 'its-old-token', 'sock-back');
+    expect(typeof back.screenToken).toBe('string');
+  });
+
+  it('reads screen bindings stored as a bare hash (before bind times were kept)', () => {
+    const store = new LobbyStore(makeResolver(TAP_RACE));
+    const { slug } = store.createLobby(Date.now(), 'remote');
+    const tv = store.joinScreen(slug, 'scr_tv', undefined);
+    const serialized = serializeLobbyRecord(store.getLobby(slug));
+    const legacy = {
+      ...serialized,
+      screenSecrets: { scr_tv: (serialized.screenSecrets!.scr_tv as { hash: string }).hash },
+      screenPresence: undefined
+    };
+    const restored = deserializeLobbyRecord(legacy);
+    expect(restored.screenSecrets.scr_tv).toEqual({ hash: legacy.screenSecrets.scr_tv, at: 0 });
+    expect(restored.screenPresence).toEqual({});
+    store.lobbies.set(slug, restored);
+    expect(store.joinScreen(slug, 'scr_tv', tv.screenToken).screenId).toBe('scr_tv');
+    expect(() => store.joinScreen(slug, 'scr_tv', 'wrong')).toThrow(/anderen Gerät/);
   });
 });

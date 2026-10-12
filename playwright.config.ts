@@ -15,6 +15,10 @@ const tapRaceManifestPath = resolve(
   'apps/web/tests/fixtures/tap-race/couch.game.json'
 );
 const tapRaceManifest = JSON.parse(readFileSync(tapRaceManifestPath, 'utf-8'));
+// "input-lab" logs every input it receives; the controller specs drive it.
+const inputLabManifest = JSON.parse(
+  readFileSync(resolve(dirname(tapRaceManifestPath), '../input-lab/couch.game.json'), 'utf-8')
+);
 
 export default defineConfig({
   testDir: './apps/web/tests',
@@ -42,7 +46,7 @@ export default defineConfig({
             ...(Object.fromEntries(
               Object.entries(process.env).filter(([, v]) => v !== undefined)
             ) as Record<string, string>),
-            EXTERNAL_GAMES_JSON: JSON.stringify([tapRaceManifest])
+            EXTERNAL_GAMES_JSON: JSON.stringify([tapRaceManifest, inputLabManifest])
           }
         },
         {

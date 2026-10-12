@@ -103,6 +103,15 @@ describe.skipIf(!redisUrl)('Redis fan-out across instances', () => {
     expect((await res.json()).fanout).toBe('redis');
   });
 
+  it('tells joining TVs and phones that changes reach every instance, so they poll slowly', async () => {
+    const created = await fetch(`${urlA}/api/lobbies`, { method: 'POST' }).then((r) => r.json());
+    const slug: string = created.lobby.slug;
+    const screen = await ack<{ fanout: string }>(open(urlA), 'screen:join', { slug });
+    expect(screen.fanout).toBe('redis');
+    const joined = await ack<{ fanout: string }>(open(urlB), 'controller:join', { slug, name: 'Ann' });
+    expect(joined.fanout).toBe('redis');
+  });
+
   it('delivers an input sent to instance A to a screen on instance B, with unique seqs', async () => {
     const created = await fetch(`${urlA}/api/lobbies`, { method: 'POST' }).then((r) => r.json());
     const slug: string = created.lobby.slug;

@@ -6,6 +6,14 @@
 // resolver (resolveById) can stay synchronous — the lobby store resolves a game
 // on join/select/start with no await. REST handlers call ensureFresh() first so
 // the public catalog reflects other-instance writes within the cache window.
+// The cache is only ever read for listing and resolving: every mutation reads
+// the stored record and writes it back conditionally (see GamePersistence), so
+// a stale cache can't undo a takedown or bring back a deleted game.
+//
+// Reports and probe failures count once per client (a keyed hash of the IP,
+// see client-id.ts): one person can't hide a game alone. Those ids stay in the
+// store; no API payload carries them. Served thumbnails are sanitized, so a
+// record stored before the thumbnail rules still renders in the catalog.
 //
 // Security invariants (grep-enforced by the task):
 //   - the plaintext management token is returned exactly once, from submit(),
@@ -16,11 +24,13 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import {
   RESERVED_GAME_IDS,
+  sanitizeThumbnail,
   validateExternalManifestInput,
   type ExternalManifestInput
 } from '@couch/game-runtime';
 import type { ExternalGameManifest } from '@couch/types';
-import type { GamePersistence } from './persistence.js';
+import { LOBBY_TTL_MS } from './lobbies.js';
+import { GameWriteConflictError, type GamePersistence } from './persistence.js';
 
 // A published external game plus the registry bookkeeping the manifest itself
 // does not carry. `manifest` is always a full ExternalGameManifest with
@@ -34,7 +44,17 @@ export interface PublishedGameRecord {
   featured: boolean;
   hidden: boolean; // admin takedown OR report/probe auto-hide
   reports: number;
-  probe: { status: 'ok' | 'unverified' | 'failed'; lastCheckedAt: number | null; failCount: number };
+  // Hashed ids of the clients that reported since the last restore. Optional:
+  // records stored before reports were counted per client lack it.
+  reporters?: string[];
+  probe: {
+    status: 'ok' | 'unverified' | 'failed';
+    lastCheckedAt: number | null;
+    failCount: number;
+    // Hashed ids of the clients behind the current run of failures (optional,
+    // like reporters).
+    failedBy?: string[];
+  };
 }
 
 // A rejection the REST layer maps to an HTTP status. Mirrors LobbyError so
@@ -53,6 +73,19 @@ const REPORT_HIDE_THRESHOLD = 3;
 const PROBE_FAIL_THRESHOLD = 3;
 const PROBE_TIMEOUT_MS = 5000;
 const TOKEN_BYTES = 16; // 128-bit management token
+// Most client ids kept in reporters / probe.failedBy; far past the thresholds.
+const MAX_TRACKED_CLIENTS = 50;
+// How long a game session's probe claim is kept: a lobby's lifetime.
+const PROBE_CLAIM_TTL_MS = LOBBY_TTL_MS;
+// How often a probe result that changes nothing but lastCheckedAt is written.
+const PROBE_RECHECK_MS = 10 * 60_000;
+
+// Per-client budgets for the public write endpoints, shared by every instance.
+// A real TV sends one probe result per game it starts.
+const REQUEST_LIMITS = {
+  report: { max: 5, windowMs: 3_600_000 },
+  probe: { max: 30, windowMs: 3_600_000 }
+} as const;
 
 export interface SubmitOptions {
   // Ids already claimed by built-in or env-registered games. A submit that
@@ -137,7 +170,7 @@ export class GamesRegistry {
     const out: ExternalGameManifest[] = [];
     for (const record of this.cache.values()) {
       if (record.hidden || record.probe.status === 'failed') continue;
-      out.push({ ...record.manifest, featured: record.featured });
+      out.push(publicGame(record));
     }
     return out;
   }
@@ -148,7 +181,7 @@ export class GamesRegistry {
   resolveById(id: string): ExternalGameManifest | null {
     const record = this.cache.get(id);
     if (!record) return null;
-    return { ...record.manifest, featured: record.featured };
+    return publicGame(record);
   }
 
   // Full admin listing — every record including hidden/failed, tokenHash stripped
@@ -177,7 +210,8 @@ export class GamesRegistry {
 
     // Id must not collide with a built-in / env-registered game or an existing
     // registry record. (RESERVED ids are already rejected by the validator; this
-    // is the belt-and-suspenders check for the dynamic side.)
+    // is the belt-and-suspenders check for the dynamic side.) The cache check
+    // only saves a probe; the store decides below.
     const reserved = new Set<string>([...RESERVED_GAME_IDS, ...(opts.reservedIds ?? [])]);
     if (reserved.has(value.id) || this.cache.has(value.id)) {
       throw new RegistryError(`id "${value.id}" is already taken`, 409);
@@ -207,19 +241,21 @@ export class GamesRegistry {
       }
     };
 
-    await this.persist(record);
+    // Only lands on a free id: another instance (or a concurrent submit here,
+    // which passed the cache check during its probe) may have taken it.
+    if (!(await this.persistence.createGame(record))) {
+      throw new RegistryError(`id "${value.id}" is already taken`, 409);
+    }
+    this.cache.set(record.manifest.id, record);
     return { record, managementToken };
   }
 
-  // Constant-time management-token check. False for an unknown id or a token
-  // whose hash does not match. Never leaks which of the two failed via timing.
+  // Constant-time management-token check against the cached record. False for
+  // an unknown id or a token whose hash does not match. update/remove check the
+  // stored record instead.
   verifyManagementToken(id: string, token: string): boolean {
     const record = this.cache.get(id);
-    if (!record) return false;
-    const provided = Buffer.from(sha256Hex(token), 'hex');
-    const stored = Buffer.from(record.managementTokenHash, 'hex');
-    if (provided.length !== stored.length) return false;
-    return timingSafeEqual(provided, stored);
+    return !!record && tokenMatches(record, token);
   }
 
   // Self-service update by management token. Re-validates the new manifest and
@@ -227,112 +263,186 @@ export class GamesRegistry {
   // the probe to 'unverified' (re-probed on next real load); otherwise the probe
   // state is kept.
   async update(id: string, token: string, input: unknown, now = Date.now()): Promise<PublishedGameRecord> {
-    const record = this.requireRecord(id);
-    if (!this.verifyManagementToken(id, token)) {
-      throw new RegistryError('invalid management token', 401);
-    }
-    const result = validateExternalManifestInput(input, {
-      allowHttpLocalhost: !process.env.VERCEL
+    return this.mutate(id, (record) => {
+      if (!tokenMatches(record, token)) {
+        throw new RegistryError('invalid management token', 401);
+      }
+      const result = validateExternalManifestInput(input, {
+        allowHttpLocalhost: !process.env.VERCEL
+      });
+      if (!result.ok) {
+        throw new RegistryError('manifest is invalid', 422, result.errors);
+      }
+      if (result.value.id !== id) {
+        throw new RegistryError('id cannot be changed on update', 422);
+      }
+      const entryUrlChanged = result.value.entryUrl !== record.manifest.entryUrl;
+      return {
+        ...record,
+        manifest: composeManifest(result.value, record.manifest.publishedAt),
+        updatedAt: now,
+        probe: entryUrlChanged
+          ? { status: 'unverified', lastCheckedAt: null, failCount: 0, failedBy: [] }
+          : record.probe
+      };
     });
-    if (!result.ok) {
-      throw new RegistryError('manifest is invalid', 422, result.errors);
-    }
-    if (result.value.id !== id) {
-      throw new RegistryError('id cannot be changed on update', 422);
-    }
-    const entryUrlChanged = result.value.entryUrl !== record.manifest.entryUrl;
-    const updated: PublishedGameRecord = {
-      ...record,
-      manifest: composeManifest(result.value, record.manifest.publishedAt),
-      updatedAt: now,
-      probe: entryUrlChanged
-        ? { status: 'unverified', lastCheckedAt: null, failCount: 0 }
-        : record.probe
-    };
-    await this.persist(updated);
-    return updated;
   }
 
   async remove(id: string, token: string): Promise<void> {
-    this.requireRecord(id);
-    if (!this.verifyManagementToken(id, token)) {
-      throw new RegistryError('invalid management token', 401);
-    }
-    await this.persistence.deleteGame(id);
+    const deleted = await retryable(() =>
+      this.persistence.deleteGame(id, (record) => {
+        if (!tokenMatches(record, token)) {
+          throw new RegistryError('invalid management token', 401);
+        }
+      })
+    );
     this.cache.delete(id);
+    if (!deleted) throw new RegistryError('game not found', 404);
   }
 
-  // Community report. Increments the counter; at the threshold the game is
-  // auto-hidden. Returns the (possibly now-hidden) record.
-  async report(id: string, now = Date.now()): Promise<PublishedGameRecord> {
-    const record = this.requireRecord(id);
-    const reports = record.reports + 1;
-    const updated: PublishedGameRecord = {
-      ...record,
-      reports,
-      hidden: record.hidden || reports >= REPORT_HIDE_THRESHOLD,
-      updatedAt: now
-    };
-    await this.persist(updated);
-    return updated;
+  // Community report from one client (a hashed id). Each client counts once
+  // until an admin restore; at the threshold the game is auto-hidden. Returns
+  // the (possibly now-hidden) record and whether this report counted.
+  async report(
+    id: string,
+    reporter: string,
+    now = Date.now()
+  ): Promise<{ record: PublishedGameRecord; counted: boolean }> {
+    let counted = false;
+    const record = await this.mutate(id, (current) => {
+      counted = false;
+      const reporters = current.reporters ?? [];
+      if (reporters.includes(reporter) || reporters.length >= MAX_TRACKED_CLIENTS) return current;
+      counted = true;
+      const reports = current.reports + 1;
+      return {
+        ...current,
+        reports,
+        reporters: [...reporters, reporter],
+        hidden: current.hidden || reports >= REPORT_HIDE_THRESHOLD,
+        updatedAt: now
+      };
+    });
+    return { record, counted };
   }
 
-  // First-load probe result from a real TV. ok resets the fail counter and marks
-  // the probe 'ok'; a failure increments failCount and, at the threshold of
-  // consecutive fails, marks the probe 'failed' (which hides it from the catalog
-  // via listPublic — perpetual URL-rot defense).
-  async probeResult(id: string, ok: boolean, now = Date.now()): Promise<PublishedGameRecord> {
-    const record = this.requireRecord(id);
-    const probe = ok
-      ? { status: 'ok' as const, lastCheckedAt: now, failCount: 0 }
-      : (() => {
-          const failCount = record.probe.failCount + 1;
-          const status = failCount >= PROBE_FAIL_THRESHOLD ? ('failed' as const) : record.probe.status;
-          return { status, lastCheckedAt: now, failCount };
-        })();
-    const updated: PublishedGameRecord = { ...record, probe, updatedAt: now };
-    await this.persist(updated);
-    return updated;
+  // Take the one probe result a game session may give (see the probe-result
+  // route). False when that session already gave one.
+  async claimProbe(id: string, sessionId: string): Promise<boolean> {
+    return this.persistence.claimOnce(`probe:${id}:${sessionId}`, PROBE_CLAIM_TTL_MS);
   }
 
-  // Admin takedown / restore.
+  // First-load probe result from a real TV (`source` is its client's hashed
+  // id). ok resets the failures and marks the probe 'ok'; a failure from a
+  // client not yet in the current run of failures adds one, and at the
+  // threshold the probe is 'failed' (which hides it from the catalog via
+  // listPublic — perpetual URL-rot defense).
+  //
+  // A result that would only move lastCheckedAt (an ok for a game that is
+  // already ok, a failure that already counts) is written once per
+  // PROBE_RECHECK_MS: a popular game reports ok on every start, and rewriting
+  // its record each time would race every admin and creator write to it.
+  async probeResult(id: string, ok: boolean, source: string, now = Date.now()): Promise<PublishedGameRecord> {
+    return this.mutate(id, (current) => {
+      const checkedLately =
+        current.probe.lastCheckedAt !== null && now - current.probe.lastCheckedAt < PROBE_RECHECK_MS;
+      if (ok) {
+        if (current.probe.status === 'ok' && current.probe.failCount === 0 && checkedLately) return current;
+        return { ...current, probe: { status: 'ok', lastCheckedAt: now, failCount: 0, failedBy: [] }, updatedAt: now };
+      }
+      const failedBy = current.probe.failedBy ?? [];
+      if (failedBy.includes(source) || failedBy.length >= MAX_TRACKED_CLIENTS) {
+        if (checkedLately) return current;
+        return { ...current, probe: { ...current.probe, lastCheckedAt: now }, updatedAt: now };
+      }
+      const failCount = current.probe.failCount + 1;
+      const status = failCount >= PROBE_FAIL_THRESHOLD ? 'failed' : current.probe.status;
+      return {
+        ...current,
+        probe: { status, lastCheckedAt: now, failCount, failedBy: [...failedBy, source] },
+        updatedAt: now
+      };
+    });
+  }
+
+  // Admin takedown / restore. A restore starts the game over: the reports and
+  // probe failures that hid it no longer count (an 'ok' probe stays 'ok').
   async setHidden(id: string, hidden: boolean, now = Date.now()): Promise<PublishedGameRecord> {
-    const record = this.requireRecord(id);
-    const updated: PublishedGameRecord = { ...record, hidden, updatedAt: now };
-    await this.persist(updated);
-    return updated;
+    return this.mutate(id, (current) =>
+      hidden
+        ? { ...current, hidden: true, updatedAt: now }
+        : {
+            ...current,
+            hidden: false,
+            reports: 0,
+            reporters: [],
+            probe: {
+              status: current.probe.status === 'failed' ? 'unverified' : current.probe.status,
+              lastCheckedAt: current.probe.lastCheckedAt,
+              failCount: 0,
+              failedBy: []
+            },
+            updatedAt: now
+          }
+    );
   }
 
   // Admin feature toggle.
   async setFeatured(id: string, featured: boolean, now = Date.now()): Promise<PublishedGameRecord> {
-    const record = this.requireRecord(id);
-    const updated: PublishedGameRecord = { ...record, featured, updatedAt: now };
-    await this.persist(updated);
+    return this.mutate(id, (current) => ({ ...current, featured, updatedAt: now }));
+  }
+
+  // Whether this client may make one more request of this kind (report /
+  // probe-result) in the current window. Counted in the store, so the budget
+  // holds across instances.
+  async allowRequest(kind: keyof typeof REQUEST_LIMITS, client: string): Promise<boolean> {
+    if (!this.persistence.enabled) return true;
+    const limit = REQUEST_LIMITS[kind];
+    return (await this.persistence.countHit(`${kind}:${client}`, limit.windowMs)) <= limit.max;
+  }
+
+  // Apply `change` to the STORED record (the cache may be 30 s old), write it
+  // back only if nobody else wrote in between, and cache the result. 404 when
+  // the game is gone, which also drops it from this instance's cache.
+  private async mutate(
+    id: string,
+    change: (current: PublishedGameRecord) => PublishedGameRecord
+  ): Promise<PublishedGameRecord> {
+    const updated = await retryable(() => this.persistence.updateGame(id, change));
+    if (!updated) {
+      this.cache.delete(id);
+      throw new RegistryError('game not found', 404);
+    }
+    this.cache.set(id, updated);
     return updated;
   }
+}
 
-  private requireRecord(id: string): PublishedGameRecord {
-    const record = this.cache.get(id);
-    if (!record) throw new RegistryError('game not found', 404);
-    return record;
-  }
-
-  // Write-through: persist then update the cache immediately so a subsequent
-  // sync resolveById/listPublic sees the new state without waiting on ensureFresh.
-  private async persist(record: PublishedGameRecord): Promise<void> {
-    await this.persistence.saveGame(record);
-    this.cache.set(record.manifest.id, record);
+// Run a store write; when it keeps losing to concurrent writes to the same
+// game, fail with a 503 so the caller knows to try again.
+async function retryable<T>(write: () => Promise<T>): Promise<T> {
+  try {
+    return await write();
+  } catch (err) {
+    if (err instanceof GameWriteConflictError) {
+      throw new RegistryError('too many concurrent changes to this game, try again', 503);
+    }
+    throw err;
   }
 }
 
 // Serialize a record for a public payload: the served manifest with the record's
-// featured flag folded in. NEVER includes managementTokenHash.
+// featured flag folded in and a thumbnail the catalog can render (a record
+// stored before the thumbnail rules gets the fallback look instead of leaving
+// the catalog). NEVER includes managementTokenHash.
 export function publicGame(record: PublishedGameRecord): ExternalGameManifest {
-  return { ...record.manifest, featured: record.featured };
+  return { ...record.manifest, thumbnail: sanitizeThumbnail(record.manifest.thumbnail), featured: record.featured };
 }
 
 // Admin view of a record: everything the operator needs to triage, minus the
-// token hash (an operator can take down / feature by id; they never need the hash).
+// token hash (an operator can take down / feature by id; they never need the
+// hash) and the client ids behind reports and probe failures (the counts say
+// enough, and the ids are personal data).
 export function adminGameView(record: PublishedGameRecord): {
   manifest: ExternalGameManifest;
   createdAt: number;
@@ -340,7 +450,7 @@ export function adminGameView(record: PublishedGameRecord): {
   featured: boolean;
   hidden: boolean;
   reports: number;
-  probe: PublishedGameRecord['probe'];
+  probe: Omit<PublishedGameRecord['probe'], 'failedBy'>;
 } {
   return {
     manifest: record.manifest,
@@ -349,7 +459,11 @@ export function adminGameView(record: PublishedGameRecord): {
     featured: record.featured,
     hidden: record.hidden,
     reports: record.reports,
-    probe: record.probe
+    probe: {
+      status: record.probe.status,
+      lastCheckedAt: record.probe.lastCheckedAt,
+      failCount: record.probe.failCount
+    }
   };
 }
 
@@ -362,6 +476,14 @@ function composeManifest(value: ExternalManifestInput, publishedAt: string): Ext
     status: 'published',
     publishedAt
   };
+}
+
+// Constant-time check of a plaintext management token against a record's hash.
+function tokenMatches(record: PublishedGameRecord, token: string): boolean {
+  const provided = Buffer.from(sha256Hex(token), 'hex');
+  const stored = Buffer.from(record.managementTokenHash, 'hex');
+  if (provided.length !== stored.length) return false;
+  return timingSafeEqual(provided, stored);
 }
 
 function sha256Hex(input: string): string {

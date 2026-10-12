@@ -1,4 +1,5 @@
-import { expect, test, type Browser } from '@playwright/test';
+import { expect, test, type APIRequestContext, type Browser } from '@playwright/test';
+import { io as connectSocket, type Socket } from 'socket.io-client';
 
 const DESKTOP_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -16,6 +17,27 @@ async function phonePage(browser: Browser, name: string) {
   const p = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
   await p.addInitScript((n) => window.localStorage.setItem('couch:name', n), name);
   return p;
+}
+
+const REALTIME_URL = 'http://127.0.0.1:4100';
+
+// A bare realtime connection, standing in for another device.
+function realtimeSocket(): Socket {
+  return connectSocket(REALTIME_URL, { transports: ['websocket'], forceNew: true });
+}
+
+function ack<T = { ok: boolean }>(socket: Socket, event: string, payload: unknown): Promise<T> {
+  return new Promise((resolve) => socket.emit(event, payload, resolve));
+}
+
+async function newLobby(request: APIRequestContext): Promise<string> {
+  const res = await request.post(`${REALTIME_URL}/api/lobbies`, { data: {} });
+  return (await res.json()).lobby.slug;
+}
+
+async function lobbyScreens(request: APIRequestContext, slug: string): Promise<string[]> {
+  const res = await request.get(`${REALTIME_URL}/api/lobbies/${slug}`);
+  return (await res.json()).lobby.screens;
 }
 
 async function attractScreenId(browser: Browser) {
@@ -153,4 +175,65 @@ test('controller survives a network drop and auto-rejoins (slept phone)', async 
 
   await tv.close();
   await alex.close();
+});
+
+test('a TV whose screen id another device joined with first takes a fresh one', async ({ browser, request }) => {
+  const slug = await newLobby(request);
+  // The id is public (pairing link, lobby snapshot), so someone can bind it first.
+  const taken = `scr_taken${Date.now().toString(36)}`;
+  const squatter = realtimeSocket();
+  expect((await ack(squatter, 'screen:join', { slug, screenId: taken })).ok).toBe(true);
+
+  const tv = await desktopPage(browser);
+  await tv.addInitScript((id) => {
+    if (!window.sessionStorage.getItem('couch:screenId')) window.sessionStorage.setItem('couch:screenId', id);
+  }, taken);
+  await tv.goto('/l/' + slug);
+  await expect(tv.locator('.room-code strong')).toHaveText(slug);
+  await expect
+    .poll(() => tv.evaluate(() => window.sessionStorage.getItem('couch:screenId')), { timeout: 15_000 })
+    .not.toBe(taken);
+  const fresh = await tv.evaluate(() => window.sessionStorage.getItem('couch:screenId'));
+  await expect.poll(() => lobbyScreens(request, slug), { timeout: 10_000 }).toEqual([taken, fresh]);
+  await expect(tv.locator('.status-panel')).toHaveCount(0);
+
+  squatter.disconnect();
+  await tv.close();
+});
+
+test('a TV the lobby dropped while it was still connected joins again', async ({ browser, request }) => {
+  test.setTimeout(90_000);
+  const slug = await newLobby(request);
+  const tv = await desktopPage(browser);
+  await tv.goto('/l/' + slug);
+  await expect.poll(async () => (await lobbyScreens(request, slug)).length, { timeout: 15_000 }).toBe(1);
+  const own = await tv.evaluate((s) => {
+    const id = window.sessionStorage.getItem('couch:screenId')!;
+    return { id, token: window.sessionStorage.getItem(`couch:screenToken:${s}:${id}`) };
+  }, slug);
+  expect(await lobbyScreens(request, slug)).toEqual([own.id]);
+
+  const watcher = realtimeSocket();
+  const snapshots: string[][] = [];
+  watcher.on('lobby:snapshot', (lobby: { screens: string[] }) => snapshots.push(lobby.screens));
+  expect((await ack(watcher, 'controller:join', { slug, name: 'Watcher' })).ok).toBe(true);
+
+  // Another connection takes over the TV's screen id and goes away, so after
+  // the grace period the server drops the screen while the TV page is still
+  // connected (like a rejoin the record lost).
+  const twin = realtimeSocket();
+  expect((await ack(twin, 'screen:join', { slug, screenId: own.id, screenToken: own.token })).ok).toBe(true);
+  twin.disconnect();
+  await expect
+    .poll(() => snapshots.some((screens) => !screens.includes(own.id)), { timeout: 25_000 })
+    .toBe(true);
+
+  // The TV sees a snapshot without itself and joins again.
+  await expect.poll(() => lobbyScreens(request, slug), { timeout: 10_000 }).toEqual([own.id]);
+  const dropped = snapshots.findIndex((screens) => !screens.includes(own.id));
+  expect(snapshots.slice(dropped).some((screens) => screens.includes(own.id))).toBe(true);
+  await expect(tv.locator('.status-panel')).toHaveCount(0);
+
+  watcher.disconnect();
+  await tv.close();
 });

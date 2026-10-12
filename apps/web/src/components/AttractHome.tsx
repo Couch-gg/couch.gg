@@ -30,6 +30,9 @@ function loadSfx(): Promise<SfxModule | null> {
 }
 
 const SCREEN_KEY = 'couch:screenId';
+// Register again this often while showing the QR code: that keeps the screen
+// id alive on the server (it expires 10 minutes after the last registration).
+const REREGISTER_MS = 4 * 60 * 1000;
 
 /**
  * Desktop / TV "attract" home. Registers a short-lived screen, shows a QR a phone can scan,
@@ -56,6 +59,8 @@ export function AttractHome({ navigate }: { navigate: (to: string) => void }) {
     let active = true;
     const socket = createSocket();
     let pollTimer: number | null = null;
+    let refreshTimer: number | null = null;
+    let registering = false;
 
     const goToLobby = (slug: string | null | undefined) => {
       if (claimedRef.current || !slug) return;
@@ -74,7 +79,14 @@ export function AttractHome({ navigate }: { navigate: (to: string) => void }) {
       if (claimedSlug) goToLobby(claimedSlug);
     };
 
-    const register = async () => {
+    // Register this TV's screen, or the one it already shows again: that
+    // keeps it alive on the server, and puts this socket (back) into the
+    // screen's room for the instant screen:claimed push. Without a usable id
+    // (none yet, or it expired) a REST registration is the fallback, so a QR
+    // code still appears when the socket can't connect.
+    const register = async (needsId: boolean) => {
+      if (registering || claimedRef.current) return;
+      registering = true;
       let stored: string | null = null;
       try {
         stored = window.sessionStorage.getItem(SCREEN_KEY);
@@ -89,19 +101,24 @@ export function AttractHome({ navigate }: { navigate: (to: string) => void }) {
         );
         applyScreen(res.screen.id, res.screen.claimedSlug);
       } catch {
-        // Socket path failed — fall back to a REST registration so the QR still appears.
+        if (!needsId) return;
         try {
           const screen = await registerScreen();
           applyScreen(screen.id, screen.claimedSlug);
         } catch {
           // Both paths failed; leave the "Connecting…" hint in place.
         }
+      } finally {
+        registering = false;
       }
     };
 
     socket.on('screen:claimed', (p: { screenId: string; slug: string }) => goToLobby(p.slug));
+    // A reconnected socket is in no room: register again to rejoin it.
+    socket.on('connect', () => void register(false));
 
-    void register();
+    void register(true);
+    refreshTimer = window.setInterval(() => void register(false), REREGISTER_MS);
 
     // REST poll fallback in case the realtime push never lands (e.g. socket dropped).
     pollTimer = window.setInterval(() => {
@@ -113,7 +130,12 @@ export function AttractHome({ navigate }: { navigate: (to: string) => void }) {
       }
       if (!id || claimedRef.current) return;
       void fetchScreen(id)
-        .then((screen) => goToLobby(screen.claimedSlug))
+        .then((screen) => {
+          // The QR code shows a dead id (the TV sat unscanned past its
+          // lifetime): get a live one, or a phone's claim would fail.
+          if (screen.expired) void register(true);
+          else goToLobby(screen.claimedSlug);
+        })
         .catch(() => {
           // Swallow poll errors — the next tick retries.
         });
@@ -122,6 +144,7 @@ export function AttractHome({ navigate }: { navigate: (to: string) => void }) {
     return () => {
       active = false;
       if (pollTimer != null) window.clearInterval(pollTimer);
+      if (refreshTimer != null) window.clearInterval(refreshTimer);
       socket.disconnect();
     };
   }, [navigate]);

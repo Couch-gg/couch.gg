@@ -26,14 +26,20 @@ export type ControllerControl =
 
 export type ControllerLayoutKind = 'trebuchet-aim-fire' | 'generic-buttons';
 
+export type ControllerControlType = 'slider' | 'button' | 'hold' | 'select' | 'stick' | 'dpad';
+
 export interface ControllerLayout {
   kind: ControllerLayoutKind;
+  // Hint for the phone: 'landscape' lays the controls out in a left and a right
+  // thumb zone (stick/d-pad left, buttons right unless a control names its zone).
+  orientation?: 'portrait' | 'landscape';
   controls: Array<{
     // Widened to string so external (creator-authored) manifests can name their
     // own controls. ControllerControl is kept exported for built-in back-compat.
     control: string;
-    type: 'slider' | 'button' | 'hold' | 'select';
+    type: ControllerControlType;
     label: string;
+    zone?: 'left' | 'right';
     min?: number;
     max?: number;
     step?: number;
@@ -48,10 +54,17 @@ export interface Player {
   isHost: boolean;
   connected: boolean;
   colorIdx: number;
+  // The screen (TV) this player sits at: the one whose QR they scanned. Null
+  // when they joined by invite link without a screen.
+  screenId?: ScreenId | null;
 }
 
 export interface Lobby {
   id: LobbyId;
+  // Grows with every change to the lobby. Of two snapshots of one lobby the
+  // one with the lower rev is older. Absent from servers before it existed,
+  // and while such a server stored the lobby last.
+  rev?: number;
   slug: LobbySlug;
   name: string;
   hostPlayerId: PlayerId | null;
@@ -67,6 +80,32 @@ export interface Lobby {
   // Populated in a later wave; optional so existing apps compile unchanged.
   mode?: 'local' | 'remote';
   inputLog?: GameInputEnvelope[];
+  // What the running game told each player's phone (labels, cooldowns, ...).
+  controllerState?: Record<PlayerId, ControllerState>;
+  // Screens (TVs) showing this lobby, in the order they first joined.
+  screens?: ScreenId[];
+  // The screen that runs a host-authoritative game: the host player's screen,
+  // else the first screen that joined.
+  hostScreenId?: ScreenId | null;
+}
+
+// A game's instructions for one player's phone, set via couch.setController.
+// `labels` and `disabled` persist until the game changes them; `cooldowns` and
+// `vibrate` are one-shot effects the phone runs once per new `seq`.
+export interface ControllerState {
+  seq: number;
+  labels: Record<string, string>;
+  disabled: string[];
+  cooldowns: Record<string, number>; // control -> ms, counted from when the phone receives it
+  vibrate: number[] | null;
+}
+
+// The patch a game sends. Omitted fields leave the current value alone.
+export interface ControllerPatch {
+  labels?: Record<string, string>;
+  disabled?: string[];
+  cooldowns?: Record<string, number>;
+  vibrate?: number | number[];
 }
 
 // One relayed controller input for an external game. Ordered by monotonic `seq`
@@ -84,7 +123,14 @@ export interface GameEventEnvelope {
   seq: number;       // monotonic per lobby; clients replay only seq > last-seen
   at: string;        // ISO
   event: unknown;    // the TrebuchetEvent (client casts)
+  // Set when a poll left the event's `snapshot` out because it is the same as
+  // the lobby's gameSession.snapshot (only for a poll that asked for that).
+  snapshotFromSession?: true;
 }
+
+// How a server's room emits reach sockets: 'redis' when they reach every
+// instance's sockets (Socket.IO Redis adapter), 'local' when only its own.
+export type FanoutMode = 'redis' | 'local';
 
 export interface GameSession<TSnapshot = unknown> {
   id: string;

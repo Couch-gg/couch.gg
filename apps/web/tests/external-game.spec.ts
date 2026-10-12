@@ -1,4 +1,9 @@
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { expect, test, type Browser } from '@playwright/test';
+
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 
 const DESKTOP_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -157,6 +162,16 @@ test('PUBLISH flow: submit via REST, play it, unpublish', async ({ browser, requ
   await expect(card).toBeVisible({ timeout: 15_000 });
   await expect(card.locator('.game-badge', { hasText: 'Community' })).toBeVisible();
 
+  // The TV reports its first load of the game (probe-result). A client
+  // address of its own keeps it out of the per-client budget the rest of the
+  // suite's TVs share (they all come from 127.0.0.1).
+  const probeIp = `10.${Math.floor(Math.random() * 256)}.${Math.floor(Math.random() * 256)}.7`;
+  const probeUrl = new RegExp(`/games/${gameId}/probe-result$`);
+  await tv.route(probeUrl, (route) =>
+    route.continue({ headers: { ...route.request().headers(), 'x-forwarded-for': probeIp } })
+  );
+  const probe = tv.waitForResponse((res) => probeUrl.test(res.url()) && res.request().method() === 'POST');
+
   // Select + start.
   await card.click();
   const start = alex.getByRole('button', { name: /Tap Race Two starten/i });
@@ -167,6 +182,18 @@ test('PUBLISH flow: submit via REST, play it, unpublish', async ({ browser, requ
   const stage = tv.locator('[data-testid="game-host-stage"]');
   await expect(stage).toBeVisible({ timeout: 20_000 });
   await expect(stage).toHaveAttribute('data-ready', 'true', { timeout: 20_000 });
+
+  // It counts: it came from the host screen (with its screen token) of the
+  // lobby running the game. The same session can't report a second time.
+  const probeResponse = await probe;
+  expect(await probeResponse.json()).toMatchObject({ counted: true, status: 'ok' });
+  const probeBody = probeResponse.request().postDataJSON();
+  expect(probeBody).toMatchObject({ slug, ok: true, screenId: expect.stringMatching(/^scr_/) });
+  const replay = await request.post(`http://127.0.0.1:4100/api/games/${gameId}/probe-result`, {
+    data: { ...probeBody, ok: false },
+    headers: { 'x-forwarded-for': probeIp }
+  });
+  expect(await replay.json()).toMatchObject({ counted: false });
 
   const frame = tv.frameLocator('iframe[title="Tap Race Two"]');
   await expect(frame.locator('[data-testid^="lane-"]', { hasText: 'Alex' })).toBeVisible({ timeout: 20_000 });
@@ -286,4 +313,24 @@ test('DEV simulator: fixture standalone shows sim overlay', async ({ page }) => 
 
   const laneCount = page.locator('[data-testid^="count-"]').first();
   await expect(laneCount).toHaveText('1', { timeout: 10_000 });
+});
+
+test('STARTER template: opened from disk it still boots the simulator', async ({ page }) => {
+  const starter = resolve(repoRoot, 'templates/couch-game-starter');
+  // The inline copy is what a file:// page runs on, so it must match the real manifest.
+  const html = readFileSync(resolve(starter, 'index.html'), 'utf-8');
+  const copy = /<script type="application\/json" id="manifest-copy">([\s\S]*?)<\/script>/.exec(html);
+  expect(JSON.parse(copy![1])).toEqual(JSON.parse(readFileSync(resolve(starter, 'couch.game.json'), 'utf-8')));
+
+  // Serve the hot-linked production SDK from this build.
+  await page.route('https://couch-gg.vercel.app/sdk/v1/couch-sdk.js', (route) =>
+    route.fulfill({ path: resolve(repoRoot, 'packages/game-sdk/dist/couch-sdk.iife.js'), contentType: 'text/javascript' })
+  );
+  await page.goto(pathToFileURL(resolve(starter, 'index.html')).href);
+
+  const simRoot = page.locator('#couch-sim-root');
+  await expect(simRoot).toBeVisible({ timeout: 15_000 });
+  await expect(page.locator('.lane-name', { hasText: 'Alex' })).toBeVisible();
+  await simRoot.locator('.couch-sim-phone').first().locator('.couch-sim-pad-button').click();
+  await expect(page.locator('#count-sim-p1')).toHaveText('1');
 });

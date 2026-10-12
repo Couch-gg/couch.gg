@@ -1,6 +1,7 @@
 import { createAdapter } from '@socket.io/redis-adapter';
 import { createClient } from 'redis';
 import type { Server, Socket } from 'socket.io';
+import type { FanoutMode } from '@couch/types';
 
 // Cross-instance broadcast. On Vercel the TV and the phones of one lobby can be
 // connected to different Function instances; without an adapter a room emit only
@@ -11,7 +12,6 @@ import type { Server, Socket } from 'socket.io';
 // Attaching is async (two Redis connections). Until it resolves, emits stay
 // instance-local, which is exactly the old behaviour, so callers don't wait.
 // Sockets that connect in the meantime are moved over by swapAdapter.
-export type FanoutMode = 'redis' | 'local';
 
 export interface Fanout {
   mode(): FanoutMode;

@@ -25,6 +25,16 @@ describe('ScreenRegistry', () => {
     expect(registry.screens.size).toBe(2);
   });
 
+  it('keeps an unclaimed screen alive while its TV registers again', () => {
+    const registry = new ScreenRegistry();
+    const first = registry.register(0);
+    const later = SCREEN_TTL_MS - 1_000;
+    expect(registry.registerOrReuse(first.id, later).id).toBe(first.id);
+    expect(first.expiresAt).toBe(later + SCREEN_TTL_MS);
+    // Past the original deadline the QR code still works.
+    expect(registry.claim(first.id, 'ABCDEF', SCREEN_TTL_MS + 1_000).claimedSlug).toBe('ABCDEF');
+  });
+
   it('claims a screen and is idempotent for the same slug', () => {
     const registry = new ScreenRegistry();
     const record = registry.register(0);
