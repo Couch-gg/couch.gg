@@ -1,0 +1,17 @@
+{
+  // Typecheck-only config for the Vercel function entries under api/. Vercel's
+  // @vercel/node compiles these files itself and only logs type errors, so the
+  // root `pnpm typecheck` runs `tsc -p api/tsconfig.json` to catch them first.
+  // @couch/realtime is mapped to its source so this works without a realtime
+  // build (its package exports point at dist/).
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["node"],
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "@couch/realtime": ["../apps/realtime/src/index.ts"]
+    }
+  },
+  "include": ["**/*.ts"]
+}
