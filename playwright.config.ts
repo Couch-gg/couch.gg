@@ -25,10 +25,19 @@ export default defineConfig({
   timeout: 60_000,
   expect: { timeout: 10_000 },
   fullyParallel: true,
+  forbidOnly: !!process.env.CI,
+  // One retry in CI so a timing flake on a shared runner records a trace
+  // (trace: 'on-first-retry') and is reported as flaky instead of failing.
+  retries: process.env.CI ? 1 : 0,
   // The suite boots multiple Phaser/WebGL canvases; cap workers so concurrent GL
-  // contexts don't starve each other and flake on canvas-mount timing.
-  workers: 3,
-  reporter: [['list'], ['html', { open: 'never', outputFolder: 'playwright-report' }]],
+  // contexts don't starve each other and flake on canvas-mount timing. Hosted
+  // CI runners have fewer cores, so use one worker less there.
+  workers: process.env.CI ? 2 : 3,
+  reporter: [
+    ...(process.env.CI ? ([['github']] as const) : []),
+    ['list'],
+    ['html', { open: 'never', outputFolder: 'playwright-report' }]
+  ],
   use: {
     baseURL: liveBaseURL ?? 'http://127.0.0.1:5173',
     trace: 'on-first-retry',
