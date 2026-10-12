@@ -6,10 +6,15 @@
 // which exposes the `CouchSDK` global. This script runs before `dev`/`build`
 // (wired in package.json) so the file is always fresh.
 //
+// It also copies the built Trebuchet sim (@couch/trebuchet dist/sim.js and
+// dist/constants.js) to public/shared/. The original Phaser scenes under
+// public/js/ import them from /shared/ in the browser; generating them here keeps
+// the TV on the same code the server runs instead of a hand-kept copy.
+//
 // Paths are resolved relative to THIS script's location, not the cwd, so it works
 // regardless of where pnpm invokes it from.
 
-import { mkdir, copyFile, access } from 'node:fs/promises';
+import { mkdir, copyFile, access, readFile, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -28,6 +33,12 @@ const dest = resolve(destDir, 'couch-sdk.js');
 const guideSource = resolve(repoRoot, 'packages', 'game-sdk', 'COUCH-GAME-GUIDE.md');
 const publicDir = resolve(scriptDir, '..', 'public');
 const guideDest = resolve(publicDir, 'COUCH-GAME-GUIDE.md');
+
+// tsc emits browser-ready ESM (sim.js imports './constants.js'). public/shared/
+// is gitignored; the source of truth is packages/games/trebuchet/src.
+const trebuchetDist = resolve(repoRoot, 'packages', 'games', 'trebuchet', 'dist');
+const sharedDir = resolve(publicDir, 'shared');
+const SHARED_MODULES = ['constants.js', 'sim.js'];
 
 async function main() {
   try {
@@ -57,6 +68,26 @@ async function main() {
   await mkdir(publicDir, { recursive: true });
   await copyFile(guideSource, guideDest);
   console.log(`[copy-sdk] Copied creator guide -> ${guideDest}`);
+
+  await mkdir(sharedDir, { recursive: true });
+  for (const file of SHARED_MODULES) {
+    const from = resolve(trebuchetDist, file);
+    try {
+      await access(from);
+    } catch {
+      console.error(
+        `[copy-sdk] Built Trebuchet module not found:\n  ${from}\n` +
+          `Run \`pnpm build:packages\` first to build @couch/trebuchet.`
+      );
+      process.exit(1);
+    }
+    // Drop the sourceMappingURL comment: the map points at ../src/*.ts, which
+    // the web server does not serve.
+    const code = (await readFile(from, 'utf-8')).replace(/\n\/\/# sourceMappingURL=.*\s*$/, '\n');
+    const banner = `// GENERATED from packages/games/trebuchet/src/${file.replace(/\.js$/, '.ts')} by apps/web/scripts/copy-sdk.mjs. Do not edit.\n`;
+    await writeFile(resolve(sharedDir, file), banner + code, 'utf-8');
+  }
+  console.log(`[copy-sdk] Copied Trebuchet sim -> ${sharedDir}`);
 }
 
 main().catch((err) => {
