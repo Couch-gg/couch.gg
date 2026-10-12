@@ -1,9 +1,10 @@
 import { Copy, MessageSquare, Plus, RotateCcw, Smartphone, Volume2, VolumeX } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { ExternalGameManifest, GameManifest, Lobby } from '@couch/types';
+import type { ExternalGameManifest, FanoutMode, GameManifest, Lobby } from '@couch/types';
 import type { Socket } from 'socket.io-client';
 import type { TrebuchetEvent, TrebuchetSnapshot } from '@couch/trebuchet';
 import { createLobby, fetchGames, fetchLobby } from '../api.js';
+import { isOlderLobby, startLobbyPoll } from '../lobbySync.js';
 import { createSocket, emitAck } from '../socket.js';
 import { ChatPanel } from '../components/ChatPanel.js';
 import { GameCatalog } from '../components/GameCatalog.js';
@@ -30,6 +31,8 @@ let sfxPromise: Promise<SfxModule | null> | null = null;
 const GAME_OVER_LINGER_MS = 5_000;
 // How often a TV the server doesn't list (anymore) may ask to join again.
 const REJOIN_INTERVAL_MS = 3_000;
+// How often to fetch the catalog again while the lobby's game isn't in it.
+const CATALOG_RETRY_MS = 5_000;
 const SCREENS_FULL_NOTICE = 'Diese Lobby hat schon genug Screens. Dieser Screen schaut nur zu, bis einer frei wird.';
 
 const SCREEN_ID_KEY = 'couch:screenId';
@@ -101,6 +104,12 @@ function statusOf(err: unknown): number | undefined {
   return (err as { status?: number } | null)?.status;
 }
 
+// Only the built-in Trebuchet snapshot has `units`; an external game's is
+// { kind: 'external', seed }.
+function isTrebuchetSnapshot(snapshot: unknown): snapshot is TrebuchetSnapshot {
+  return !!snapshot && typeof snapshot === 'object' && 'units' in snapshot;
+}
+
 function loadSfx(): Promise<SfxModule | null> {
   if (sfxPromise) return sfxPromise;
   sfxPromise = (async () => {
@@ -132,6 +141,18 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
   const [screenId, setScreenId] = useState(ownScreenId);
   const screenIdRef = useRef(screenId);
 
+  // The lobby shown, replaced only by snapshots that are not older (see
+  // isOlderLobby). Returns whether `next` was taken.
+  const lobbyRef = useRef<Lobby | null>(null);
+  const takeLobby = useCallback((next: Lobby): boolean => {
+    if (isOlderLobby(lobbyRef.current, next)) return false;
+    lobbyRef.current = next;
+    setLobby(next);
+    return true;
+  }, []);
+  // Asks the poll for the lobby out of turn (for missing game inputs).
+  const pollNowRef = useRef<() => void>(() => {});
+
   // A shot can reach this screen via the socket (same instance, instant) or via the
   // polled/snapshot lobby state (cross-instance, ≤750ms). Dedupe by monotonic seq so
   // it animates exactly once regardless of which path wins the race.
@@ -144,12 +165,11 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
 
   useEffect(() => {
     let active = true;
-    // The first join is through (or found no room): from then on reconnects
-    // and the listing check below join again.
-    let ready = false;
     let joining = false;
     let lastJoinAt = 0;
     let replacedId = false;
+    // What the latest screen:join ack said about the server's fan-out.
+    let fanout: FanoutMode | null = null;
     const socket = createSocket();
     setSocket(socket);
     // Join this lobby as this TV. If the server says the screen id belongs to
@@ -161,15 +181,23 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
         for (;;) {
           const id = screenIdRef.current;
           try {
-            const joined = await emitAck<{ ok: true; lobby: Lobby; games: GameManifest[]; screenToken?: string }>(socket, 'screen:join', {
+            const joined = await emitAck<{
+              ok: true;
+              lobby: Lobby;
+              games: GameManifest[];
+              screenToken?: string;
+              fanout?: FanoutMode;
+            }>(socket, 'screen:join', {
               slug,
               screenId: id,
               screenToken: readScreenToken(slug, id)
             });
             if (joined.screenToken) keepScreenToken(slug, id, joined.screenToken);
+            fanout = joined.fanout ?? null;
             if (active) {
               setNotice(null);
-              if (joined.lobby) setLobby(joined.lobby);
+              if (joined.lobby) takeLobby(joined.lobby);
+              if (joined.games) setGames(joined.games);
             }
             return;
           } catch (err) {
@@ -202,57 +230,62 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
     // write got lost between instances), and an unlisted TV is never the host
     // screen: whenever a snapshot doesn't list this one, join again.
     const checkListed = (next: Lobby) => {
-      if (!ready || joining || !socket.connected || !next.screens) return;
+      if (joining || !socket.connected || !next.screens) return;
       if (next.screens.includes(screenIdRef.current)) return;
       if (Date.now() - lastJoinAt < REJOIN_INTERVAL_MS) return;
       rejoin();
     };
 
-    Promise.all([fetchLobby(slug), fetchGames()])
-      .then(([initialLobby, gameList]) => {
-        if (!active) return;
-        setLobby(initialLobby);
-        setGames(gameList);
-        return joinScreen().catch((err) => {
-          if (!noRoom(err)) throw err;
-        });
-      })
-      .then(() => {
-        ready = true;
-      })
-      .catch((err) => active && setError(err instanceof Error ? err.message : 'Lobby konnte nicht geladen werden'));
+    // Only a lobby that doesn't exist (anymore) ends on the error page. A
+    // failed join or catalog fetch doesn't: reconnects, the listing check and
+    // the poll get past those.
+    fetchLobby(slug)
+      .then((initialLobby) => active && takeLobby(initialLobby))
+      .catch((err) => {
+        const status = statusOf(err);
+        if (active && (status === 404 || status === 410)) {
+          setError(err instanceof Error ? err.message : 'Lobby nicht gefunden');
+        }
+      });
+    fetchGames()
+      .then((gameList) => active && setGames(gameList))
+      .catch(() => {
+        // The screen:join ack carries the catalog too.
+      });
+    rejoin();
 
     // After a dropped connection the server no longer has this socket in the
-    // lobby room (no inputs, no host role for broadcasts): rejoin.
-    socket.on('connect', () => {
-      if (ready) rejoin();
+    // lobby room (no inputs, no host role for broadcasts): rejoin. The first
+    // connect finds the join above still waiting for it.
+    socket.on('connect', rejoin);
+    socket.on('disconnect', () => {
+      fanout = null;
     });
     socket.on('lobby:snapshot', (next: Lobby) => {
-      setLobby(next);
-      checkListed(next);
+      if (takeLobby(next)) checkListed(next);
     });
     socket.on('game:event', (p: { seq: number; event: TrebuchetEvent }) => applyGameEvent(p.seq, p.event));
     socket.on('game:control', (control: TrebuchetControlEvent) => setLastControlEvent(control));
 
-    const refreshTimer = window.setInterval(() => {
-      void fetchLobby(slug)
-        .then((next) => {
-          if (!active) return;
-          setLobby(next);
-          checkListed(next);
-        })
-        .catch(() => {
-          // Socket errors still surface during initial load; polling stays quiet.
-        });
-    }, 750);
+    // Socket errors still surface during initial load; polling stays quiet.
+    const poll = startLobbyPoll({
+      slug,
+      socket,
+      fanout: () => fanout,
+      onLobby: (next) => {
+        if (active && takeLobby(next)) checkListed(next);
+      }
+    });
+    pollNowRef.current = poll.pollNow;
 
     return () => {
       active = false;
-      window.clearInterval(refreshTimer);
+      poll.stop();
+      pollNowRef.current = () => {};
       socket.disconnect();
       setSocket(null);
     };
-  }, [slug, applyGameEvent]);
+  }, [slug, applyGameEvent, takeLobby]);
 
   // Replay the latest event carried inside the polled/snapshot lobby state. This is the
   // cross-instance path: when the opponent fired on a different serverless instance the
@@ -296,20 +329,30 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
 
   const inviteUrl = useMemo(() => `${window.location.origin}/j/${slug}`, [slug]);
   const eventSnapshot = lastEvent && 'snapshot' in lastEvent ? (lastEvent.snapshot as TrebuchetSnapshot) : undefined;
-  const snapshot = (lobby?.gameSession?.snapshot as TrebuchetSnapshot | undefined) ?? eventSnapshot;
+  const rawSnapshot = lobby?.gameSession?.snapshot;
+  const snapshot = isTrebuchetSnapshot(rawSnapshot) ? rawSnapshot : eventSnapshot;
   const currentGame = games.find((game) => game.id === lobby?.currentGameId);
   // An external game is any resolved manifest whose origin is 'external' (the
   // catalog now returns those from GET /api/games). Absent origin ⇒ builtin.
   const externalManifest =
     currentGame && currentGame.origin === 'external' ? (currentGame as ExternalGameManifest) : null;
 
-  // Strict seq-ordered relay: socket 'game:input' + polled inputLog -> iframe.
-  // Always mounted (hooks can't be conditional); it no-ops until an external
-  // game is playing and the ref is attached.
-  const forwardInput = useCallback((input: Parameters<GameHostStageHandle['forwardInput']>[0]) => {
-    gameHostRef.current?.forwardInput(input);
-  }, []);
-  useExternalGameInputs({ socket, lobby, onInput: forwardInput });
+  // The lobby's game isn't in this TV's catalog: it was published after the
+  // catalog was loaded (or reached this instance's cache first). Fetch the
+  // catalog again, so the game can be shown, at most every CATALOG_RETRY_MS.
+  const catalogRetryRef = useRef<{ gameId: string; at: number } | null>(null);
+  const unknownGameId = lobby && !currentGame ? lobby.currentGameId : null;
+  useEffect(() => {
+    if (!unknownGameId) return;
+    const last = catalogRetryRef.current;
+    if (last && last.gameId === unknownGameId && Date.now() - last.at < CATALOG_RETRY_MS) return;
+    catalogRetryRef.current = { gameId: unknownGameId, at: Date.now() };
+    void fetchGames()
+      .then((gameList) => setGames(gameList))
+      .catch(() => {
+        // Tried again on a later lobby update.
+      });
+  }, [unknownGameId, lobby]);
 
   // GAME-OVER LINGER: the server flips the lobby to 'ended' within milliseconds
   // of couch:gameOver, which would unmount the iframe before anyone sees the
@@ -347,6 +390,16 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
   // same element position across playing → linger keeps the iframe instance
   // (and the game's winner screen) alive through the transition.
   const stageManifest = lobby?.state === 'playing' ? externalManifest : lingerManifest;
+
+  // Strict seq-ordered relay: socket 'game:input' + polled inputLog -> iframe.
+  // Always mounted (hooks can't be conditional). It only sees the lobby while
+  // a stage is there to take the inputs: an input passed on with no stage
+  // would count as delivered and never reach the game once it mounts.
+  const forwardInput = useCallback((input: Parameters<GameHostStageHandle['forwardInput']>[0]) => {
+    gameHostRef.current?.forwardInput(input);
+  }, []);
+  const pollForGap = useCallback(() => pollNowRef.current(), []);
+  useExternalGameInputs({ socket, lobby: stageManifest ? lobby : null, onInput: forwardInput, onGap: pollForGap });
 
   const createAnother = async () => {
     const next = await createLobby();
@@ -438,7 +491,12 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
             </span>
           </div>
           {stageManifest && lobby ? (
+            // One stage per round: a new round (even of the same game, even
+            // during the game-over linger) gets a fresh iframe and a fresh
+            // couch:init with its own seed. The linger keeps the session id,
+            // so the winner screen stays up.
             <GameHostStage
+              key={lobby.gameSession?.id ?? ''}
               ref={gameHostRef}
               manifest={stageManifest}
               lobby={lobby}
@@ -448,7 +506,14 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
               mode="live"
             />
           ) : lobby?.state === 'playing' ? (
-            <TrebuchetStage snapshot={snapshot ?? null} event={lastEvent} controlEvent={lastControlEvent} />
+            (currentGame && currentGame.origin !== 'external') || isTrebuchetSnapshot(rawSnapshot) ? (
+              <TrebuchetStage snapshot={snapshot ?? null} event={lastEvent} controlEvent={lastControlEvent} />
+            ) : (
+              // An external game this TV's catalog doesn't know yet.
+              <div className="stage-pending muted" data-testid="stage-pending">
+                Spiel wird geladen…
+              </div>
+            )
           ) : (
             <GameCatalog
               games={games}

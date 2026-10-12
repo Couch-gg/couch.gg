@@ -43,6 +43,8 @@
       });
       window.couch = couch;
       labelPlayers(couch.players);
+      // The host tearing the stage down must reach the game (the e2e reads this).
+      couch.on('abort', (e) => console.log('[input-lab] abort ' + e.reason));
 
       const show = (id, text) => (document.querySelector('[data-testid="' + id + '"]').textContent = text);
       const renderScreen = () => {

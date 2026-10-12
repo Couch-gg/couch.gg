@@ -1,4 +1,9 @@
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { expect, test, type Browser } from '@playwright/test';
+
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 
 const DESKTOP_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -308,4 +313,24 @@ test('DEV simulator: fixture standalone shows sim overlay', async ({ page }) => 
 
   const laneCount = page.locator('[data-testid^="count-"]').first();
   await expect(laneCount).toHaveText('1', { timeout: 10_000 });
+});
+
+test('STARTER template: opened from disk it still boots the simulator', async ({ page }) => {
+  const starter = resolve(repoRoot, 'templates/couch-game-starter');
+  // The inline copy is what a file:// page runs on, so it must match the real manifest.
+  const html = readFileSync(resolve(starter, 'index.html'), 'utf-8');
+  const copy = /<script type="application\/json" id="manifest-copy">([\s\S]*?)<\/script>/.exec(html);
+  expect(JSON.parse(copy![1])).toEqual(JSON.parse(readFileSync(resolve(starter, 'couch.game.json'), 'utf-8')));
+
+  // Serve the hot-linked production SDK from this build.
+  await page.route('https://couch-gg.vercel.app/sdk/v1/couch-sdk.js', (route) =>
+    route.fulfill({ path: resolve(repoRoot, 'packages/game-sdk/dist/couch-sdk.iife.js'), contentType: 'text/javascript' })
+  );
+  await page.goto(pathToFileURL(resolve(starter, 'index.html')).href);
+
+  const simRoot = page.locator('#couch-sim-root');
+  await expect(simRoot).toBeVisible({ timeout: 15_000 });
+  await expect(page.locator('.lane-name', { hasText: 'Alex' })).toBeVisible();
+  await simRoot.locator('.couch-sim-phone').first().locator('.couch-sim-pad-button').click();
+  await expect(page.locator('#count-sim-p1')).toHaveText('1');
 });
