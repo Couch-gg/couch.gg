@@ -65,10 +65,18 @@ export interface CouchInputEnvelope {
 export interface CouchControl {
   /** Machine name emitted on inputs (matches `CouchInputEnvelope.control`). */
   control: string;
-  /** Rendering kind the phone/simulator uses. */
-  type: 'slider' | 'button' | 'hold' | 'select';
+  /**
+   * Rendering kind the phone/simulator uses.
+   * - `stick`: analog thumbstick. `change` with `{ x, y }` in -1..1 (y up),
+   *   throttled; `release` with `{ x: 0, y: 0 }` when the thumb lifts.
+   * - `dpad`: 8-way pad. `change` with `{ dir }` ('up' | 'up-right' | 'right' |
+   *   ... ) whenever the direction changes; `release` with `{ dir: 'none' }`.
+   */
+  type: 'slider' | 'button' | 'hold' | 'select' | 'stick' | 'dpad';
   /** Human label shown on the controller. */
   label: string;
+  /** Landscape layouts: which thumb zone the control sits in. */
+  zone?: 'left' | 'right';
   /** For sliders: bounds/step. */
   min?: number;
   max?: number;
@@ -81,6 +89,8 @@ export interface CouchControl {
 export interface CouchControllerLayout {
   /** Layout family. External games use `'generic-buttons'`. */
   kind: 'trebuchet-aim-fire' | 'generic-buttons' | string;
+  /** `'landscape'`: the phone shows a left and a right thumb zone. */
+  orientation?: 'portrait' | 'landscape';
   controls: CouchControl[];
 }
 

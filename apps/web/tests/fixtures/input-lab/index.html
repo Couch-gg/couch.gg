@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Input Lab</title>
+  <style>
+    body { margin: 0; background: #111; color: #eee; font: 14px ui-monospace, monospace; }
+    #log { white-space: pre-wrap; padding: 12px; }
+  </style>
+</head>
+<body>
+  <!-- One JSON line per input: { playerId, control, action, value }. -->
+  <div id="log" data-testid="log"></div>
+  <script src="./couch-sdk.js"></script>
+  <script>
+    async function main() {
+      const manifest = await fetch('./couch.game.json').then((r) => r.json());
+      const log = document.getElementById('log');
+      const couch = await CouchSDK.init({
+        manifest,
+        onInput(input) {
+          log.textContent += JSON.stringify({
+            playerId: input.playerId,
+            control: input.control,
+            action: input.action,
+            value: input.value
+          }) + '\n';
+        }
+      });
+      window.couch = couch;
+    }
+    main();
+  </script>
+</body>
+</html>

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type PointerEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type PointerEvent, type ReactElement } from 'react';
 import type { ControllerLayout, InputAction } from '@couch/types';
 
 // Manifest-driven phone controller for external games. Renders whatever
@@ -11,6 +11,13 @@ import type { ControllerLayout, InputAction } from '@couch/types';
 const HOLD_TICK_MS = 120;
 const HOLD_RAMP_MS = 1500;
 const SLIDER_COALESCE_MS = 100;
+// Thumbstick: at most ~15 changes/s, inside the server's 20/s per-player budget.
+const STICK_THROTTLE_MS = 66;
+const STICK_DEADZONE = 0.12;
+const STICK_MIN_DELTA = 0.04;
+const DPAD_DEADZONE = 0.25;
+
+type LayoutControl = ControllerLayout['controls'][number];
 
 interface GenericControllerProps {
   layout: ControllerLayout;
@@ -20,61 +27,106 @@ interface GenericControllerProps {
 
 export function GenericController({ layout, enabled, onEvent }: GenericControllerProps) {
   const controls = layout.controls ?? [];
-  const sliders = controls.filter((c) => c.type === 'slider');
-  const selects = controls.filter((c) => c.type === 'select');
-  const actions = controls.filter((c) => c.type === 'button' || c.type === 'hold');
-  const singleCluster = controls.length <= 2;
+
+  const render = (control: LayoutControl) => {
+    const key = control.control;
+    const base = { control: control.control, label: control.label, enabled, onEvent };
+    switch (control.type) {
+      case 'stick':
+        return <StickControl key={key} {...base} />;
+      case 'dpad':
+        return <DpadControl key={key} {...base} />;
+      case 'hold':
+        return <HoldControl key={key} {...base} />;
+      case 'select':
+        return <SelectControl key={key} {...base} options={control.options ?? []} />;
+      case 'slider':
+        return <SliderControl key={key} {...base} min={control.min ?? 0} max={control.max ?? 100} step={control.step ?? 1} />;
+      default:
+        return <ButtonControl key={key} {...base} />;
+    }
+  };
 
   return (
-    <div className={`generic-controls retro-pad${enabled ? '' : ' generic-disabled'}`} aria-disabled={!enabled}>
+    <div
+      className={`generic-controls retro-pad${enabled ? '' : ' generic-disabled'}${layout.orientation === 'landscape' ? ' generic-landscape' : ''}`}
+      aria-disabled={!enabled}
+    >
       <div className="retro-pad-shell generic-pad-shell">
         <div className="retro-pad-brand">
           <span className={enabled ? 'retro-led on' : 'retro-led'} aria-hidden="true" />
           <span className="retro-pad-name">COUCH.GG</span>
           <span className="retro-pad-model" aria-hidden="true">GEN-01</span>
         </div>
-
-        {selects.length > 0 ? (
-          <div className="generic-select-row">
-            {selects.map((control) => (
-              <SelectControl key={control.control} control={control.control} label={control.label} options={control.options ?? []} enabled={enabled} onEvent={onEvent} />
-            ))}
-          </div>
-        ) : null}
-
-        <div className={`generic-cluster${singleCluster ? ' generic-cluster-single' : ''}`}>
-          {sliders.length > 0 ? (
-            <div className="generic-slider-col">
-              {sliders.map((control) => (
-                <SliderControl
-                  key={control.control}
-                  control={control.control}
-                  label={control.label}
-                  min={control.min ?? 0}
-                  max={control.max ?? 100}
-                  step={control.step ?? 1}
-                  enabled={enabled}
-                  onEvent={onEvent}
-                />
-              ))}
-            </div>
-          ) : null}
-
-          {actions.length > 0 ? (
-            <div className="generic-action-cluster">
-              {actions.map((control) =>
-                control.type === 'hold' ? (
-                  <HoldControl key={control.control} control={control.control} label={control.label} enabled={enabled} onEvent={onEvent} />
-                ) : (
-                  <ButtonControl key={control.control} control={control.control} label={control.label} enabled={enabled} onEvent={onEvent} />
-                )
-              )}
-            </div>
-          ) : null}
-        </div>
+        {layout.orientation === 'landscape' ? (
+          <LandscapeZones controls={controls} render={render} />
+        ) : (
+          <PortraitLayout controls={controls} render={render} />
+        )}
       </div>
     </div>
   );
+}
+
+function isDirectional(control: LayoutControl): boolean {
+  return control.type === 'stick' || control.type === 'dpad';
+}
+
+// Landscape: a left and a right thumb zone. Directional controls default left,
+// everything else right; a control's own `zone` wins.
+function LandscapeZones({ controls, render }: { controls: LayoutControl[]; render: (c: LayoutControl) => ReactElement }) {
+  const zoneOf = (control: LayoutControl) => control.zone ?? (isDirectional(control) ? 'left' : 'right');
+  const left = controls.filter((control) => zoneOf(control) === 'left');
+  const right = controls.filter((control) => zoneOf(control) === 'right');
+  return (
+    <div className="generic-zones">
+      <div className="generic-zone generic-zone-left">{left.map(render)}</div>
+      <div className="generic-zone generic-zone-right">{right.map(render)}</div>
+    </div>
+  );
+}
+
+function PortraitLayout({ controls, render }: { controls: LayoutControl[]; render: (c: LayoutControl) => ReactElement }) {
+  const sliders = controls.filter((c) => c.type === 'slider');
+  const selects = controls.filter((c) => c.type === 'select');
+  const directional = controls.filter(isDirectional);
+  const actions = controls.filter((c) => c.type === 'button' || c.type === 'hold');
+  const singleCluster = sliders.length + actions.length <= 2 && sliders.length === 0;
+
+  return (
+    <>
+      {selects.length > 0 ? <div className="generic-select-row">{selects.map(render)}</div> : null}
+      {directional.length > 0 ? <div className="generic-analog-row">{directional.map(render)}</div> : null}
+      {sliders.length + actions.length > 0 ? (
+        <div className={`generic-cluster${singleCluster || sliders.length === 0 || actions.length === 0 ? ' generic-cluster-single' : ''}`}>
+          {sliders.length > 0 ? <div className="generic-slider-col">{sliders.map(render)}</div> : null}
+          {actions.length > 0 ? <div className="generic-action-cluster">{actions.map(render)}</div> : null}
+        </div>
+      ) : null}
+    </>
+  );
+}
+
+// Calls `release` when the phone stops being usable mid-press: screen lock, app
+// switch, tab hidden, window blur. Without this a pointer that never gets its
+// pointerup leaves the control held on the TV.
+function useReleaseOnHide(release: () => void): void {
+  const releaseRef = useRef(release);
+  releaseRef.current = release;
+  useEffect(() => {
+    const fire = () => releaseRef.current();
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') fire();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('pagehide', fire);
+    window.addEventListener('blur', fire);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('pagehide', fire);
+      window.removeEventListener('blur', fire);
+    };
+  }, []);
 }
 
 // Guarded haptics: no-op when the device/browser does not support vibration
@@ -113,6 +165,7 @@ function ButtonControl({ control, label, enabled, onEvent }: ControlBaseProps) {
     activeRef.current = false;
     onEvent(control, 'release');
   };
+  useReleaseOnHide(release);
 
   return (
     <button
@@ -182,6 +235,7 @@ function HoldControl({ control, label, enabled, onEvent }: ControlBaseProps) {
     haptic(30);
     onEvent(control, 'release', { heldMs });
   };
+  useReleaseOnHide(end);
 
   return (
     <button
@@ -354,6 +408,210 @@ function SelectControl({ control, label, options, enabled, onEvent }: SelectCont
       </div>
     </div>
   );
+}
+
+// Pointer position relative to an element's centre, as a vector in the unit
+// circle with y pointing up.
+function vectorFrom(el: HTMLElement, clientX: number, clientY: number): { x: number; y: number } {
+  const rect = el.getBoundingClientRect();
+  const radius = Math.min(rect.width, rect.height) / 2 || 1;
+  let x = (clientX - (rect.left + rect.width / 2)) / radius;
+  let y = -(clientY - (rect.top + rect.height / 2)) / radius;
+  const length = Math.hypot(x, y);
+  if (length > 1) {
+    x /= length;
+    y /= length;
+  }
+  return { x, y };
+}
+
+function StickControl({ control, label, enabled, onEvent }: ControlBaseProps) {
+  const baseRef = useRef<HTMLDivElement | null>(null);
+  const activeRef = useRef(false);
+  // The finger that grabbed the stick; a second finger landing on it is ignored.
+  const pointerRef = useRef<number | null>(null);
+  const [knob, setKnob] = useState({ x: 0, y: 0 });
+  const sentRef = useRef({ x: 0, y: 0 });
+  const lastSendRef = useRef(0);
+  const trailingRef = useRef<number | null>(null);
+  const latestRef = useRef({ x: 0, y: 0 });
+
+  const clearTrailing = () => {
+    if (trailingRef.current != null) {
+      window.clearTimeout(trailingRef.current);
+      trailingRef.current = null;
+    }
+  };
+  useEffect(() => clearTrailing, []);
+
+  const send = () => {
+    clearTrailing();
+    const next = latestRef.current;
+    if (Math.abs(next.x - sentRef.current.x) < STICK_MIN_DELTA && Math.abs(next.y - sentRef.current.y) < STICK_MIN_DELTA) return;
+    sentRef.current = next;
+    lastSendRef.current = performance.now();
+    onEvent(control, 'change', next);
+  };
+
+  const move = (clientX: number, clientY: number) => {
+    const el = baseRef.current;
+    if (!el) return;
+    const raw = vectorFrom(el, clientX, clientY);
+    setKnob(raw);
+    const inDeadzone = Math.hypot(raw.x, raw.y) < STICK_DEADZONE;
+    latestRef.current = inDeadzone ? { x: 0, y: 0 } : { x: round2(raw.x), y: round2(raw.y) };
+    const wait = STICK_THROTTLE_MS - (performance.now() - lastSendRef.current);
+    if (wait <= 0) send();
+    else if (trailingRef.current == null) trailingRef.current = window.setTimeout(send, wait);
+  };
+
+  const release = () => {
+    if (!activeRef.current) return;
+    activeRef.current = false;
+    pointerRef.current = null;
+    clearTrailing();
+    setKnob({ x: 0, y: 0 });
+    latestRef.current = { x: 0, y: 0 };
+    sentRef.current = { x: 0, y: 0 };
+    onEvent(control, 'release', { x: 0, y: 0 });
+  };
+  useReleaseOnHide(release);
+  // Only the owning finger lifting (or being cancelled) lets go of the control.
+  const releasePointer = (event: PointerEvent<HTMLDivElement>) => {
+    if (event.pointerId === pointerRef.current) release();
+  };
+
+  return (
+    <div className="generic-stick-wrap">
+      <div
+        ref={baseRef}
+        className={`generic-stick${enabled ? '' : ' disabled'}${activeRef.current ? ' active' : ''}`}
+        role="application"
+        aria-label={label}
+        data-control={control}
+        onPointerDown={(event) => {
+          if (!enabled || activeRef.current) return;
+          event.preventDefault();
+          try {
+            event.currentTarget.setPointerCapture(event.pointerId);
+          } catch {
+            // ignore stale pointer ids
+          }
+          activeRef.current = true;
+          pointerRef.current = event.pointerId;
+          haptic(10);
+          move(event.clientX, event.clientY);
+        }}
+        onPointerMove={(event) => {
+          if (!activeRef.current || event.pointerId !== pointerRef.current) return;
+          event.preventDefault();
+          move(event.clientX, event.clientY);
+        }}
+        onPointerUp={releasePointer}
+        onPointerCancel={releasePointer}
+        onLostPointerCapture={releasePointer}
+        onContextMenu={(e) => e.preventDefault()}
+      >
+        <span
+          className="generic-stick-knob"
+          style={{ transform: `translate(${knob.x * 50}%, ${-knob.y * 50}%)` }}
+          aria-hidden="true"
+        />
+      </div>
+      <span className="generic-slider-label">{label}</span>
+    </div>
+  );
+}
+
+const DPAD_DIRS = ['right', 'up-right', 'up', 'up-left', 'left', 'down-left', 'down', 'down-right'] as const;
+type DpadDir = (typeof DPAD_DIRS)[number] | 'none';
+
+function dpadDirection(v: { x: number; y: number }): DpadDir {
+  if (Math.hypot(v.x, v.y) < DPAD_DEADZONE) return 'none';
+  const angle = Math.atan2(v.y, v.x); // 0 = right, counter-clockwise
+  const sector = Math.round(angle / (Math.PI / 4));
+  return DPAD_DIRS[(sector + 8) % 8];
+}
+
+function DpadControl({ control, label, enabled, onEvent }: ControlBaseProps) {
+  const padRef = useRef<HTMLDivElement | null>(null);
+  const activeRef = useRef(false);
+  // The finger that pressed the d-pad; a second finger landing on it is ignored.
+  const pointerRef = useRef<number | null>(null);
+  const dirRef = useRef<DpadDir>('none');
+  const [dir, setDir] = useState<DpadDir>('none');
+
+  const apply = (next: DpadDir) => {
+    if (next === dirRef.current) return;
+    dirRef.current = next;
+    setDir(next);
+    if (next === 'none') {
+      onEvent(control, 'release', { dir: 'none' });
+    } else {
+      haptic(8);
+      onEvent(control, 'change', { dir: next });
+    }
+  };
+
+  const track = (clientX: number, clientY: number) => {
+    const el = padRef.current;
+    if (el) apply(dpadDirection(vectorFrom(el, clientX, clientY)));
+  };
+
+  const release = () => {
+    if (!activeRef.current) return;
+    activeRef.current = false;
+    pointerRef.current = null;
+    apply('none');
+  };
+  useReleaseOnHide(release);
+  // Only the owning finger lifting (or being cancelled) lets go of the control.
+  const releasePointer = (event: PointerEvent<HTMLDivElement>) => {
+    if (event.pointerId === pointerRef.current) release();
+  };
+
+  return (
+    <div className="generic-stick-wrap">
+      <div
+        ref={padRef}
+        className={`generic-dpad${enabled ? '' : ' disabled'}`}
+        role="application"
+        aria-label={label}
+        data-control={control}
+        data-dir={dir}
+        onPointerDown={(event) => {
+          if (!enabled || activeRef.current) return;
+          event.preventDefault();
+          try {
+            event.currentTarget.setPointerCapture(event.pointerId);
+          } catch {
+            // ignore stale pointer ids
+          }
+          activeRef.current = true;
+          pointerRef.current = event.pointerId;
+          track(event.clientX, event.clientY);
+        }}
+        onPointerMove={(event) => {
+          if (!activeRef.current || event.pointerId !== pointerRef.current) return;
+          event.preventDefault();
+          track(event.clientX, event.clientY);
+        }}
+        onPointerUp={releasePointer}
+        onPointerCancel={releasePointer}
+        onLostPointerCapture={releasePointer}
+        onContextMenu={(e) => e.preventDefault()}
+      >
+        {(['up', 'right', 'down', 'left'] as const).map((arm) => (
+          <span key={arm} className={`generic-dpad-arm ${arm}${dir.includes(arm) ? ' lit' : ''}`} aria-hidden="true" />
+        ))}
+      </div>
+      <span className="generic-slider-label">{label}</span>
+    </div>
+  );
+}
+
+function round2(value: number): number {
+  return Math.round(value * 100) / 100;
 }
 
 function clamp01(value: number): number {

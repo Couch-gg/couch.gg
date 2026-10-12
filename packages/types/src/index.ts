@@ -26,14 +26,20 @@ export type ControllerControl =
 
 export type ControllerLayoutKind = 'trebuchet-aim-fire' | 'generic-buttons';
 
+export type ControllerControlType = 'slider' | 'button' | 'hold' | 'select' | 'stick' | 'dpad';
+
 export interface ControllerLayout {
   kind: ControllerLayoutKind;
+  // Hint for the phone: 'landscape' lays the controls out in a left and a right
+  // thumb zone (stick/d-pad left, buttons right unless a control names its zone).
+  orientation?: 'portrait' | 'landscape';
   controls: Array<{
     // Widened to string so external (creator-authored) manifests can name their
     // own controls. ControllerControl is kept exported for built-in back-compat.
     control: string;
-    type: 'slider' | 'button' | 'hold' | 'select';
+    type: ControllerControlType;
     label: string;
+    zone?: 'left' | 'right';
     min?: number;
     max?: number;
     step?: number;

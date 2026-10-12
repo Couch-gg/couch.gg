@@ -280,6 +280,8 @@ envelope is exactly the `data` object shown:
 | `hold`   | `press`, then repeated `change`, then `release` | `change` → `{ progress }` (0–1); `release` → `{ heldMs }` |
 | `slider` | repeated `change` while dragging, plus a final `change` on release | `{ value }` (a number, snapped to `min`/`max`/`step`) |
 | `select` | `change` on each tap          | `{ value }` (the chosen option string) |
+| `stick`  | repeated `change` while the thumb moves, then `release` | `change` → `{ x, y }` (each -1..1, y is up); `release` → `{ x: 0, y: 0 }` |
+| `dpad`   | `change` each time the direction changes, then `release` | `change` → `{ dir }` (`'up'`, `'up-right'`, `'right'`, `'down-right'`, `'down'`, `'down-left'`, `'left'`, `'up-left'`); `release` → `{ dir: 'none' }` (thumb lifted or back in the centre) |
 
 Cadence details (so you know how often events arrive):
 
@@ -290,6 +292,23 @@ Cadence details (so you know how often events arrive):
   even if it was coalesced away. So the last value is authoritative.
 - **button**: `press` on pointer-down, `release` on pointer-up/leave.
 - **select**: one `change` per tap with the picked option.
+- **stick**: `change` at most every **~66 ms** (about 15/s), only when the
+  position moved; the thumb lifting always sends `release` at rest.
+- **dpad**: one `change` per new direction, never repeats while held. If the
+  rate limit drops a change, the previous direction stays in effect until the
+  phone's resend lands (see below), the next direction change, or the release.
+
+If the rate limit drops a `change` (stick, d-pad, slider, hold), the phone
+resends it about **100 ms** later as long as it is still that control's newest
+value, so a held position catches up instead of staying stale until the next
+move. The release of a held control is never dropped by the rate limit, and the
+phone releases every held control when it is locked, backgrounded or loses
+focus. A `release` is always the last thing you get for a control the player let
+go of.
+
+**Layout hint.** Set `controllerLayout.orientation: 'landscape'` for action
+games: the phone then shows a left and a right thumb zone. Sticks and d-pads go
+left and everything else right, unless a control sets `zone: 'left' | 'right'`.
 
 The dev simulator emits the **same** shapes, so what you test locally matches
 production.
@@ -362,7 +381,9 @@ numeric string is a type error, not a number. Strings are trimmed.
 | `controllerLayout.kind` | string | Must be exactly `'generic-buttons'`. |
 | `controllerLayout.controls` | array | 1–12 controls. |
 | `controls[].control` | string | Matches `^[a-z0-9._-]{1,32}$`. Unique within the layout. |
-| `controls[].type` | string | One of `button` \| `hold` \| `slider` \| `select`. |
+| `controllerLayout.orientation` | string | Optional. `'portrait'` (default) or `'landscape'`. |
+| `controls[].type` | string | One of `button` \| `hold` \| `slider` \| `select` \| `stick` \| `dpad`. |
+| `controls[].zone` | string | Optional. `'left'` or `'right'` (used by landscape layouts). |
 | `controls[].label` | string | 1–16 chars after trim. |
 | `controls[].min` / `max` | number | **Required for `slider`.** `min < max`. |
 | `controls[].step` | number | Optional for `slider`; if present, `> 0`. |
@@ -479,11 +500,12 @@ after `gameOver` — the controllers move on. Highest `score` wins by convention
 
 From `rate-limit.ts`, `lobbies.ts`, and `GameHostStage.tsx`:
 
-- **Per-player input rate**: token bucket, capacity **20** (burst), refill **10
+- **Per-player input rate**: token bucket, capacity **40** (burst), refill **20
   tokens/second**. Inputs beyond this from one player are silently dropped
-  (not an error) — the controller stream stays healthy.
-- **Per-lobby aggregate input rate**: capacity **60** (burst), refill **30
-  tokens/second** across all players.
+  (not an error) — the controller stream stays healthy. The `release` of a
+  control the phone is holding is exempt and always delivered.
+- **Per-lobby aggregate input rate**: capacity **320** (burst), refill **160
+  tokens/second** across all players (the per-player budget times 8 players).
 - **Input `value` size**: the `data` payload is JSON-encoded and capped at
   **1024 bytes**; larger is rejected with a 413. Keep control values tiny (a
   number, a short string).
@@ -499,7 +521,7 @@ From `rate-limit.ts`, `lobbies.ts`, and `GameHostStage.tsx`:
 
 These are per serverless instance; do not treat them as a hard global quota, but
 do design well within them. For a mash game, sending one `press` per tap is far
-under 10/s per player in practice.
+under 20/s per player in practice.
 
 ---
 
@@ -519,7 +541,7 @@ box. `CouchSDK.init` resolves immediately with `mode: 'dev'`.
   with your declared controls.
 - Player 1 also takes **keyboard** input: number keys `1`–`9` press the Nth
   button/hold control, `Space` holds the first hold control, `Arrow Up/Down`
-  nudge the first slider.
+  nudge the first slider, `W`/`A`/`S`/`D` steer the first stick or d-pad.
 - Calling `couch.gameOver(scores)` shows a game-over toast in the simulator.
 
 This is the fastest loop and the one your coding agent should use to iterate.

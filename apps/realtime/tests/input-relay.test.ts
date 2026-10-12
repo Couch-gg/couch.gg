@@ -344,64 +344,75 @@ describe('selectGame remote gating', () => {
 });
 
 describe('RateLimiter', () => {
-  it('sustains 10 inputs/sec for a single player', () => {
+  it('sustains 20 inputs/sec for a single player (a stick plus buttons)', () => {
     const rl = new RateLimiter();
     let now = 1_000_000;
     let allowed = 0;
-    // 30 ticks, one every 100ms → exactly 10/s. Bucket starts full (20) so all pass.
-    for (let i = 0; i < 30; i++) {
+    // 60 ticks, one every 50ms → exactly 20/s. Bucket starts full (40) so all pass.
+    for (let i = 0; i < 60; i++) {
       if (rl.allow('ROOM', 'p1', now)) allowed++;
-      now += 100;
+      now += 50;
     }
-    expect(allowed).toBe(30);
+    expect(allowed).toBe(60);
   });
 
-  it('drops a burst beyond the per-player capacity of 20', () => {
+  it('drops a burst beyond the per-player capacity of 40', () => {
     const rl = new RateLimiter();
     const now = 2_000_000;
     let allowed = 0;
-    for (let i = 0; i < 25; i++) {
+    for (let i = 0; i < 45; i++) {
       if (rl.allow('ROOM', 'p1', now)) allowed++;
     }
-    // Capacity 20 with no time elapsed → 20 allowed, 5 dropped.
-    expect(allowed).toBe(20);
+    expect(allowed).toBe(40);
   });
 
-  it('enforces the per-slug aggregate capacity of 60 across players', () => {
+  it('enforces the per-slug aggregate capacity of 320 across players', () => {
     const rl = new RateLimiter();
     const now = 3_000_000;
     let allowed = 0;
-    // 8 players each firing 10 instantly = 80 attempts. Per-player cap (20) never
-    // binds here; the slug aggregate cap (60) does.
-    for (let p = 0; p < 8; p++) {
-      for (let i = 0; i < 10; i++) {
+    // 10 player ids each firing 40 instantly = 400 attempts. Per-player cap (40)
+    // never binds here; the slug aggregate cap (8 x 40 = 320) does.
+    for (let p = 0; p < 10; p++) {
+      for (let i = 0; i < 40; i++) {
         if (rl.allow('ROOM', `p${p}`, now)) allowed++;
       }
     }
-    expect(allowed).toBe(60);
+    expect(allowed).toBe(320);
+  });
+
+  it('fits a full lobby of 8 sticks at 15 changes/s plus buttons without drops', () => {
+    const rl = new RateLimiter();
+    let now = 3_500_000;
+    let dropped = 0;
+    // 10 s of 8 players each sending 20 inputs/s (a stick at ~15/s plus taps).
+    for (let tick = 0; tick < 200; tick++) {
+      for (let p = 0; p < 8; p++) {
+        if (!rl.allow('ROOM', `p${p}`, now)) dropped++;
+      }
+      now += 50;
+    }
+    expect(dropped).toBe(0);
   });
 
   it('refills tokens over time', () => {
     const rl = new RateLimiter();
     let now = 4_000_000;
-    // Drain the player bucket (20).
-    for (let i = 0; i < 20; i++) rl.allow('ROOM', 'p1', now);
+    for (let i = 0; i < 40; i++) rl.allow('ROOM', 'p1', now);
     expect(rl.allow('ROOM', 'p1', now)).toBe(false);
-    // After 1s, ~10 tokens refill (player refill 10/s).
+    // After 1s, 20 tokens refill (player refill 20/s).
     now += 1000;
     let allowed = 0;
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < 25; i++) {
       if (rl.allow('ROOM', 'p1', now)) allowed++;
     }
-    expect(allowed).toBe(10);
+    expect(allowed).toBe(20);
   });
 
   it('keeps per-player buckets independent', () => {
     const rl = new RateLimiter();
     const now = 5_000_000;
-    for (let i = 0; i < 20; i++) rl.allow('ROOM', 'p1', now);
+    for (let i = 0; i < 40; i++) rl.allow('ROOM', 'p1', now);
     expect(rl.allow('ROOM', 'p1', now)).toBe(false);
-    // A different player in the same slug still has their own bucket.
     expect(rl.allow('ROOM', 'p2', now)).toBe(true);
   });
 });
