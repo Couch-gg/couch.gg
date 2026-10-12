@@ -19,6 +19,7 @@ import {
   isHostMessage,
   type CouchControllerPatch,
   type CouchInputEnvelope,
+  type CouchLatency,
   type CouchLatencyTier,
   type CouchManifest,
   type CouchMessage,
@@ -52,6 +53,7 @@ export type CouchEventName =
   | 'pause'
   | 'resume'
   | 'abort'
+  | 'latency'
   | 'state'
   | 'screenChanged';
 
@@ -62,6 +64,7 @@ export interface CouchEventMap {
   pause: { reason: string };
   resume: void;
   abort: { reason: string };
+  latency: CouchLatency;
   state: CouchStateEnvelope;
   screenChanged: CouchScreen;
 }
@@ -91,8 +94,10 @@ export interface CouchGame {
   readonly seed: string;
   /** 'live' | 'dev' | 'test'. */
   readonly mode: CouchMode;
-  /** 'local' | 'remote'. */
+  /** 'local' | 'remote': the lobby's mode, fixed at init. */
   readonly latencyTier: CouchLatencyTier;
+  /** Latest measured latency from the host screen, or null before the first measurement. */
+  readonly latency: CouchLatency | null;
   /** BCP-47 locale hint. */
   readonly locale: string;
   /** Whether the player prefers reduced motion. */
@@ -143,6 +148,7 @@ class CouchCore {
   seed = '';
   mode: CouchMode = 'live';
   latencyTier: CouchLatencyTier = 'local';
+  latency: CouchLatency | null = null;
   locale = 'en';
   reducedMotion = false;
   manifest: CouchManifest;
@@ -158,6 +164,7 @@ class CouchCore {
     pause: new Set(),
     resume: new Set(),
     abort: new Set(),
+    latency: new Set(),
     state: new Set(),
     screenChanged: new Set()
   };
@@ -244,6 +251,11 @@ class CouchCore {
     if (this.aborted) return;
     this.aborted = true;
     this.emit('abort', { reason });
+  }
+
+  setLatency(latency: CouchLatency): void {
+    this.latency = latency;
+    this.emit('latency', latency);
   }
 
   get localPlayers(): CouchPlayer[] {
@@ -341,6 +353,9 @@ function makeHandle(core: CouchCore): CouchGame {
     },
     get latencyTier() {
       return core.latencyTier;
+    },
+    get latency() {
+      return core.latency;
     },
     get locale() {
       return core.locale;
@@ -501,6 +516,9 @@ function initEmbedded(opts: CouchInitOptions): Promise<CouchGame> {
           break;
         case 'couch:abort':
           core.abort(msg.reason);
+          break;
+        case 'couch:latency':
+          core.setLatency(msg.latency);
           break;
         case 'couch:state':
           core.receiveState(msg.envelope);

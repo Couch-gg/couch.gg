@@ -163,8 +163,28 @@ export type CouchLiveMode = 'live' | 'test';
 /** Full mode set the SDK exposes (`'dev'` is standalone / top-level simulator). */
 export type CouchMode = CouchLiveMode | 'dev';
 
-/** Round-trip latency class of the lobby. */
+/**
+ * Latency class the lobby was created for: `'local'` (one couch) or `'remote'`
+ * (screens in different places). This is the lobby's mode, fixed at init — the
+ * measured numbers live in `CouchLatency`.
+ */
 export type CouchLatencyTier = 'local' | 'remote';
+
+/** Measured transport latency, as the host screen sees it. */
+export interface CouchLatency {
+  /** Screen ↔ server round trip (ms, best recent sample). */
+  rttMs: number;
+  /**
+   * Median time from the server recording an input to this screen receiving it
+   * (ms, last 20 inputs, server clock mapped onto the screen clock). Excludes the
+   * phone → server leg. `null` until an input has arrived.
+   */
+  deliveryMs: number | null;
+  /** How most recent inputs arrived: the push socket, or the lobby poll fallback. */
+  transport: 'socket' | 'poll';
+  /** Measured class: `'local'` when inputs arrive by socket with delivery under 100ms. */
+  measuredTier: CouchLatencyTier;
+}
 
 /** A per-player score, as reported at game over. */
 export interface CouchScore {
@@ -387,6 +407,13 @@ export interface CouchAbortMessage {
   reason: string;
 }
 
+/** Periodic latency measurement (sent when it changes, at most every 2s). */
+export interface CouchLatencyMessage {
+  v: ProtocolVersion;
+  type: 'couch:latency';
+  latency: CouchLatency;
+}
+
 /** State from the host screen, delivered to every other screen. */
 export interface CouchStateMessage {
   v: ProtocolVersion;
@@ -405,6 +432,7 @@ export type CouchHostToGameMessage =
   | CouchInitMessage
   | CouchStateMessage
   | CouchScreenMessage
+  | CouchLatencyMessage
   | CouchInputMessage
   | CouchPlayersMessage
   | CouchPlayerJoinedMessage
@@ -439,7 +467,8 @@ const COUCH_MESSAGE_TYPES = new Set<string>([
   'couch:resume',
   'couch:abort',
   'couch:state',
-  'couch:screen'
+  'couch:screen',
+  'couch:latency'
 ]);
 
 /**
@@ -468,6 +497,7 @@ export function isHostMessage(data: unknown): data is CouchHostToGameMessage {
       data.type === 'couch:resume' ||
       data.type === 'couch:abort' ||
       data.type === 'couch:state' ||
-      data.type === 'couch:screen')
+      data.type === 'couch:screen' ||
+      data.type === 'couch:latency')
   );
 }

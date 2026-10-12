@@ -55,7 +55,11 @@ Fluid Compute is enabled in vercel.json. Production multiplayer uses the Vercel
 Redis marketplace resource through REDIS_URL so TV and phone requests share the
 same lobby state across Function instances. Local development still works without
 Redis, and the server also has a Vercel Queues snapshot fallback for production
-environments where Redis is not configured.
+environments where Redis is not configured. With Redis, socket broadcasts also fan
+out across instances through the Socket.IO Redis adapter, and external-game inputs
+get their seq from an atomic counter (`/api/realtime/health` reports
+`"fanout": "redis"`). Set `TEST_REDIS_URL=redis://localhost:6379` to run the
+cross-instance test in `apps/realtime/tests/fanout.test.ts`.
 
 Useful production checks:
 

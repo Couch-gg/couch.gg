@@ -351,6 +351,27 @@ describe('CouchSDK input delivery', () => {
   });
 });
 
+describe('CouchSDK latency', () => {
+  it('latency is null until the host measures, then updates + fires on("latency")', async () => {
+    const h = embed();
+    const p = CouchSDK.init({ manifest });
+    h.deliver(initMessage());
+    const couch = await p;
+    expect(couch.latency).toBeNull();
+
+    const seen = vi.fn();
+    couch.on('latency', seen);
+    const latency = { rttMs: 40, deliveryMs: 25, transport: 'socket', measuredTier: 'local' };
+    h.deliver({ v: 1, type: 'couch:latency', latency });
+
+    expect(couch.latency).toEqual(latency);
+    expect(seen).toHaveBeenCalledWith(latency);
+    expect(couch.latencyTier).toBe('local');
+
+    h.restore();
+  });
+});
+
 describe('CouchSDK setController', () => {
   it('posts couch:setController to the host with the player id and patch', async () => {
     const h = embed();

@@ -38,7 +38,7 @@ export type ManifestResolver = (id: GameId) => GameManifest | null;
 
 const INPUT_ACTIONS: readonly InputAction[] = ['press', 'release', 'change'];
 const MAX_INPUT_VALUE_BYTES = 1024;
-const INPUT_LOG_LIMIT = 128;
+export const INPUT_LOG_LIMIT = 128;
 const INPUT_LOG_PUBLIC_LIMIT = 64;
 
 // The snapshot union the server may hold: the built-in Trebuchet snapshot or the
@@ -183,6 +183,8 @@ export interface PlayerRemoval {
   lobby: Lobby;
   gameEvent: TrebuchetSnapshot | null;
 }
+
+export type PreparedGameInput = Omit<GameInputEnvelope, 'seq' | 'at'>;
 
 export class LobbyError extends Error {
   constructor(
@@ -518,6 +520,13 @@ export class LobbyStore {
   // must be in the enum; the value payload is capped at 1KB. Stamps a monotonic
   // seq from a per-game-start counter and trims the ring buffer to the last 128.
   recordGameInput(slug: string, playerToken: string, event: ControllerEvent): GameInputEnvelope {
+    return this.commitGameInput(slug, this.prepareGameInput(slug, playerToken, event));
+  }
+
+  // Validation half of recordGameInput. Split out so the server can allocate the
+  // seq from shared storage (atomic across instances) only after an input has
+  // passed every check — a rejected input must never burn a seq and leave a gap.
+  prepareGameInput(slug: string, playerToken: string, event: ControllerEvent): PreparedGameInput {
     const lobby = this.getLobby(slug);
     const player = this.playerByToken(lobby, playerToken);
     if (lobby.state !== 'playing') throw new LobbyError('Kein laufendes Spiel', 409);
@@ -544,15 +553,25 @@ export class LobbyStore {
       }
     }
 
+    return { playerId: player.id, control: rawControl, action: action as InputAction, value: data };
+  }
+
+  // Stamp a prepared input with its seq and append it to the ring buffer. `seq`
+  // comes from shared storage when the server has it (Redis INCR, stored along
+  // with `at`); otherwise the lobby's own counter. Inputs from other instances
+  // can land out of order, so the log is kept sorted by seq.
+  commitGameInput(slug: string, prepared: PreparedGameInput, seq?: number, at = new Date().toISOString()): GameInputEnvelope {
+    const lobby = this.getLobby(slug);
+    const stamped = seq ?? lobby.inputSeq + 1;
+    lobby.inputSeq = Math.max(lobby.inputSeq, stamped);
     const envelope: GameInputEnvelope = {
-      seq: ++lobby.inputSeq,
-      at: new Date().toISOString(),
-      playerId: player.id,
-      control: rawControl,
-      action: action as InputAction,
-      value: data
+      seq: stamped,
+      at,
+      ...prepared
     };
     lobby.inputLog.push(envelope);
+    const len = lobby.inputLog.length;
+    if (len > 1 && lobby.inputLog[len - 2].seq > stamped) lobby.inputLog.sort((a, b) => a.seq - b.seq);
     if (lobby.inputLog.length > INPUT_LOG_LIMIT) {
       lobby.inputLog = lobby.inputLog.slice(-INPUT_LOG_LIMIT);
     }

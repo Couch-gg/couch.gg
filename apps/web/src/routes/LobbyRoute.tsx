@@ -395,8 +395,8 @@ export function LobbyRoute({ slug, navigate }: { slug: string; navigate: (to: st
   // Always mounted (hooks can't be conditional). It only sees the lobby while
   // a stage is there to take the inputs: an input passed on with no stage
   // would count as delivered and never reach the game once it mounts.
-  const forwardInput = useCallback((input: Parameters<GameHostStageHandle['forwardInput']>[0]) => {
-    gameHostRef.current?.forwardInput(input);
+  const forwardInput = useCallback((...args: Parameters<GameHostStageHandle['forwardInput']>) => {
+    gameHostRef.current?.forwardInput(...args);
   }, []);
   const pollForGap = useCallback(() => pollNowRef.current(), []);
   useExternalGameInputs({ socket, lobby: stageManifest ? lobby : null, onInput: forwardInput, onGap: pollForGap });

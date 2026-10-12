@@ -109,6 +109,15 @@ describe.skipIf(!redisUrl)('lobby writes across instances', () => {
 
   const stored = async (slug: string) => JSON.parse((await redis.get(`couch:lobby:${slug}`)) ?? 'null');
 
+  // External-game inputs live next to the lobby, in a list and a seq counter
+  // the lobby blob never touches (RedisLobbyPersistence.appendNextInput).
+  const storedInputs = async (slug: string) => ({
+    seqs: (await redis.lRange(`couch:lobby:${slug}:inputs`, 0, -1))
+      .map((entry) => (JSON.parse(entry) as { seq: number }).seq)
+      .sort((x, y) => x - y),
+    counter: Number(await redis.get(`couch:lobby:${slug}:inputseq`))
+  });
+
   const poll = (url: string, slug: string): Promise<Lobby> =>
     fetch(`${url}/api/lobbies/${slug}`)
       .then((r) => r.json())
@@ -264,9 +273,9 @@ describe.skipIf(!redisUrl)('lobby writes across instances', () => {
     expect(polled.rev).toBe(after.rev);
   });
 
-  it('commits a burst of game inputs in a few round trips, not one per input', async () => {
-    // One instance, with Redis 10 ms away each way: committing 24 inputs one
-    // after the other would take at least 24 round trips (480 ms).
+  it('takes a burst of game inputs without a lobby commit per input', async () => {
+    // One instance, with Redis 10 ms away each way: inputs that waited for one
+    // another (or for lobby commits) would take at least 24 round trips (480 ms).
     const delayMs = 10;
     const far = await slowRedisProxy(redisUrl!, delayMs);
     process.env.REDIS_URL = far.url;
@@ -281,8 +290,11 @@ describe.skipIf(!redisUrl)('lobby writes across instances', () => {
       tv.on('game:input', ({ seq }: { seq: number }) => relayed.push(seq));
       await monitor.connect();
       let commits = 0;
+      let appends = 0;
       await monitor.monitor((line: string) => {
-        if (line.includes('"EVAL"') && line.includes(`"couch:lobby:${slug}"`)) commits++;
+        if (!line.includes('"EVAL"')) return;
+        if (line.includes(`"couch:lobby:${slug}"`)) commits++;
+        else if (line.includes(`"couch:lobby:${slug}:inputs"`)) appends++;
       });
 
       const perPhone = 8;
@@ -300,20 +312,20 @@ describe.skipIf(!redisUrl)('lobby writes across instances', () => {
         const seqs = each.map((a) => a.seq!);
         expect(seqs).toEqual([...seqs].sort((x, y) => x - y));
       }
-      const seqs = acks.flat().map((a) => a.seq!);
-      expect(new Set(seqs).size).toBe(total);
-      const record = await stored(slug);
-      expect(record.inputLog.map((input: { seq: number }) => input.seq).sort((x: number, y: number) => x - y)).toEqual(
-        [...seqs].sort((x, y) => x - y)
-      );
+      const seqs = acks.flat().map((a) => a.seq!).sort((x, y) => x - y);
+      expect(seqs).toEqual(Array.from({ length: total }, (_, n) => n + 1));
+      expect(await storedInputs(slug)).toEqual({ seqs, counter: total });
+      // A poll on the instance has them all in its log.
+      const polled = await poll(url, slug);
+      expect(polled.inputLog.map((input) => input.seq)).toEqual(seqs);
       // The TV gets them all, in seq order.
       await expect.poll(() => relayed.length).toBe(total);
       expect(relayed).toEqual([...relayed].sort((x, y) => x - y));
 
-      // Far fewer commits than inputs, and well under the time one commit per
-      // input would take.
-      expect(commits).toBeGreaterThan(0);
-      expect(commits).toBeLessThanOrEqual(total / 3);
+      // One append per input and no lobby commit, in well under the time
+      // inputs waiting on each other would take.
+      await expect.poll(() => appends).toBe(total);
+      expect(commits).toBe(0);
       expect(elapsed).toBeLessThan(total * 2 * delayMs);
     } finally {
       await monitor.destroy();
@@ -343,11 +355,24 @@ describe.skipIf(!redisUrl)('lobby writes across instances', () => {
       .filter((a) => a.ok)
       .map((a) => a.seq!)
       .sort((x, y) => x - y);
-    // One seq per input taken, none skipped and none twice.
-    expect(seqs).toEqual(Array.from({ length: 16 }, (_, n) => seqs[0] + n));
-    const record = await stored(slug);
-    expect(record.inputSeq).toBe(seqs.at(-1));
-    expect(record.inputLog.map((input: { seq: number }) => input.seq).sort((x: number, y: number) => x - y)).toEqual(seqs);
+    // One seq per input taken, none skipped and none twice: a refused input
+    // never takes one.
+    expect(seqs).toEqual(Array.from({ length: 16 }, (_, n) => n + 1));
+    expect(await storedInputs(slug)).toEqual({ seqs, counter: 16 });
+    // Both instances read the same log.
+    for (const url of urls) expect((await poll(url, slug)).inputLog.map((input) => input.seq)).toEqual(seqs);
+  });
+
+  it("starts the next round's inputs at seq 1 on every instance", async () => {
+    const { slug, phones, players } = await startedPad(A, [A, B]);
+    for (let n = 0; n < 3; n++) expect((await press(phones[1], slug, players[1])).seq).toBe(n + 1);
+    expect((await ack(phones[0], 'game:end', { slug, playerToken: players[0].playerToken })).ok).toBe(true);
+    // The host starts the next round on A; the first input of it, on B, is 1.
+    expect((await ack(phones[0], 'game:start', { slug, playerToken: players[0].playerToken })).ok).toBe(true);
+    expect(await storedInputs(slug)).toEqual({ seqs: [], counter: 0 });
+    expect((await press(phones[1], slug, players[1])).seq).toBe(1);
+    expect((await press(phones[0], slug, players[0])).seq).toBe(2);
+    expect(await storedInputs(slug)).toEqual({ seqs: [1, 2], counter: 2 });
   });
 
   it('keeps every controller update of a burst the TV sends at once, each under its own seq', async () => {

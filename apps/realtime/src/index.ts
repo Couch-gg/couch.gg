@@ -5,7 +5,7 @@ import express from 'express';
 import { Server, type ServerOptions } from 'socket.io';
 import { GAME_MANIFESTS } from '@couch/game-runtime';
 import type { TrebuchetEvent } from '@couch/trebuchet';
-import type { ControllerEvent, ControllerPatch, FanoutMode, GameId, GameManifest, PlayerId, ScreenId } from '@couch/types';
+import type { ControllerEvent, ControllerPatch, FanoutMode, GameId, GameInputEnvelope, GameManifest, PlayerId, ScreenId } from '@couch/types';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import {
   LobbyError,
@@ -25,6 +25,7 @@ import { createProductionGamePersistence, createProductionLobbyPersistence } fro
 import { GamesRegistry, RegistryError, adminGameView, publicGame } from './games-registry.js';
 import { ScreenRegistry } from './screens.js';
 import { clientId, clientIdKey } from './client-id.js';
+import { attachFanout, type Fanout } from './fanout.js';
 
 // Largest host-authoritative state broadcast (serialized), see game:state.
 const MAX_STATE_BYTES = 32_768;
@@ -83,6 +84,7 @@ export interface RealtimeServerInstance {
   io: Server;
   server: http.Server;
   store: LobbyStore;
+  fanout: Fanout;
 }
 
 export function createRealtimeServer(options: RealtimeServerOptions = {}): RealtimeServerInstance {
@@ -121,9 +123,10 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
 
   // Whether this instance's room emits reach every instance's sockets, told
   // to clients in their join acks: while their socket carries every change
-  // they poll the lobby less often. No adapter carries emits across instances
-  // here, so a TV or phone on another instance hears nothing of them.
-  const fanoutMode = (): FanoutMode => 'local';
+  // they poll the lobby less often. 'redis' once the Socket.IO Redis adapter
+  // is attached (fanout.ts); until then, and without REDIS_URL, a TV or phone
+  // on another instance hears nothing of this instance's emits.
+  const fanoutMode = (): FanoutMode => fanout.mode();
 
   const store = new LobbyStore(resolveManifest);
   const screens = new ScreenRegistry();
@@ -144,11 +147,11 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   app.use(express.json());
 
   app.get('/health', (_req, res) => {
-    res.json({ ok: true, lobbies: store.lobbies.size });
+    res.json({ ok: true, lobbies: store.lobbies.size, fanout: fanout.mode() });
   });
 
   app.get(`${apiPrefix}/health`, (_req, res) => {
-    res.json({ ok: true, lobbies: store.lobbies.size });
+    res.json({ ok: true, lobbies: store.lobbies.size, fanout: fanout.mode() });
   });
 
   app.get(`${apiPrefix}/games`, async (_req, res) => {
@@ -363,6 +366,7 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   };
   if (options.websocketOnly) socketOptions.transports = ['websocket'];
   const io = new Server(server, socketOptions);
+  const fanout = attachFanout(io);
 
   io.on('connection', (socket) => {
     let ctx: SocketContext | null = null;
@@ -385,6 +389,12 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
     // sends it right before what it held back (a game:finish), and that must
     // not be refused as coming from a socket that hasn't joined yet.
     let screenJoining: Promise<void> | null = null;
+
+    // Clock probe for measured latency: the screen times the round trip and uses
+    // serverNow to put the server's input timestamps on its own clock.
+    socket.on('latency:ping', (_payload: unknown, ack?: (value: unknown) => void) => {
+      ack?.({ ok: true, serverNow: Date.now() });
+    });
 
     socket.on('screen:join', (payload: { slug?: string; screenId?: string; screenToken?: string }, ack?: (value: unknown) => void) => {
       const joining = (async () => {
@@ -532,11 +542,25 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
             ack?.({ ok: true, dropped: true });
             return;
           }
-          const { result: envelope } = await mutateLobby(
-            slug,
-            () => store.recordGameInput(slug, playerToken, controllerEvent),
-            { hydrated: true }
-          );
+          // Validate first, then take the seq. With Redis one script INCRs it (so
+          // two instances can't stamp the same seq) and appends the input under
+          // it to a list the lobby blob never touches, seeding a missing counter
+          // from the hydrated inputSeq: inputs don't wait for, or race with,
+          // lobby commits. Without it, the input is a lobby write like any other.
+          let envelope: GameInputEnvelope;
+          if (persistence.appendNextInput) {
+            const prepared = store.prepareGameInput(slug, playerToken, controllerEvent);
+            const at = new Date().toISOString();
+            const { expiresAt, inputSeq } = store.getLobby(slug);
+            const seq = await persistence.appendNextInput(slug, { at, ...prepared }, expiresAt, inputSeq);
+            envelope = store.commitGameInput(slug, prepared, seq, at);
+          } else {
+            ({ result: envelope } = await mutateLobby(
+              slug,
+              () => store.recordGameInput(slug, playerToken, controllerEvent),
+              { hydrated: true }
+            ));
+          }
           if (derivedId && !isRelease) held.add(heldKey);
           ack?.({ ok: true, seq: envelope.seq });
           // Only screens run games; phones never read inputs.
@@ -1118,7 +1142,11 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
           for (const { write, result } of applied) write.resolve({ result, lobby: held });
           return;
         }
-        const stored = persistence.commit ? await persistence.commit(lobby, held.rev) : (await persistence.save(lobby), true);
+        // A batch that starts a game (a new session) starts its input seqs over.
+        const resetInputs = lobby.gameSession !== null && lobby.gameSession.id !== held.gameSession?.id;
+        const stored = persistence.commit
+          ? await persistence.commit(lobby, held.rev, { resetInputs })
+          : (await persistence.save(lobby), true);
         if (stored) {
           store.adopt(lobby);
           for (const { write, result } of applied) write.resolve({ result, lobby });
@@ -1202,7 +1230,7 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
     if (rec) await persistence.saveScreen(rec);
   }
 
-  return { app, io, server, store };
+  return { app, io, server, store, fanout };
 }
 
 // A promise nobody awaits must never take the process down: every socket on

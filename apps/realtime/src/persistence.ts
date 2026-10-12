@@ -1,6 +1,8 @@
 import { PollingQueueClient } from '@vercel/queue';
 import { createClient, type RedisClientType } from 'redis';
+import type { GameInputEnvelope } from '@couch/types';
 import {
+  INPUT_LOG_LIMIT,
   deserializeLobbyRecord,
   serializeLobbyRecord,
   type LobbyRecord,
@@ -56,10 +58,27 @@ export interface LobbyPersistence {
   // Store the lobby only if the stored one is still at `expectedRev` (the rev
   // it was loaded with), or, with null, only if there is none yet. Resolves to
   // whether it was stored. Without it (the Queue) a write is a plain save.
-  commit?(lobby: LobbyRecord, expectedRev: number | null): Promise<boolean>;
+  // `resetInputs` clears the input list and counter (appendNextInput) in the
+  // same step: a commit that starts a game starts its seq stream at 1.
+  commit?(lobby: LobbyRecord, expectedRev: number | null, options?: { resetInputs?: boolean }): Promise<boolean>;
   loadScreen(id: string): Promise<ScreenRecord | null>;
   saveScreen(record: ScreenRecord): Promise<void>;
   deleteScreen(id: string): Promise<void>;
+  // Optional atomic input log (Redis only). Inputs for the same lobby can hit
+  // different serverless instances at the same moment; a load-modify-save of the
+  // lobby blob would hand both the same seq and one would overwrite the other.
+  // With these, the seq is an INCR and the log is a list the blob never touches.
+  // appendNextInput takes the seq and appends the input under it in one atomic
+  // script and resolves to that seq, so no seq is handed out without its entry.
+  // lastSeq is the hydrated lobby's inputSeq. It seeds a missing counter, so a
+  // game whose seq so far lived only in the blob continues after it.
+  appendNextInput?(
+    slug: string,
+    input: Omit<GameInputEnvelope, 'seq'>,
+    expiresAt: number,
+    lastSeq: number
+  ): Promise<number>;
+  resetInputs?(slug: string): Promise<void>;
 }
 
 // A claimed screen lives until claimedAt + grace; an unclaimed one until expiresAt.
@@ -94,20 +113,56 @@ const disabledPersistence: LobbyPersistence = {
 
 class RedisLobbyPersistence implements LobbyPersistence {
   enabled = true;
-  private clientPromise: Promise<RedisClientType> | null = null;
 
   constructor(private readonly redisUrl: string) {}
 
   async load(slug: string): Promise<LobbyRecord | null> {
     const client = await this.client();
-    const raw = await client.get(key(slug));
+    const [raw, rawInputs, rawSeq] = await Promise.all([
+      client.get(key(slug)),
+      client.lRange(inputsKey(slug), -INPUT_LOG_LIMIT, -1),
+      client.get(inputSeqKey(slug))
+    ]);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as SerializedLobbyRecord;
     if (parsed.expiresAt <= Date.now()) {
       await this.delete(slug);
       return null;
     }
-    return deserializeLobbyRecord(parsed);
+    const lobby = deserializeLobbyRecord(parsed);
+    // The input list is the authority for the running game. An empty list with no
+    // counter means no input has gone through it yet, so the blob's log stands.
+    // Blob entries older than the list's first stay in front of it: a game that
+    // was running before the list existed keeps its earlier inputs in the log.
+    if (rawInputs.length || rawSeq) {
+      const listed = rawInputs.map((entry) => JSON.parse(entry) as GameInputEnvelope).sort((a, b) => a.seq - b.seq);
+      const firstListed = listed[0]?.seq ?? Infinity;
+      lobby.inputLog = [...lobby.inputLog.filter((entry) => entry.seq < firstListed), ...listed].slice(-INPUT_LOG_LIMIT);
+      lobby.inputSeq = Math.max(Number(rawSeq ?? 0), lobby.inputLog.at(-1)?.seq ?? 0);
+    }
+    return lobby;
+  }
+
+  async appendNextInput(
+    slug: string,
+    input: Omit<GameInputEnvelope, 'seq'>,
+    expiresAt: number,
+    lastSeq: number
+  ): Promise<number> {
+    const client = await this.client();
+    // The script puts `{"seq":N,` in front, so the rest goes without its brace.
+    // The seed must be an integer: INCR on anything else would fail every input.
+    const seed = Number.isSafeInteger(lastSeq) && lastSeq > 0 ? lastSeq : 0;
+    const seq = await client.eval(APPEND_NEXT_INPUT_SCRIPT, {
+      keys: [inputsKey(slug), inputSeqKey(slug)],
+      arguments: [JSON.stringify(input).slice(1), String(-INPUT_LOG_LIMIT), String(expiresAt), String(seed)]
+    });
+    return Number(seq);
+  }
+
+  async resetInputs(slug: string): Promise<void> {
+    const client = await this.client();
+    await client.del([inputsKey(slug), inputSeqKey(slug)]);
   }
 
   async save(lobby: LobbyRecord): Promise<void> {
@@ -117,14 +172,15 @@ class RedisLobbyPersistence implements LobbyPersistence {
     });
   }
 
-  async commit(lobby: LobbyRecord, expectedRev: number | null): Promise<boolean> {
+  async commit(lobby: LobbyRecord, expectedRev: number | null, options: { resetInputs?: boolean } = {}): Promise<boolean> {
     const client = await this.client();
     const stored = await client.eval(COMMIT_LOBBY_SCRIPT, {
-      keys: [key(lobby.slug)],
+      keys: [key(lobby.slug), inputsKey(lobby.slug), inputSeqKey(lobby.slug)],
       arguments: [
         expectedRev === null ? '' : String(expectedRev),
         JSON.stringify(serializeLobbyRecord(lobby)),
-        String(lobby.expiresAt)
+        String(lobby.expiresAt),
+        options.resetInputs ? '1' : ''
       ]
     });
     return Number(stored) === 1;
@@ -132,7 +188,7 @@ class RedisLobbyPersistence implements LobbyPersistence {
 
   async delete(slug: string): Promise<void> {
     const client = await this.client();
-    await client.del(key(slug));
+    await client.del([key(slug), inputsKey(slug), inputSeqKey(slug)]);
   }
 
   async loadScreen(id: string): Promise<ScreenRecord | null> {
@@ -159,15 +215,8 @@ class RedisLobbyPersistence implements LobbyPersistence {
     await client.del(screenKey(id));
   }
 
-  private async client(): Promise<RedisClientType> {
-    if (!this.clientPromise) {
-      const client = createClient({ url: this.redisUrl });
-      client.on('error', (err: unknown) => {
-        console.error('Redis lobby persistence error', err);
-      });
-      this.clientPromise = client.connect() as Promise<RedisClientType>;
-    }
-    return this.clientPromise;
+  private client(): Promise<RedisClientType> {
+    return commandClient(this.redisUrl);
   }
 }
 
@@ -441,7 +490,6 @@ function writeBackoff(attempt: number): Promise<void> {
 
 class RedisGamePersistence implements GamePersistence {
   enabled = true;
-  private clientPromise: Promise<RedisClientType> | null = null;
 
   constructor(private readonly redisUrl: string) {}
 
@@ -533,16 +581,28 @@ class RedisGamePersistence implements GamePersistence {
     return Number(hits);
   }
 
-  private async client(): Promise<RedisClientType> {
-    if (!this.clientPromise) {
-      const client = createClient({ url: this.redisUrl });
-      client.on('error', (err: unknown) => {
-        console.error('Redis games persistence error', err);
-      });
-      this.clientPromise = client.connect() as Promise<RedisClientType>;
-    }
-    return this.clientPromise;
+  private client(): Promise<RedisClientType> {
+    return commandClient(this.redisUrl);
   }
+}
+
+// One command connection per Redis URL for the whole process, shared by lobby
+// and games persistence. Connections count against the Redis plan's cap on every
+// serverless instance, and both only send single commands and EVAL (nothing that
+// blocks or changes connection state), so they can share one.
+const commandClients = new Map<string, Promise<RedisClientType>>();
+
+function commandClient(redisUrl: string): Promise<RedisClientType> {
+  let pending = commandClients.get(redisUrl);
+  if (!pending) {
+    const client = createClient({ url: redisUrl });
+    client.on('error', (err: unknown) => {
+      console.error('Redis persistence error', err);
+    });
+    pending = client.connect() as Promise<RedisClientType>;
+    commandClients.set(redisUrl, pending);
+  }
+  return pending;
 }
 
 function clone<T>(value: T): T {
@@ -559,8 +619,37 @@ function key(slug: string): string {
   return `couch:lobby:${slug.toUpperCase()}`;
 }
 
-// KEYS: the lobby. ARGV: the rev the lobby was loaded with ('' for a new
-// lobby, which must not exist yet), the lobby JSON, its expiry in unix ms.
+function inputsKey(slug: string): string {
+  return `couch:lobby:${slug.toUpperCase()}:inputs`;
+}
+
+function inputSeqKey(slug: string): string {
+  return `couch:lobby:${slug.toUpperCase()}:inputseq`;
+}
+
+// KEYS: input list, seq counter. ARGV: the envelope JSON minus its opening brace
+// (no seq yet), -INPUT_LOG_LIMIT, the lobby's expiry in unix ms, the hydrated
+// lobby's inputSeq. One script so an instance dying or a dropped connection
+// between the INCR and the RPUSH can't leave a seq that screens wait on but that
+// never reaches the log. The SET NX seeds a missing counter: a game that started
+// before the counter existed kept its seq in the lobby blob and must continue
+// after it (screens drop every seq they have already forwarded), while a game
+// whose starting commit cleared them has its blob saved at 0 and so starts at 1.
+const APPEND_NEXT_INPUT_SCRIPT = `
+redis.call('SET', KEYS[2], ARGV[4], 'NX')
+local seq = redis.call('INCR', KEYS[2])
+redis.call('RPUSH', KEYS[1], '{"seq":' .. seq .. ',' .. ARGV[1])
+redis.call('LTRIM', KEYS[1], ARGV[2], -1)
+redis.call('PEXPIREAT', KEYS[1], ARGV[3])
+redis.call('PEXPIREAT', KEYS[2], ARGV[3])
+return seq
+`;
+
+// KEYS: the lobby, its input list, its input seq counter. ARGV: the rev the
+// lobby was loaded with ('' for a new lobby, which must not exist yet), the
+// lobby JSON, its expiry in unix ms, '1' to clear the input list and counter
+// along with the write (a new game starts its seqs at 1; clearing them in a
+// separate step could drop a new game's first input or keep an old one).
 // The stored rev is read off the front of the stored JSON
 // (serializeLobbyRecord puts it first), so the blob is never parsed here; a
 // lobby stored before revs existed reads as rev 0, like it loads. A lobby that
@@ -575,6 +664,7 @@ else
   if rev ~= ARGV[1] then return 0 end
 end
 redis.call('SET', KEYS[1], ARGV[2], 'PXAT', ARGV[3])
+if ARGV[4] == '1' then redis.call('DEL', KEYS[2], KEYS[3]) end
 return 1
 `;
 
