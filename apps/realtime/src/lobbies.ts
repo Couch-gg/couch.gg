@@ -105,6 +105,9 @@ export interface InternalPlayer extends Player {
 }
 
 export interface SerializedLobbyRecord {
+  // Always the first key: the commit script reads it off the front of the
+  // stored JSON (see persistence.ts). Absent in records persisted before it.
+  rev?: number;
   id: string;
   slug: LobbySlug;
   name: string;
@@ -144,6 +147,10 @@ export interface ScreenPresence {
 }
 
 export interface LobbyRecord {
+  // Bumped by every committed change (see nextLobbyRev), so clients can tell
+  // an older snapshot from a newer one and the commit can tell whether the
+  // stored lobby moved on since it was loaded.
+  rev: number;
   id: string;
   slug: LobbySlug;
   name: string;
@@ -189,6 +196,9 @@ export class LobbyError extends Error {
 export class LobbyStore {
   readonly lobbies = new Map<LobbySlug, LobbyRecord>();
   private readonly resolveManifest: ManifestResolver;
+  // Counts adopt calls; each adopted lobby remembers its count (see adopt).
+  private adoptions = 0;
+  private readonly adoptedAt = new WeakMap<LobbyRecord, number>();
 
   constructor(getManifest: ManifestResolver = builtinManifestResolver) {
     this.resolveManifest = getManifest;
@@ -206,6 +216,7 @@ export class LobbyStore {
     let slug = randomSlug();
     while (this.lobbies.has(slug)) slug = randomSlug();
     const lobby: LobbyRecord = {
+      rev: 0,
       id: createId('lobby'),
       slug,
       name: createRoomName(slug),
@@ -251,10 +262,41 @@ export class LobbyStore {
     lobby.expiresAt = Math.max(lobby.expiresAt, Math.min(now + LOBBY_TTL_MS, latest));
   }
 
+  // The lobby is about to be committed with a change: give it the next rev
+  // and keep it alive.
+  markChanged(lobby: LobbyRecord, now = Date.now()): void {
+    lobby.rev = nextLobbyRev(lobby.rev, now);
+    this.keepAlive(lobby, now);
+  }
+
+  // Where a read of storage starts, for adopt.
+  readMark(): number {
+    return this.adoptions;
+  }
+
+  // Keep a lobby read from (`readMark` from before the read) or committed to
+  // storage, unless the one held here is newer: a read that started before a
+  // commit can finish after it. A read that started after the held lobby was
+  // taken is what storage holds, though, even if its rev is lower (a deploy
+  // from before revs stored it). Returns the one now held.
+  adopt(record: LobbyRecord, readMark?: number): LobbyRecord {
+    const held = this.lobbies.get(record.slug);
+    if (held && held !== record && held.id === record.id && held.rev > record.rev) {
+      if (readMark === undefined || (this.adoptedAt.get(held) ?? 0) > readMark) return held;
+    }
+    this.lobbies.set(record.slug, record);
+    this.adoptedAt.set(record, ++this.adoptions);
+    return record;
+  }
+
   publicLobby(slugOrLobby: string | LobbyRecord): Lobby {
     const lobby = typeof slugOrLobby === 'string' ? this.getLobby(slugOrLobby) : slugOrLobby;
     return {
       id: lobby.id,
+      // Rev 0 is a lobby last stored by a deploy from before revs: its rev is
+      // unknown. Sent as 0 it would read as older than every rev a client saw
+      // before, and the client would drop it; without one it is taken.
+      ...(lobby.rev > 0 ? { rev: lobby.rev } : {}),
       slug: lobby.slug,
       name: lobby.name,
       hostPlayerId: lobby.hostPlayerId,
@@ -342,8 +384,9 @@ export class LobbyStore {
     player.name = nextName;
 
     let gameEvent: TrebuchetSnapshot | null = null;
-    if (lobby.engine) {
-      gameEvent = lobby.engine.renamePlayer(player.id, nextName);
+    const engine = this.engineOf(lobby);
+    if (engine) {
+      gameEvent = engine.renamePlayer(player.id, nextName);
       this.updateGameSession(lobby, gameEvent);
     } else if (isTrebuchetSnapshot(lobby.gameSession?.snapshot)) {
       const snapshot = lobby.gameSession.snapshot;
@@ -433,7 +476,7 @@ export class LobbyStore {
   fire(slug: string, playerToken: string, angle: unknown, power: unknown): TrebuchetEvent | null {
     const lobby = this.getLobby(slug);
     const player = this.playerByToken(lobby, playerToken);
-    const event = lobby.engine?.fire(player.id, angle, power) ?? null;
+    const event = this.engineOf(lobby)?.fire(player.id, angle, power) ?? null;
     if (event) this.updateGameSession(lobby, event.snapshot);
     return event;
   }
@@ -453,7 +496,7 @@ export class LobbyStore {
   skipTurn(slug: string, turnEndsAt: number, now = Date.now()): TrebuchetEvent | null {
     const lobby = this.getLobby(slug);
     if (lobby.state !== 'playing' || turnEndsAtOf(lobby) !== turnEndsAt || turnEndsAt > now) return null;
-    const event = lobby.engine?.skipTurn() ?? null;
+    const event = this.engineOf(lobby)?.skipTurn() ?? null;
     if (event) this.updateGameSession(lobby, event.snapshot);
     return event;
   }
@@ -637,6 +680,20 @@ export class LobbyStore {
     return gone;
   }
 
+  // Whether dropGoneScreens or markDroppedGone would change anything now.
+  // Read-only, so a poll can check without writing the lobby.
+  hasPresenceToSettle(slug: string, now: number, graceMs: number, quietMs: number): boolean {
+    const lobby = this.getLobby(slug);
+    for (const id of lobby.screens) {
+      const leftAt = lobby.screenPresence[id]?.leftAt;
+      if (leftAt != null && now - leftAt >= graceMs) return true;
+    }
+    for (const player of lobby.players.values()) {
+      if (player.droppedAt != null && player.connected && now - player.droppedAt >= quietMs) return true;
+    }
+    return false;
+  }
+
   // Remove a player that has been gone since `since` (and didn't come back).
   // Returns null when nothing changed.
   removeIfStillDisconnected(slug: string, playerId: PlayerId, since: number): PlayerRemoval | null {
@@ -690,14 +747,26 @@ export class LobbyStore {
   private removePlayer(lobby: LobbyRecord, player: InternalPlayer, activity: string): PlayerRemoval {
     lobby.players.delete(player.id);
     let gameSnapshot: TrebuchetSnapshot | null = null;
-    if (lobby.engine && lobby.state === 'playing') {
-      gameSnapshot = lobby.engine.removePlayer(player.id);
+    const engine = lobby.state === 'playing' ? this.engineOf(lobby) : null;
+    if (engine) {
+      gameSnapshot = engine.removePlayer(player.id);
       this.updateGameSession(lobby, gameSnapshot);
     }
     this.addActivity(lobby, activity);
     if (lobby.hostPlayerId === player.id) this.promoteHost(lobby);
     if (lobby.players.size === 0 && lobby.state === 'playing') this.endSession(lobby);
     return { lobby: this.publicLobby(lobby), gameEvent: gameSnapshot };
+  }
+
+  // The Trebuchet engine of a running Trebuchet round. A lobby read from
+  // storage gets it rebuilt from its snapshot only here, on first use: most
+  // reads (every poll) never touch the engine.
+  private engineOf(lobby: LobbyRecord): TrebuchetEngine | null {
+    if (lobby.engine) return lobby.engine;
+    const snapshot = lobby.gameSession?.snapshot;
+    if (lobby.state !== 'playing' || !isTrebuchetSnapshot(snapshot)) return null;
+    lobby.engine = TrebuchetEngine.fromSnapshot(snapshot);
+    return lobby.engine;
   }
 
   private endSession(lobby: LobbyRecord): void {
@@ -873,6 +942,7 @@ export function sanitizeChatText(raw: unknown): string {
 
 export function serializeLobbyRecord(lobby: LobbyRecord): SerializedLobbyRecord {
   return {
+    rev: lobby.rev,
     id: lobby.id,
     slug: lobby.slug,
     name: lobby.name,
@@ -901,9 +971,53 @@ export function serializeLobbyRecord(lobby: LobbyRecord): SerializedLobbyRecord 
   };
 }
 
+// A copy of a lobby to change, which shares nothing it could change with the
+// original (the engine is rebuilt from the snapshot when it is needed).
+export function cloneLobbyRecord(lobby: LobbyRecord): LobbyRecord {
+  return deserializeLobbyRecord(serializeLobbyRecord(lobby));
+}
+
+// How far ahead of the clock the first rev after an unknown one (0) starts.
+const UNKNOWN_REV_LEAD_MS = 60_000;
+
+// The rev of a lobby's next committed change. Never below the clock, so it
+// still moves forward when a writer without revs (a deploy from before them)
+// stored the lobby in between and it reads as 0. The revs clients saw before
+// that write are unknown then, and another instance may have handed them out
+// from a clock ahead of this one's, so the rev after an unknown one starts
+// well ahead of the clock: from the clock alone, clients could take the
+// changes after it for older until this clock caught up.
+export function nextLobbyRev(rev: number, now = Date.now()): number {
+  return rev > 0 ? Math.max(rev + 1, now) : now + UNKNOWN_REV_LEAD_MS;
+}
+
+// A lobby view without the copy of the game state its last event repeats:
+// when that copy is the session's snapshot, `snapshotFromSession` says so and
+// the client puts it back (see the web app's fetchLobby). Only for clients
+// that ask for it: older ones read the snapshot off the event.
+export function withoutRepeatedSnapshot(lobby: Lobby): Lobby {
+  const event = lobby.lastEvent?.event as { snapshot?: unknown } | undefined;
+  const sessionSnapshot = lobby.gameSession?.snapshot;
+  if (!lobby.lastEvent || !event || typeof event !== 'object' || !('snapshot' in event)) return lobby;
+  if (sessionSnapshot === undefined || !sameValue(event.snapshot, sessionSnapshot)) return lobby;
+  const { snapshot: _repeated, ...rest } = event;
+  return { ...lobby, lastEvent: { ...lobby.lastEvent, event: rest, snapshotFromSession: true } };
+}
+
+function sameValue(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  const left = a as Record<string, unknown>;
+  const right = b as Record<string, unknown>;
+  const keys = Object.keys(left);
+  if (keys.length !== Object.keys(right).length) return false;
+  return keys.every((key) => Object.prototype.hasOwnProperty.call(right, key) && sameValue(left[key], right[key]));
+}
+
 export function deserializeLobbyRecord(serialized: SerializedLobbyRecord): LobbyRecord {
-  const snapshot = serialized.gameSession?.snapshot ?? null;
   return {
+    rev: serialized.rev ?? 0,
     id: serialized.id,
     slug: serialized.slug.toUpperCase(),
     name: serialized.name,
@@ -922,12 +1036,9 @@ export function deserializeLobbyRecord(serialized: SerializedLobbyRecord): Lobby
         }
       : null,
     lastEvent: serialized.lastEvent ?? null,
-    // Only rebuild a Trebuchet engine for a live Trebuchet snapshot — external
-    // games have no engine, and fromSnapshot would fault on their shape.
-    engine:
-      isTrebuchetSnapshot(snapshot) && serialized.state === 'playing'
-        ? TrebuchetEngine.fromSnapshot(snapshot)
-        : null,
+    // Rebuilt on first use (LobbyStore.engineOf), and only for a running
+    // Trebuchet round: external games have no engine.
+    engine: null,
     // Back-compat: records persisted before external-game support lack these.
     mode: serialized.mode ?? 'local',
     inputSeq: serialized.inputSeq ?? 0,

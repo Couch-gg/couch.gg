@@ -15,7 +15,16 @@ import {
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState, type FormEvent, type MutableRefObject, type PointerEvent } from 'react';
 import type { Socket } from 'socket.io-client';
-import type { ControllerState, GameManifest, InputAction, JoinLobbyResponse, Lobby, Player, RenamePlayerResponse } from '@couch/types';
+import type {
+  ControllerState,
+  FanoutMode,
+  GameManifest,
+  InputAction,
+  JoinLobbyResponse,
+  Lobby,
+  Player,
+  RenamePlayerResponse
+} from '@couch/types';
 import {
   CHARGE_TIME_MS,
   ELEV_MAX,
@@ -31,7 +40,8 @@ import {
 import { GameCatalog } from '../components/GameCatalog.js';
 import { ChatPanel } from '../components/ChatPanel.js';
 import { GenericController } from '../components/GenericController.js';
-import { fetchLobby, leaveLobby, sendChat } from '../api.js';
+import { leaveLobby, sendChat } from '../api.js';
+import { isOlderLobby, startLobbyPoll } from '../lobbySync.js';
 import { createSocket, emitAck } from '../socket.js';
 
 // True only for the built-in trebuchet snapshot shape. External games report
@@ -145,6 +155,18 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   const playerRef = useRef<Player | null>(null);
   playerRef.current = player;
 
+  // The lobby shown, replaced only by snapshots that are not older (see
+  // isOlderLobby).
+  const lobbyRef = useRef<Lobby | null>(null);
+  const takeLobby = useCallback((next: Lobby) => {
+    if (isOlderLobby(lobbyRef.current, next)) return;
+    lobbyRef.current = next;
+    setLobby(next);
+  }, []);
+  // What the latest controller:join ack said about the server's fan-out
+  // (null before one, and since the socket dropped). Sets the poll's pace.
+  const fanoutRef = useRef<FanoutMode | null>(null);
+
   // The room doesn't take this phone back (it moved on without it, or is
   // gone): show the join screen with "Try again" instead of a controller that
   // silently does nothing. A token the room no longer knows (refused as a new
@@ -176,16 +198,22 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
   useEffect(() => {
     const nextSocket = createSocket();
     setSocket(nextSocket);
-    nextSocket.on('lobby:snapshot', (next: Lobby) => setLobby(next));
+    nextSocket.on('lobby:snapshot', takeLobby);
     // A game updated one player's controller (couch.setController). Merge it in
-    // right away; the next snapshot/poll carries the same state.
-    nextSocket.on('controller:state', ({ playerId, state }: { playerId: string; state: ControllerState }) =>
-      setLobby((prev) =>
-        prev && (prev.controllerState?.[playerId]?.seq ?? 0) < state.seq
-          ? { ...prev, controllerState: { ...prev.controllerState, [playerId]: state } }
-          : prev
-      )
-    );
+    // right away; the next snapshot/poll carries the same state. The merged
+    // lobby takes the rev the update was stored under, so a snapshot from
+    // before it counts as older and can't take the update back.
+    nextSocket.on('controller:state', ({ playerId, state, rev }: { playerId: string; state: ControllerState; rev?: number }) => {
+      const prev = lobbyRef.current;
+      if (!prev || (prev.controllerState?.[playerId]?.seq ?? 0) >= state.seq) return;
+      const merged: Lobby = {
+        ...prev,
+        controllerState: { ...prev.controllerState, [playerId]: state },
+        ...(typeof rev === 'number' && typeof prev.rev === 'number' ? { rev: Math.max(prev.rev, rev) } : {})
+      };
+      lobbyRef.current = merged;
+      setLobby(merged);
+    });
     nextSocket.on('game:event', (p: { seq: number; event: TrebuchetEvent }) => applyGameEvent(p.seq, p.event));
 
     // Re-register this controller on every (re)connect. A phone that locks or sleeps
@@ -211,7 +239,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
         return;
       }
       const storedName = window.localStorage.getItem('couch:name') || 'Player';
-      void emitAck<JoinLobbyResponse & { ok: true; games: GameManifest[] }>(nextSocket, 'controller:join', {
+      void emitAck<JoinLobbyResponse & { ok: true; games: GameManifest[]; fanout?: FanoutMode }>(nextSocket, 'controller:join', {
         slug,
         name: storedName,
         playerToken: token,
@@ -219,9 +247,10 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
       })
         .then((joined) => {
           if (attempt !== rejoinAttempt) return;
+          fanoutRef.current = joined.fanout ?? null;
           setReconnecting(false);
           setPlayer(joined.player);
-          setLobby(joined.lobby);
+          takeLobby(joined.lobby);
           setGames(joined.games);
           setPlayerToken(joined.playerToken);
           window.localStorage.setItem(tokenKey(slug), joined.playerToken);
@@ -243,7 +272,10 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     };
 
     nextSocket.on('connect', rejoinIfPossible);
-    nextSocket.on('disconnect', () => setReconnecting(true));
+    nextSocket.on('disconnect', () => {
+      fanoutRef.current = null;
+      setReconnecting(true);
+    });
 
     return () => {
       rejoinAttempt += 1; // an answer still on its way is for nobody now
@@ -251,7 +283,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
       nextSocket.disconnect();
       setSocket(null);
     };
-  }, [slug, applyGameEvent, lostSeat]);
+  }, [slug, applyGameEvent, lostSeat, takeLobby]);
 
   // Replay the latest event carried inside the polled/snapshot lobby state — the
   // cross-instance path. When the opponent fired on a different serverless instance the
@@ -293,14 +325,15 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     }
     setJoinStatus('joining');
     try {
-      const joined = await emitAck<JoinLobbyResponse & { ok: true; games: GameManifest[] }>(socket, 'controller:join', {
+      const joined = await emitAck<JoinLobbyResponse & { ok: true; games: GameManifest[]; fanout?: FanoutMode }>(socket, 'controller:join', {
         slug,
         name: name || 'Player',
         playerToken,
         screenId: seatFor(slug)
       });
+      fanoutRef.current = joined.fanout ?? null;
       setPlayer(joined.player);
-      setLobby(joined.lobby);
+      takeLobby(joined.lobby);
       setGames(joined.games);
       setPlayerToken(joined.playerToken);
       window.localStorage.setItem(tokenKey(slug), joined.playerToken);
@@ -311,7 +344,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
       setError(err instanceof Error ? err.message : 'Join fehlgeschlagen');
       setJoinStatus('failed');
     }
-  }, [name, playerToken, slug, socket]);
+  }, [name, playerToken, slug, socket, takeLobby]);
 
   // First-time visitors should land directly in the controller. Returning users
   // still auto-join + reconnect via the socket effect's 'connect' listener above.
@@ -320,23 +353,13 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
     void join();
   }, [join, joinStatus, player, socket]);
 
+  // A dropped poll does not disconnect an already joined controller.
+  const isJoined = player !== null;
   useEffect(() => {
-    if (!player) return;
-    let active = true;
-    const refresh = () => {
-      void fetchLobby(slug)
-        .then((next) => active && setLobby(next))
-        .catch(() => {
-          // A dropped poll should not disconnect an already joined controller.
-        });
-    };
-    refresh();
-    const refreshTimer = window.setInterval(refresh, 750);
-    return () => {
-      active = false;
-      window.clearInterval(refreshTimer);
-    };
-  }, [player, slug]);
+    if (!isJoined) return;
+    const poll = startLobbyPoll({ slug, socket, fanout: () => fanoutRef.current, onLobby: takeLobby, immediate: true });
+    return () => poll.stop();
+  }, [isJoined, slug, socket, takeLobby]);
 
   const isHost = Boolean(player && lobby?.hostPlayerId === player.id);
   const rawSnapshot = lobby?.gameSession?.snapshot;
@@ -420,7 +443,7 @@ export function ControllerRoute({ slug, navigate }: { slug: string; navigate: (t
         name: draftName
       });
       setPlayer(renamed.player);
-      setLobby(renamed.lobby);
+      takeLobby(renamed.lobby);
       setName(renamed.player.name);
       setDraftName(renamed.player.name);
       window.localStorage.setItem('couch:name', renamed.player.name);
