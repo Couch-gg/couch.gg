@@ -18,8 +18,8 @@ packages/game-runtime/
                     game catalog and runtime helpers
 packages/games/trebuchet/
                     Trebuchet direct platform port
-games/              original game references
-  trebuchet/        original TREBUCHET implementation
+games/              legacy references, outside the pnpm workspace
+  trebuchet/        original standalone TREBUCHET (not built, tested or deployed)
 ~~~
 
 The platform shell now includes lobby creation, QR onboarding, phone controllers,
@@ -87,10 +87,22 @@ and input relay. Games run in a sandboxed iframe and talk to the platform via th
 
 ## Games
 
-### [TREBUCHET](games/trebuchet/) — siege artillery duel
+### TREBUCHET — siege artillery duel
 Trebuchets, destructible terrain, castles, wind, and plunging fire. 2–4 players
-online (room codes + invite links) or local hotseat on one keyboard. Retro pixel
-art, Phaser 3 client, Node + WebSocket server.
+with their phones as controllers, retro pixel art, Phaser 3 client.
+
+The platform game lives in `packages/games/trebuchet` (the authoritative sim the
+realtime server runs) and is exercised by `/games/trebuchet`. The TV's Phaser
+scenes under `apps/web/public/js/` load that sim from `/shared/`, generated from
+the package build by `apps/web/scripts/copy-sdk.mjs`.
+
+#### Legacy: the original standalone game
+
+[`games/trebuchet/`](games/trebuchet/) is the original standalone game (Node +
+WebSocket server, room codes, local hotseat) that the platform port started
+from. It is kept for reference only: it is outside the pnpm workspace, nothing
+builds, tests or deploys it, and it still uses the old 480x270 world. Changes to
+the game belong in `packages/games/trebuchet`. To run it anyway:
 
 ```bash
 cd games/trebuchet
@@ -99,5 +111,4 @@ npm start
 ```
 
 Then open http://localhost:3000. See [games/trebuchet/README.md](games/trebuchet/README.md)
-for gameplay and details. The integrated platform port lives in
-`packages/games/trebuchet` and is exercised by `/games/trebuchet`.
+for gameplay and details.
