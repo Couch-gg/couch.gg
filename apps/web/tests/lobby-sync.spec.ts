@@ -187,3 +187,28 @@ test('the lobby poll slows down while the socket carries every change, and speed
   await tv.close();
   await alex.close();
 });
+
+test('a lobby that a deploy from before revs stored last still reaches a TV that holds a rev', async ({ browser, request }) => {
+  test.setTimeout(60_000);
+  const slug = await newLobby(request);
+  const tv = await desktopPage(browser);
+  await tv.goto('/l/' + slug);
+  const alex = await phonePage(browser, 'Alex');
+  await joinByLink(alex, slug);
+  await expect(tv.locator('.player-name', { hasText: 'Alex' })).toBeVisible({ timeout: 15_000 });
+
+  // From now on the TV's polls are answered the way such a lobby is: without
+  // a rev, and with a change made by the old deploy.
+  await tv.route(isPoll(slug), async (route: Route) => {
+    const response = await route.fetch();
+    const body = await response.json();
+    expect(typeof body.lobby.rev).toBe('number');
+    const { rev: _rev, ...lobby } = body.lobby;
+    lobby.players = lobby.players.map((p: { name: string }) => ({ ...p, name: `${p.name} (old deploy)` }));
+    await route.fulfill({ response, json: { lobby } });
+  });
+  await expect(tv.locator('.player-name', { hasText: 'Alex (old deploy)' })).toBeVisible({ timeout: 5_000 });
+
+  await tv.close();
+  await alex.close();
+});

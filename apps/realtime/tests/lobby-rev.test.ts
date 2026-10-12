@@ -49,15 +49,25 @@ function shotFired() {
 
 describe('lobby rev', () => {
   it('never goes back, and never below the clock', () => {
-    expect(nextLobbyRev(0, 1_000)).toBe(1_000);
     expect(nextLobbyRev(1_000, 1_000)).toBe(1_001);
     expect(nextLobbyRev(5_000, 1_000)).toBe(5_001);
+    expect(nextLobbyRev(1_000, 3_000)).toBe(3_000);
   });
 
-  it('grows with every change and shows in the public lobby', () => {
+  it('starts well ahead of the clock after an unknown rev', () => {
+    // Rev 0: a deploy from before revs stored the lobby last. Clients may hold
+    // a rev from before that, handed out by an instance whose clock is ahead
+    // of this one's: the next change must still read as newer.
+    const seen = nextLobbyRev(1, 10_000 + 5_000);
+    expect(nextLobbyRev(0, 10_000)).toBeGreaterThan(seen);
+    expect(nextLobbyRev(nextLobbyRev(0, 10_000), 10_001)).toBe(nextLobbyRev(0, 10_000) + 1);
+  });
+
+  it('grows with every change and shows in the public lobby once known', () => {
     const store = new LobbyStore();
     const lobby = store.createLobby();
-    expect(store.publicLobby(lobby).rev).toBe(0);
+    // Not sent as 0: a client would take that for older than any rev it saw.
+    expect(store.publicLobby(lobby)).not.toHaveProperty('rev');
     store.markChanged(lobby);
     const first = store.publicLobby(lobby).rev!;
     store.markChanged(lobby);

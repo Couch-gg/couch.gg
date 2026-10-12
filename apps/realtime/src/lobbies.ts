@@ -293,7 +293,10 @@ export class LobbyStore {
     const lobby = typeof slugOrLobby === 'string' ? this.getLobby(slugOrLobby) : slugOrLobby;
     return {
       id: lobby.id,
-      rev: lobby.rev,
+      // Rev 0 is a lobby last stored by a deploy from before revs: its rev is
+      // unknown. Sent as 0 it would read as older than every rev a client saw
+      // before, and the client would drop it; without one it is taken.
+      ...(lobby.rev > 0 ? { rev: lobby.rev } : {}),
       slug: lobby.slug,
       name: lobby.name,
       hostPlayerId: lobby.hostPlayerId,
@@ -974,11 +977,18 @@ export function cloneLobbyRecord(lobby: LobbyRecord): LobbyRecord {
   return deserializeLobbyRecord(serializeLobbyRecord(lobby));
 }
 
+// How far ahead of the clock the first rev after an unknown one (0) starts.
+const UNKNOWN_REV_LEAD_MS = 60_000;
+
 // The rev of a lobby's next committed change. Never below the clock, so it
 // still moves forward when a writer without revs (a deploy from before them)
-// stored the lobby in between and it reads as 0.
+// stored the lobby in between and it reads as 0. The revs clients saw before
+// that write are unknown then, and another instance may have handed them out
+// from a clock ahead of this one's, so the rev after an unknown one starts
+// well ahead of the clock: from the clock alone, clients could take the
+// changes after it for older until this clock caught up.
 export function nextLobbyRev(rev: number, now = Date.now()): number {
-  return Math.max(rev + 1, now);
+  return rev > 0 ? Math.max(rev + 1, now) : now + UNKNOWN_REV_LEAD_MS;
 }
 
 // A lobby view without the copy of the game state its last event repeats:

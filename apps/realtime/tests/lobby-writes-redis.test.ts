@@ -107,6 +107,11 @@ describe.skipIf(!redisUrl)('lobby writes across instances', () => {
 
   const stored = async (slug: string) => JSON.parse((await redis.get(`couch:lobby:${slug}`)) ?? 'null');
 
+  const poll = (url: string, slug: string): Promise<Lobby> =>
+    fetch(`${url}/api/lobbies/${slug}`)
+      .then((r) => r.json())
+      .then((b) => b.lobby);
+
   it('stores a lobby only on top of the rev it was loaded with', async () => {
     const persistence = createLobbyPersistence(redisUrl);
     const store = new LobbyStore();
@@ -207,11 +212,20 @@ describe.skipIf(!redisUrl)('lobby writes across instances', () => {
     const slug = await newLobby();
     const phone = await open(A);
     const ann = await ack<Joined>(phone, 'controller:join', { slug, name: 'Ann' });
-    // Instance A holds the lobby at its rev now. A deploy from before revs
-    // stores it without one (here: renames the lobby).
+    // Instance A, and the TVs and phones, hold the lobby at its rev now. A
+    // deploy from before revs stores it without one (here: renames the lobby).
     const record = await stored(slug);
+    expect((await poll(urls[A], slug)).rev).toBe(record.rev);
     const { rev: _rev, ...legacy } = { ...record, name: 'Renamed by an old deploy' };
     await redis.set(`couch:lobby:${slug}`, JSON.stringify(legacy), { PXAT: record.expiresAt });
+
+    // Its rev is unknown, so a poll of it carries none: a client takes it
+    // instead of dropping it as older than the rev it holds (isOlderLobby).
+    for (const url of urls) {
+      const polled = await poll(url, slug);
+      expect(polled.name).toBe('Renamed by an old deploy');
+      expect(polled).not.toHaveProperty('rev');
+    }
 
     const chat = await ack(phone, 'chat:send', { slug, playerToken: ann.playerToken, text: 'after the old deploy' });
     expect(chat.ok).toBe(true);
@@ -219,8 +233,9 @@ describe.skipIf(!redisUrl)('lobby writes across instances', () => {
     expect(after.name).toBe('Renamed by an old deploy');
     expect(after.chat.map((m: { text: string }) => m.text)).toContain('after the old deploy');
     expect(after.rev).toBeGreaterThan(record.rev);
-    const polled: Lobby = await fetch(`${urls[A]}/api/lobbies/${slug}`).then((r) => r.json()).then((b) => b.lobby);
+    const polled = await poll(urls[A], slug);
     expect(polled.name).toBe('Renamed by an old deploy');
+    expect(polled.rev).toBe(after.rev);
   });
 
   it('keeps every controller update of a burst the TV sends at once, each under its own seq', async () => {

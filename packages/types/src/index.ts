@@ -62,7 +62,8 @@ export interface Player {
 export interface Lobby {
   id: LobbyId;
   // Grows with every change to the lobby. Of two snapshots of one lobby the
-  // one with the lower rev is older. Absent from servers before it existed.
+  // one with the lower rev is older. Absent from servers before it existed,
+  // and while such a server stored the lobby last.
   rev?: number;
   slug: LobbySlug;
   name: string;
