@@ -89,12 +89,14 @@ describe.skipIf(!redisUrl)('lobby writes across instances', () => {
 
   const [A, B] = [0, 1];
 
-  async function open(at: number): Promise<Socket> {
-    const socket = connect(urls[at], { transports: ['websocket'], forceNew: true });
+  async function openAt(url: string): Promise<Socket> {
+    const socket = connect(url, { transports: ['websocket'], forceNew: true });
     sockets.push(socket);
     if (!socket.connected) await new Promise((resolve) => socket.once('connect', resolve));
     return socket;
   }
+
+  const open = (at: number) => openAt(urls[at]);
 
   function ack<T>(socket: Socket, event: string, payload: unknown): Promise<Ack<T>> {
     return new Promise((resolve) => socket.emit(event, payload, resolve));
@@ -111,6 +113,30 @@ describe.skipIf(!redisUrl)('lobby writes across instances', () => {
     fetch(`${url}/api/lobbies/${slug}`)
       .then((r) => r.json())
       .then((b) => b.lobby);
+
+  // A started round of the external test game, with the TV on `tvAt` and one
+  // phone per entry of `phonesAt` (the first one the host).
+  async function startedPad(tvAt: number, phonesAt: number[], instanceUrls = urls) {
+    const slug = await fetch(`${instanceUrls[tvAt]}/api/lobbies`, { method: 'POST' })
+      .then((r) => r.json())
+      .then((body) => body.lobby.slug as string);
+    const tv = await openAt(instanceUrls[tvAt]);
+    expect((await ack(tv, 'screen:join', { slug, screenId: `scr_pad${slug}` })).ok).toBe(true);
+    const phones = await Promise.all(phonesAt.map((at) => openAt(instanceUrls[at])));
+    const players: Joined[] = [await ack<Joined>(phones[0], 'controller:join', { slug, name: 'P0' })];
+    expect((await ack(phones[0], 'game:select', { slug, playerToken: players[0].playerToken, gameId: PAD.id })).ok).toBe(true);
+    for (const phone of phones.slice(1)) players.push(await ack<Joined>(phone, 'controller:join', { slug, name: `P${players.length}` }));
+    expect((await ack(phones[0], 'game:start', { slug, playerToken: players[0].playerToken })).ok).toBe(true);
+    return { slug, tv, phones, players };
+  }
+
+  function press(phone: Socket, slug: string, player: Joined, control = 'a', action = 'press') {
+    return ack<{ seq?: number }>(phone, 'controller:event', {
+      slug,
+      playerToken: player.playerToken,
+      event: { playerId: player.player.id, type: 'game', control, value: { action }, timestamp: Date.now() }
+    });
+  }
 
   it('stores a lobby only on top of the rev it was loaded with', async () => {
     const persistence = createLobbyPersistence(redisUrl);
@@ -236,6 +262,92 @@ describe.skipIf(!redisUrl)('lobby writes across instances', () => {
     const polled = await poll(urls[A], slug);
     expect(polled.name).toBe('Renamed by an old deploy');
     expect(polled.rev).toBe(after.rev);
+  });
+
+  it('commits a burst of game inputs in a few round trips, not one per input', async () => {
+    // One instance, with Redis 10 ms away each way: committing 24 inputs one
+    // after the other would take at least 24 round trips (480 ms).
+    const delayMs = 10;
+    const far = await slowRedisProxy(redisUrl!, delayMs);
+    process.env.REDIS_URL = far.url;
+    const instance = createRealtimeServer();
+    process.env.REDIS_URL = proxy.url;
+    await new Promise<void>((resolve) => instance.server.listen(0, resolve));
+    const url = `http://localhost:${(instance.server.address() as AddressInfo).port}`;
+    const monitor = redis.duplicate();
+    try {
+      const { slug, tv, phones, players } = await startedPad(0, [0, 0, 0], [url]);
+      const relayed: number[] = [];
+      tv.on('game:input', ({ seq }: { seq: number }) => relayed.push(seq));
+      await monitor.connect();
+      let commits = 0;
+      await monitor.monitor((line: string) => {
+        if (line.includes('"EVAL"') && line.includes(`"couch:lobby:${slug}"`)) commits++;
+      });
+
+      const perPhone = 8;
+      const startedAt = Date.now();
+      const sent = phones.map((phone, i) =>
+        Array.from({ length: perPhone }, (_, n) => press(phone, slug, players[i], 'a', n % 2 ? 'release' : 'press'))
+      );
+      const acks = await Promise.all(sent.map((each) => Promise.all(each)));
+      const elapsed = Date.now() - startedAt;
+      const total = phones.length * perPhone;
+
+      // Every input is stored under its own seq, each phone's in the order sent.
+      for (const each of acks) {
+        expect(each.every((a) => a.ok && typeof a.seq === 'number')).toBe(true);
+        const seqs = each.map((a) => a.seq!);
+        expect(seqs).toEqual([...seqs].sort((x, y) => x - y));
+      }
+      const seqs = acks.flat().map((a) => a.seq!);
+      expect(new Set(seqs).size).toBe(total);
+      const record = await stored(slug);
+      expect(record.inputLog.map((input: { seq: number }) => input.seq).sort((x: number, y: number) => x - y)).toEqual(
+        [...seqs].sort((x, y) => x - y)
+      );
+      // The TV gets them all, in seq order.
+      await expect.poll(() => relayed.length).toBe(total);
+      expect(relayed).toEqual([...relayed].sort((x, y) => x - y));
+
+      // Far fewer commits than inputs, and well under the time one commit per
+      // input would take.
+      expect(commits).toBeGreaterThan(0);
+      expect(commits).toBeLessThanOrEqual(total / 3);
+      expect(elapsed).toBeLessThan(total * 2 * delayMs);
+    } finally {
+      await monitor.destroy();
+      instance.io.close();
+      far.close();
+    }
+  });
+
+  it('keeps every input of a burst split over two instances, and turns away only the bad ones', async () => {
+    const { slug, phones, players } = await startedPad(A, [A, B, B]);
+    // Each phone sends 6 inputs at once; every third one of the first phone's
+    // names a control the game doesn't have, and is refused on its own.
+    const acks = await Promise.all(
+      phones.map((phone, i) =>
+        Promise.all(
+          Array.from({ length: 6 }, (_, n) =>
+            press(phone, slug, players[i], i === 0 && n % 3 === 2 ? 'nope' : 'a', n % 2 ? 'release' : 'press')
+          )
+        )
+      )
+    );
+    const refused = acks.flat().filter((a) => !a.ok);
+    expect(refused).toHaveLength(2);
+    for (const a of refused) expect(a.status).toBe(400);
+    const seqs = acks
+      .flat()
+      .filter((a) => a.ok)
+      .map((a) => a.seq!)
+      .sort((x, y) => x - y);
+    // One seq per input taken, none skipped and none twice.
+    expect(seqs).toEqual(Array.from({ length: 16 }, (_, n) => seqs[0] + n));
+    const record = await stored(slug);
+    expect(record.inputSeq).toBe(seqs.at(-1));
+    expect(record.inputLog.map((input: { seq: number }) => input.seq).sort((x: number, y: number) => x - y)).toEqual(seqs);
   });
 
   it('keeps every controller update of a burst the TV sends at once, each under its own seq', async () => {

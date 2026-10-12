@@ -84,6 +84,15 @@ interface StampedGameEvent {
   seq: number;
 }
 
+// A lobby change waiting for its commit (mutateLobby).
+interface LobbyWrite {
+  apply: (lobby: LobbyRecord) => unknown;
+  changed: (result: unknown) => boolean;
+  hydrated: boolean;
+  resolve: (done: { result: unknown; lobby: LobbyRecord }) => void;
+  reject: (err: unknown) => void;
+}
+
 interface SocketContext {
   role: 'screen' | 'controller' | 'screen-pairing';
   slug: string;
@@ -152,8 +161,9 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   const store = new LobbyStore(resolveManifest);
   const screens = new ScreenRegistry();
   const persistence = createProductionLobbyPersistence();
-  // The tail of each lobby's write queue on this instance (inLobbyQueue).
-  const lobbyQueues = new Map<string, Promise<unknown>>();
+  // The writes waiting for each lobby's next commit on this instance, kept
+  // while one is being made (mutateLobby).
+  const lobbyWrites = new Map<string, LobbyWrite[]>();
   const turnTimers = new Map<string, NodeJS.Timeout>();
   const inputLimiter = new RateLimiter();
   // Separate budget for game -> phone controller updates, keyed per lobby.
@@ -1040,18 +1050,6 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
     store.lobbies.delete(normalized);
   }
 
-  // Run one lobby's writes on this instance one after the other: at the same
-  // time they would only make each other load and apply again (mutateLobby).
-  function inLobbyQueue<T>(slug: string, task: () => Promise<T>): Promise<T> {
-    const run = (lobbyQueues.get(slug) ?? Promise.resolve()).then(task);
-    const tail = run.catch(() => undefined);
-    lobbyQueues.set(slug, tail);
-    void tail.then(() => {
-      if (lobbyQueues.get(slug) === tail) lobbyQueues.delete(slug);
-    });
-    return run;
-  }
-
   // Every change to a lobby goes through here. It loads the stored lobby,
   // applies the change to a copy and commits the copy only if the stored lobby
   // is still the one it loaded. If another instance (or anything else) wrote
@@ -1063,44 +1061,87 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   // change). `hydrated` says the caller has just loaded the lobby, so the
   // first round uses that. This is also where a lobby is kept alive
   // (LobbyStore.keepAlive).
-  async function mutateLobby<T>(
+  //
+  // One commit per lobby runs at a time on this instance: at the same time
+  // they would only make each other load and apply again. The writes that
+  // come in while one runs wait for it and then go in together, applied in
+  // turn to one copy and stored with one commit (commitLobbyWrites), so a
+  // stream of game inputs costs a round trip per batch, not one per input.
+  function mutateLobby<T>(
     slug: string,
     apply: (lobby: LobbyRecord) => T,
     options: { changed?: (result: T) => boolean; hydrated?: boolean } = {}
   ): Promise<{ result: T; lobby: LobbyRecord }> {
     const normalized = slug.toUpperCase();
-    const changed = options.changed ?? (() => true);
-    return inLobbyQueue(normalized, async () => {
+    return new Promise((resolve, reject) => {
+      const write: LobbyWrite = {
+        apply,
+        changed: (options.changed ?? (() => true)) as (result: unknown) => boolean,
+        hydrated: options.hydrated ?? false,
+        resolve: resolve as LobbyWrite['resolve'],
+        reject
+      };
+      const waiting = lobbyWrites.get(normalized);
+      if (waiting) {
+        waiting.push(write);
+        return;
+      }
+      lobbyWrites.set(normalized, [write]);
+      void drainLobbyWrites(normalized);
+    });
+  }
+
+  // Commit a lobby's waiting writes, batch after batch, until none are left.
+  async function drainLobbyWrites(slug: string): Promise<void> {
+    // Writes that come in with the first one (one burst of events) join it.
+    await new Promise((resolve) => setImmediate(resolve));
+    for (;;) {
+      const batch = lobbyWrites.get(slug) ?? [];
+      if (batch.length === 0) {
+        lobbyWrites.delete(slug);
+        return;
+      }
+      lobbyWrites.set(slug, []);
+      await commitLobbyWrites(slug, batch);
+    }
+  }
+
+  // Apply a batch of writes in the order they came and commit them with one
+  // compare-and-set (see mutateLobby). Settles every write in it.
+  async function commitLobbyWrites(slug: string, writes: LobbyWrite[]): Promise<void> {
+    let pending = writes;
+    try {
       for (let attempt = 1; ; attempt++) {
-        if (attempt > 1 || !options.hydrated) await hydrateLobby(normalized);
-        const held = store.getLobby(normalized);
-        // With storage the change goes onto a copy, which the store holds only
-        // while `apply` runs (store methods look the lobby up by slug): nothing
-        // else here sees the change before it is stored. In memory the held
-        // lobby is the only one.
-        const lobby = persistence.enabled ? cloneLobbyRecord(held) : held;
-        const before = { rev: lobby.rev, expiresAt: lobby.expiresAt };
-        // Up front, so the views `apply` builds carry the new rev.
-        store.markChanged(lobby);
-        let result: T;
-        store.lobbies.set(normalized, lobby);
-        try {
-          result = apply(lobby);
-        } catch (err) {
-          Object.assign(lobby, before);
-          throw err;
-        } finally {
-          store.lobbies.set(normalized, held);
+        if (attempt > 1 || pending.some((write) => !write.hydrated)) await hydrateLobby(slug);
+        const held = store.getLobby(slug);
+        if (!persistence.enabled) {
+          // In memory the held lobby is the only one: each change is made to
+          // it and settled in turn.
+          for (const write of pending) {
+            const before = { rev: held.rev, expiresAt: held.expiresAt };
+            store.markChanged(held);
+            try {
+              const result = write.apply(held);
+              if (!write.changed(result)) Object.assign(held, before);
+              write.resolve({ result, lobby: held });
+            } catch (err) {
+              Object.assign(held, before);
+              write.reject(err);
+            }
+          }
+          return;
         }
-        if (!changed(result)) {
-          Object.assign(lobby, before);
-          return { result, lobby: held };
+        const { lobby, applied, changed } = applyLobbyWrites(slug, held, pending);
+        pending = applied.map(({ write }) => write);
+        if (!changed) {
+          for (const { write, result } of applied) write.resolve({ result, lobby: held });
+          return;
         }
-        if (!persistence.enabled) return { result, lobby };
-        const stored = persistence.commit ? await persistence.commit(lobby, before.rev) : (await persistence.save(lobby), true);
+        const stored = persistence.commit ? await persistence.commit(lobby, held.rev) : (await persistence.save(lobby), true);
         if (stored) {
           store.adopt(lobby);
-          return { result, lobby };
+          for (const { write, result } of applied) write.resolve({ result, lobby });
+          return;
         }
         if (attempt >= MAX_COMMIT_ATTEMPTS) {
           throw new LobbyError('Die Lobby ist gerade zu beschäftigt, bitte nochmal versuchen', 503);
@@ -1108,7 +1149,46 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
         // Spread out instances that keep running into each other.
         await new Promise((resolve) => setTimeout(resolve, Math.random() * 4 * attempt));
       }
-    });
+    } catch (err) {
+      for (const write of pending) write.reject(err);
+    }
+  }
+
+  // Apply writes in turn to one copy of the held lobby. The store holds the
+  // copy only while they run (store methods look the lobby up by slug):
+  // nothing else here sees a change before it is stored. Each write gets the
+  // rev of its own change, up front, so the views it builds (a join ack's
+  // lobby) carry it and read as older than the ones after it. A write whose
+  // apply throws is rejected and left out, and the others are applied again
+  // to a fresh copy, since the throw may have left this one half changed.
+  function applyLobbyWrites(slug: string, held: LobbyRecord, writes: LobbyWrite[]) {
+    for (;;) {
+      const lobby = cloneLobbyRecord(held);
+      const applied: Array<{ write: LobbyWrite; result: unknown }> = [];
+      let changed = false;
+      let failed: LobbyWrite | null = null;
+      store.lobbies.set(slug, lobby);
+      try {
+        for (const write of writes) {
+          const before = { rev: lobby.rev, expiresAt: lobby.expiresAt };
+          store.markChanged(lobby);
+          try {
+            const result = write.apply(lobby);
+            if (write.changed(result)) changed = true;
+            else Object.assign(lobby, before);
+            applied.push({ write, result });
+          } catch (err) {
+            write.reject(err);
+            failed = write;
+            break;
+          }
+        }
+      } finally {
+        store.lobbies.set(slug, held);
+      }
+      if (!failed) return { lobby, applied, changed };
+      writes = writes.filter((write) => write !== failed);
+    }
   }
 
   // A new lobby, under a slug no instance has taken yet.
