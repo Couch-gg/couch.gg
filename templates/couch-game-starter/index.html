@@ -55,18 +55,60 @@
     Get it from https://couch-gg.vercel.app/sdk/v1/couch-sdk.js
   -->
   <script src="https://couch-gg.vercel.app/sdk/v1/couch-sdk.js"></script>
+
+  <!--
+    A copy of couch.game.json, for when you open this file straight from disk:
+    browsers refuse fetch() on file:// pages. Paste the file in again whenever
+    you change it.
+  -->
+  <script type="application/json" id="manifest-copy">
+  {
+    "id": "my-tap-race",
+    "title": "Tap Race",
+    "description": "First to 30 taps wins. Mash your button faster than everyone else in the room.",
+    "minPlayers": 1,
+    "maxPlayers": 8,
+    "controllerLayout": {
+      "kind": "generic-buttons",
+      "controls": [
+        { "control": "tap", "type": "button", "label": "TAP!" }
+      ]
+    },
+    "aspectRatio": "16:9",
+    "estimatedDurationMinutes": 2,
+    "thumbnail": {
+      "kind": "css",
+      "gradient": "linear-gradient(160deg,#12324d,#2d8fbe)",
+      "icon": "zap"
+    },
+    "entryUrl": "https://YOUR-HOST.example.com/index.html",
+    "sdkProtocol": 1,
+    "supportsRemote": true,
+    "author": { "name": "Your Name" }
+  }
+  </script>
   <script>
     // First to this many taps wins.
     const WIN_TAPS = 30;
 
+    // Served over http(s), couch.game.json is the source of truth. Because the
+    // game runs in a sandboxed (opaque-origin) iframe, this fetch sends
+    // `Origin: null` — your host MUST send `Access-Control-Allow-Origin: *` or the
+    // browser blocks it. (GitHub Pages does this by default; for Netlify/Vercel
+    // see the starter README.) Opened from disk, the fetch fails and the copy
+    // above is used. The SDK never fetches the manifest for you.
+    async function loadManifest() {
+      try {
+        const res = await fetch('./couch.game.json');
+        if (res.ok) return await res.json();
+      } catch {
+        // file:// (or a blocked request): use the copy.
+      }
+      return JSON.parse(document.getElementById('manifest-copy').textContent);
+    }
+
     async function main() {
-      // The manifest is fetched from the same host as this page. Because the game
-      // runs in a sandboxed (opaque-origin) iframe, this fetch sends `Origin: null`
-      // — your host MUST send `Access-Control-Allow-Origin: *` or the browser
-      // blocks it. (GitHub Pages does this by default; for Netlify/Vercel see the
-      // starter README.) You could also inline the manifest object and skip the
-      // fetch entirely — the SDK never fetches it for you.
-      const manifest = await (await fetch('./couch.game.json')).json();
+      const manifest = await loadManifest();
 
       // Per-player tap counts, keyed by player.id (NEVER by array index — indices
       // shift when a player leaves mid-game).
