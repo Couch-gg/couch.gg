@@ -46,27 +46,45 @@ test('a TV lobby survives catalog entries with hostile thumbnails', async ({ bro
   });
   // Serve the real catalog plus entries the server would no longer accept
   // (an old record, another deployment): lucide internals as icons, a url()
-  // gradient, a card that can't be drawn at all.
+  // gradient, a card that can't be drawn at all. The TV gets its catalog from
+  // GET /api/games and from its screen:join ack, so both carry them.
+  const hostile = [
+    hostileGame('icon-export', 'Icon Export', {
+      kind: 'css',
+      gradient: 'url(http://127.0.0.1:4180/tracker.gif?x=1) center/cover',
+      icon: 'Icon'
+    }),
+    hostileGame('icons-export', 'Icons Export', { kind: 'css', gradient: 'linear-gradient(#000,#111)', icon: 'icons' }),
+    hostileGame('factory-export', 'Factory Export', {
+      kind: 'css',
+      gradient: 'linear-gradient(red, blue), url(http://127.0.0.1:4180/tracker-layer.gif)',
+      icon: 'createLucideIcon'
+    }),
+    hostileGame('lowercase-zap', 'Lowercase Zap', { kind: 'css', gradient: 'linear-gradient(#000,#111)', icon: 'zap' }),
+    hostileGame('broken-title', { not: 'a string' }, { kind: 'css', gradient: 'linear-gradient(#000,#111)', icon: 'zap' })
+  ];
   await tv.route(/\/api\/games$/, async (route) => {
     if (route.request().method() !== 'GET') return route.continue();
     const response = await route.fetch();
     const body = await response.json();
-    body.games.push(
-      hostileGame('icon-export', 'Icon Export', {
-        kind: 'css',
-        gradient: 'url(http://127.0.0.1:4180/tracker.gif?x=1) center/cover',
-        icon: 'Icon'
-      }),
-      hostileGame('icons-export', 'Icons Export', { kind: 'css', gradient: 'linear-gradient(#000,#111)', icon: 'icons' }),
-      hostileGame('factory-export', 'Factory Export', {
-        kind: 'css',
-        gradient: 'linear-gradient(red, blue), url(http://127.0.0.1:4180/tracker-layer.gif)',
-        icon: 'createLucideIcon'
-      }),
-      hostileGame('lowercase-zap', 'Lowercase Zap', { kind: 'css', gradient: 'linear-gradient(#000,#111)', icon: 'zap' }),
-      hostileGame('broken-title', { not: 'a string' }, { kind: 'css', gradient: 'linear-gradient(#000,#111)', icon: 'zap' })
-    );
+    body.games.push(...hostile);
     await route.fulfill({ response, json: body });
+  });
+  await tv.routeWebSocket(/\/socket\.io\//, (ws) => {
+    const server = ws.connectToServer();
+    server.onMessage((message) => {
+      // A Socket.IO ack is "43<id>[...]"; the screen:join ack carries `games`.
+      const match = typeof message === 'string' ? /^43(\d+)(\[.*)$/s.exec(message) : null;
+      if (match) {
+        const args = JSON.parse(match[2]);
+        if (args[0] && typeof args[0] === 'object' && Array.isArray(args[0].games)) {
+          args[0].games.push(...hostile);
+          ws.send(`43${match[1]}${JSON.stringify(args)}`);
+          return;
+        }
+      }
+      ws.send(message);
+    });
   });
 
   await tv.goto(`/l/${slug}`);
