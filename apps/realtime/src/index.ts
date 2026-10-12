@@ -7,7 +7,7 @@ import { GAME_MANIFESTS } from '@couch/game-runtime';
 import type { TrebuchetEvent } from '@couch/trebuchet';
 import type { ControllerEvent, ControllerPatch, GameId, GameManifest, PlayerId, ScreenId } from '@couch/types';
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { LobbyError, LobbyStore, RECONNECT_GRACE_MS, type LobbyRecord, type ManifestResolver } from './lobbies.js';
+import { LobbyError, LobbyStore, RECONNECT_GRACE_MS, hostScreenId, type LobbyRecord, type ManifestResolver } from './lobbies.js';
 import { mergeCatalog, parseExternalGamesJson } from './external-games.js';
 import { RateLimiter } from './rate-limit.js';
 import { createProductionGamePersistence, createProductionLobbyPersistence } from './persistence.js';
@@ -20,6 +20,15 @@ import { ScreenRegistry } from './screens.js';
 const REPORT_CAPACITY = 5;
 const REPORT_REFILL_PER_MS = 5 / 3_600_000; // 5 per 3600s
 const REPORT_IDLE_PRUNE_MS = 3_600_000;
+// Largest host-authoritative state broadcast (serialized), see game:state.
+const MAX_STATE_BYTES = 32_768;
+// How long a socket's "is this the host screen" verdict is trusted.
+const HOST_CHECK_TTL_MS = 2_000;
+// Longest accepted broadcast epoch (a per-mount random id from the host TV).
+const MAX_EPOCH_CHARS = 32;
+// How long a TV whose socket dropped may take to come back before it is
+// dropped from lobby.screens (a reload or a blip rejoins well within this).
+const SCREEN_GRACE_MS = 10_000;
 
 class ReportRateLimiter {
   private readonly buckets = new Map<string, { tokens: number; lastRefill: number }>();
@@ -63,6 +72,8 @@ export interface RealtimeServerOptions {
   clientOrigin?: string;
   socketPath?: string;
   websocketOnly?: boolean;
+  /** Override SCREEN_GRACE_MS (tests). */
+  screenGraceMs?: number;
 }
 
 export interface RealtimeServerInstance {
@@ -76,6 +87,7 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   const clientOrigin = options.clientOrigin ?? process.env.CLIENT_ORIGIN ?? '*';
   const apiPrefix = normalizeApiPrefix(options.apiPrefix ?? process.env.API_PREFIX ?? '/api');
   const socketPath = options.socketPath ?? process.env.SOCKET_PATH ?? '/socket.io';
+  const screenGraceMs = options.screenGraceMs ?? SCREEN_GRACE_MS;
   // Env-registered external games (ops escape hatch before the durable registry).
   // Parsed once at startup; localhost http is allowed only off Vercel (local dev).
   const externalGames = parseExternalGamesJson(process.env.EXTERNAL_GAMES_JSON, {
@@ -108,6 +120,9 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   const inputLimiter = new RateLimiter();
   // Separate budget for game -> phone controller updates, keyed per lobby.
   const controllerLimiter = new RateLimiter();
+  // Host-authoritative state broadcasts: ~30/s sustained per lobby (a 30 Hz
+  // snapshot loop), bursts to 60.
+  const stateLimiter = new RateLimiter({ playerCapacity: 60, playerRefillPerSec: 30, slugCapacity: 60, slugRefillPerSec: 30 });
   // Per-IP report throttle: 5 reports/hour. Same token-bucket shape as the input
   // limiter but with report-specific capacity/refill, keyed `report:<ip>`.
   const reportLimiter = new ReportRateLimiter();
@@ -147,6 +162,9 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   app.get(`${apiPrefix}/lobbies/:slug`, async (req, res) => {
     try {
       await hydrateLobby(req.params.slug);
+      // Every TV and phone polls this, so a TV that left is dropped even when
+      // the instance that saw it go is gone before its grace timer fires.
+      await dropGoneScreens(req.params.slug.toUpperCase());
       res.json({ lobby: store.publicLobby(req.params.slug) });
     } catch (err) {
       sendHttpError(res, err);
@@ -156,7 +174,7 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   app.post(`${apiPrefix}/lobbies/:slug/players`, async (req, res) => {
     try {
       await hydrateLobby(req.params.slug);
-      const joined = store.joinPlayer(req.params.slug, req.body?.name, req.body?.playerToken);
+      const joined = store.joinPlayer(req.params.slug, req.body?.name, req.body?.playerToken, req.body?.screenId);
       await saveLobby(req.params.slug);
       res.status(201).json(joined);
     } catch (err) {
@@ -309,34 +327,55 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
 
   io.on('connection', (socket) => {
     let ctx: SocketContext | null = null;
+    // Cached game:state host verdict, see game:state. Reset on every screen:join.
+    let hostCheck: { slug: string; ok: boolean; at: number } | null = null;
+    // Whether this socket is the shell of the lobby's host screen (the lobby
+    // must already be hydrated). With no screen listed (every TV was dropped,
+    // or the TVs still run a bundle that joins without a screen id) any
+    // screen of the lobby is the host, as in the TV's own screenRole; else
+    // the round could never end. Uncached: for rare events, not game:state.
+    const isHostScreen = (slug: string): boolean => {
+      if (!ctx || ctx.role !== 'screen' || ctx.slug !== slug) return false;
+      const host = hostScreenId(store.getLobby(slug));
+      return host === null || (!!ctx.screenId && host === ctx.screenId);
+    };
     // Controls this socket has pressed/moved (relayed) and not yet released,
     // keyed `${slug}:${playerId}:${control}`. Only these releases skip the limiter.
     const held = new Set<string>();
 
-    socket.on('screen:join', async (payload: { slug?: string }, ack?: (value: unknown) => void) => {
+    socket.on('screen:join', async (payload: { slug?: string; screenId?: string; screenToken?: string }, ack?: (value: unknown) => void) => {
       try {
         const slug = String(payload?.slug ?? '').toUpperCase();
         await hydrateLobby(slug);
         await registry.ensureFresh();
+        // A known screen id must bring the token its first join was given; a
+        // new one gets its token here, in this ack only.
+        const joined = store.joinScreen(slug, payload?.screenId, payload?.screenToken, socket.id);
+        if (joined.changed) {
+          await saveLobby(slug);
+          emitLobby(slug);
+        }
         const lobby = store.publicLobby(slug);
-        ctx = { role: 'screen', slug };
-        socket.join(room(slug));
-        ack?.({ ok: true, lobby, games: catalog() });
+        const screenId = joined.screenId ?? undefined;
+        ctx = { role: 'screen', slug, screenId };
+        hostCheck = null;
+        socket.join([room(slug), screensRoom(slug)]);
+        ack?.({ ok: true, lobby, games: catalog(), ...(joined.screenToken ? { screenToken: joined.screenToken } : {}) });
         socket.emit('lobby:snapshot', lobby);
       } catch (err) {
         ack?.(socketError(err));
       }
     });
 
-    socket.on('controller:join', async (payload: { slug?: string; name?: string; playerToken?: string }, ack?: (value: unknown) => void) => {
+    socket.on('controller:join', async (payload: { slug?: string; name?: string; playerToken?: string; screenId?: string }, ack?: (value: unknown) => void) => {
       try {
         const slug = String(payload?.slug ?? '').toUpperCase();
         await hydrateLobby(slug);
         await registry.ensureFresh();
-        const joined = store.joinPlayer(slug, payload?.name, payload?.playerToken);
+        const joined = store.joinPlayer(slug, payload?.name, payload?.playerToken, payload?.screenId);
         await saveLobby(slug);
         ctx = { role: 'controller', slug, playerId: joined.player.id };
-        socket.join(room(slug));
+        socket.join([room(slug), playerRoom(slug, joined.player.id)]);
         ack?.({ ok: true, ...joined, games: catalog() });
         emitLobby(slug);
         await autoStartIfFull(slug);
@@ -427,7 +466,8 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
           if (derivedId && !isRelease) held.add(heldKey);
           ack?.({ ok: true, seq: envelope.seq });
           await saveLobby(slug);
-          io.to(room(slug)).emit('game:input', envelope);
+          // Only screens run games; phones never read inputs.
+          io.to(screensRoom(slug)).emit('game:input', envelope);
           return;
         }
 
@@ -461,8 +501,8 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
     });
 
     // An external game reports its final scores. Accepted ONLY from the trusted
-    // screen shell (the iframe can't reach the socket) whose joined slug matches.
-    // Idempotent: a duplicate report (e.g. a second TV) acks { ok:true, finished:false }.
+    // shell (the iframe can't reach the socket) of the lobby's host screen.
+    // Idempotent: a duplicate report acks { ok:true, finished:false }.
     socket.on('game:finish', async (payload: { slug?: string; scores?: unknown }, ack?: (value: unknown) => void) => {
       try {
         const slug = String(payload?.slug ?? '').toUpperCase();
@@ -470,6 +510,7 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
           throw new LobbyError('Nur der Screen kann das Spiel beenden', 403);
         }
         await hydrateLobby(slug);
+        if (!isHostScreen(slug)) throw new LobbyError('Nur der Host-Screen kann das Spiel beenden', 403);
         const finished = store.finishExternalGame(slug, payload?.scores);
         ack?.({ ok: true, finished });
         if (finished) {
@@ -483,23 +524,68 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
 
     // The running game tells one player's phone what to show (labels, disabled
     // controls, cooldowns, a vibration). Like game:finish this comes only from
-    // the trusted screen shell, never from the iframe or a phone.
+    // the trusted screen shell, never from the iframe or a phone. In a remote
+    // couch every screen may run the game, so only the host screen's calls are
+    // applied; the others are acked as ignored, so each patch lands once.
     socket.on('screen:controller', async (payload: { slug?: string; playerId?: string; patch?: unknown }, ack?: (value: unknown) => void) => {
       try {
         const slug = String(payload?.slug ?? '').toUpperCase();
         if (!ctx || ctx.role !== 'screen' || ctx.slug !== slug) {
           throw new LobbyError('Nur der Screen kann Controller steuern', 403);
         }
+        await hydrateLobby(slug);
+        if (!isHostScreen(slug)) {
+          ack?.({ ok: true, ignored: true });
+          return;
+        }
         if (!controllerLimiter.allow(slug, 'screen')) {
           ack?.({ ok: true, dropped: true });
           return;
         }
-        await hydrateLobby(slug);
         const playerId = String(payload?.playerId ?? '');
         const state = store.setControllerState(slug, playerId, payload?.patch as ControllerPatch);
         ack?.({ ok: true, state });
         await saveLobby(slug);
-        io.to(room(slug)).emit('controller:state', { playerId, state });
+        io.to(playerRoom(slug, playerId)).emit('controller:state', { playerId, state });
+      } catch (err) {
+        ack?.(socketError(err));
+      }
+    });
+
+    // Host-authoritative mode: the host screen's game broadcasts its state and
+    // every other screen renders it. Ephemeral (never persisted): a screen that
+    // joins late simply picks up the next broadcast. The host verdict is cached
+    // per socket (hostCheck) and re-read from persistence every
+    // HOST_CHECK_TTL_MS, so a 30 Hz loop doesn't hit Redis on every frame but
+    // still notices when the host player moves to another screen (possibly via
+    // another instance). `epoch` changes whenever the host's game is mounted
+    // anew (reload, new host), and receivers restart their seq check with it.
+    socket.on('game:state', async (payload: { slug?: string; epoch?: unknown; seq?: unknown; state?: unknown }, ack?: (value: unknown) => void) => {
+      try {
+        const slug = String(payload?.slug ?? '').toUpperCase();
+        if (!ctx || ctx.role !== 'screen' || ctx.slug !== slug) {
+          throw new LobbyError('Nur ein Screen kann Spielzustand senden', 403);
+        }
+        const now = Date.now();
+        if (!hostCheck || hostCheck.slug !== slug || now - hostCheck.at > HOST_CHECK_TTL_MS) {
+          await hydrateLobby(slug);
+          const lobby = store.getLobby(slug);
+          hostCheck = { slug, ok: !!ctx.screenId && hostScreenId(lobby) === ctx.screenId, at: now };
+        }
+        if (!hostCheck.ok) {
+          throw new LobbyError('Nur der Host-Screen sendet den Spielzustand', 403);
+        }
+        if (typeof payload?.seq !== 'number') throw new LobbyError('seq fehlt');
+        const epoch = payload.epoch ?? '';
+        if (typeof epoch !== 'string' || epoch.length > MAX_EPOCH_CHARS) throw new LobbyError('epoch ungültig');
+        const encoded = JSON.stringify(payload?.state ?? null);
+        if (encoded.length > MAX_STATE_BYTES) throw new LobbyError('Spielzustand zu groß', 413);
+        if (!stateLimiter.allow(slug, 'host')) {
+          ack?.({ ok: true, dropped: true });
+          return;
+        }
+        ack?.({ ok: true });
+        socket.to(screensRoom(slug)).emit('game:state', { epoch, seq: payload.seq, at: Date.now(), state: payload.state ?? null });
       } catch (err) {
         ack?.(socketError(err));
       }
@@ -566,6 +652,10 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
     });
 
     socket.on('disconnect', () => {
+      if (ctx?.role === 'screen' && ctx.screenId) {
+        void screenLeft(ctx.slug, ctx.screenId, socket.id);
+        return;
+      }
       if (!ctx || ctx.role !== 'controller' || !ctx.playerId) return;
       void (async () => {
         const at = Date.now();
@@ -638,6 +728,41 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
     store.pruneExpired();
     screens.pruneExpired();
   }, 60_000).unref?.();
+
+  // A TV whose socket dropped gets screenGraceMs to come back (a reload or a
+  // network blip rejoins with the same screen id, maybe on another instance).
+  // The drop is noted in the lobby record, not in this instance's memory: a
+  // join of that screen anywhere clears it, and once the grace has passed
+  // without one the TV is gone and leaves lobby.screens, so the host screen
+  // moves to a live one.
+  async function screenLeft(slug: string, screenId: string, socketId: string): Promise<void> {
+    try {
+      await hydrateLobby(slug);
+      if (!store.markScreenLeft(slug, screenId, socketId, Date.now())) return;
+      await saveLobby(slug);
+    } catch {
+      return; // The lobby expired meanwhile.
+    }
+    // A little past the grace, so the mark is surely old enough by then.
+    setTimeout(() => {
+      void (async () => {
+        try {
+          await hydrateLobby(slug);
+          await dropGoneScreens(slug);
+        } catch {
+          // The lobby expired meanwhile.
+        }
+      })();
+    }, screenGraceMs + 100).unref?.();
+  }
+
+  // Drop the lobby's screens that left more than screenGraceMs ago (the lobby
+  // must already be hydrated) and tell everyone.
+  async function dropGoneScreens(slug: string): Promise<void> {
+    if (!store.dropGoneScreens(slug, Date.now(), screenGraceMs)) return;
+    await saveLobby(slug);
+    emitLobby(slug);
+  }
 
   function emitLobby(slug: string): void {
     try {
@@ -766,6 +891,16 @@ export function startRealtimeServer(options: RealtimeServerOptions = {}): http.S
 
 function room(slug: string): string {
   return `lobby:${slug}`;
+}
+
+// The lobby's screens only: game:state and game:input never go to phones.
+function screensRoom(slug: string): string {
+  return `screens:${slug}`;
+}
+
+// One player's phone(s), for controller:state.
+function playerRoom(slug: string, playerId: string): string {
+  return `player:${slug}:${playerId}`;
 }
 
 function screenRoom(id: string): string {

@@ -29,6 +29,7 @@ import {
   sanitizePlayerName
 } from '@couch/game-runtime';
 import { TrebuchetEngine, type TrebuchetEvent, type TrebuchetSnapshot } from '@couch/trebuchet';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 
 // Resolves a game id to its manifest (built-in or env-registered external),
 // returning null for unknown ids. Injected into LobbyStore so the store never
@@ -116,6 +117,23 @@ export interface SerializedLobbyRecord {
   inputSeq?: number;
   inputLog?: GameInputEnvelope[];
   controllerState?: Record<PlayerId, ControllerState>;
+  screens?: string[];
+  // A bare hash: a binding persisted before its bind time was kept.
+  screenSecrets?: Record<string, ScreenSecret | string>;
+  screenPresence?: Record<string, ScreenPresence>;
+}
+
+// The hashed secret a screen id is bound to, and when it was bound.
+export interface ScreenSecret {
+  hash: string;
+  at: number;
+}
+
+// The socket a listed screen last joined with, and when that socket dropped
+// (null while it is connected).
+export interface ScreenPresence {
+  socketId: string;
+  leftAt: number | null;
 }
 
 export interface LobbyRecord {
@@ -137,6 +155,12 @@ export interface LobbyRecord {
   inputSeq: number;
   inputLog: GameInputEnvelope[];
   controllerState: Record<PlayerId, ControllerState>;
+  screens: string[];
+  // sha256 of each screen id's secret token (see joinScreen). Never public.
+  screenSecrets: Record<string, ScreenSecret>;
+  // Whether each listed screen is still connected, kept in the record so any
+  // instance can tell (see markScreenLeft). Never public.
+  screenPresence: Record<string, ScreenPresence>;
 }
 
 export class LobbyError extends Error {
@@ -185,7 +209,10 @@ export class LobbyStore {
       mode,
       inputSeq: 0,
       inputLog: [],
-      controllerState: {}
+      controllerState: {},
+      screens: [],
+      screenSecrets: {},
+      screenPresence: {}
     };
     this.addActivity(lobby, 'Lobby erstellt');
     this.lobbies.set(slug, lobby);
@@ -220,12 +247,15 @@ export class LobbyStore {
       lastEvent: lobby.lastEvent,
       mode: lobby.mode,
       inputLog: lobby.inputLog.slice(-INPUT_LOG_PUBLIC_LIMIT),
-      controllerState: lobby.controllerState
+      controllerState: lobby.controllerState,
+      screens: lobby.screens.slice(),
+      hostScreenId: hostScreenId(lobby)
     };
   }
 
-  joinPlayer(slug: string, name: unknown, existingToken?: string): JoinLobbyResponse {
+  joinPlayer(slug: string, name: unknown, existingToken?: string, screenId?: unknown): JoinLobbyResponse {
     const lobby = this.getLobby(slug);
+    const seat = cleanScreenId(screenId);
     const reconnect = existingToken
       ? [...lobby.players.values()].find((player) => player.token === existingToken)
       : undefined;
@@ -234,6 +264,7 @@ export class LobbyStore {
       reconnect.connected = true;
       reconnect.disconnectedAt = null;
       reconnect.name = sanitizePlayerName(name || reconnect.name);
+      if (seat) reconnect.screenId = seat;
       this.addActivity(lobby, `${reconnect.name} ist wieder verbunden`);
       return {
         lobby: this.publicLobby(lobby),
@@ -258,7 +289,8 @@ export class LobbyStore {
       connected: true,
       colorIdx: this.nextColor(lobby),
       token: createId('token'),
-      disconnectedAt: null
+      disconnectedAt: null,
+      screenId: seat
     };
     lobby.players.set(player.id, player);
     if (!lobby.hostPlayerId) {
@@ -589,8 +621,102 @@ export class LobbyStore {
       joinedAt: player.joinedAt,
       isHost: lobby.hostPlayerId === player.id,
       connected: player.connected,
-      colorIdx: player.colorIdx
+      colorIdx: player.colorIdx,
+      screenId: player.screenId ?? null
     };
+  }
+
+  // A TV showing this lobby. The first join of a screen id binds it to a
+  // secret token (only its hash is kept; the token goes back once, to that
+  // TV) and every later join with that id must present it, so the public
+  // screen ids can't be taken over. Screens are remembered in join order so
+  // the host screen is stable; a new one is refused once the lobby is full
+  // (nobody gets evicted). `socketId` is the joining connection, see
+  // markScreenLeft. `changed` says whether the record needs saving.
+  joinScreen(
+    slug: string,
+    screenId: unknown,
+    screenToken: unknown,
+    socketId?: string,
+    now = Date.now()
+  ): { screenId: string | null; changed: boolean; screenToken?: string } {
+    const lobby = this.getLobby(slug);
+    const id = cleanScreenId(screenId);
+    if (!id) return { screenId: null, changed: false };
+    const listed = lobby.screens.includes(id);
+    const bound = lobby.screenSecrets[id];
+    if (bound && (typeof screenToken !== 'string' || !sameHash(hashScreenToken(screenToken), bound.hash))) {
+      throw new LobbyError('Dieser Screen gehört zu einem anderen Gerät', 403);
+    }
+    if (!listed && lobby.screens.length >= MAX_LOBBY_SCREENS) throw new LobbyError('Diese Lobby hat schon genug Screens', 409);
+    let minted: string | undefined;
+    if (!bound) {
+      this.forgetOldScreenSecrets(lobby);
+      minted = randomBytes(24).toString('base64url');
+      lobby.screenSecrets[id] = { hash: hashScreenToken(minted), at: now };
+    }
+    if (!listed) lobby.screens.push(id);
+    let present = false;
+    if (socketId !== undefined) {
+      const before = lobby.screenPresence[id];
+      present = before?.socketId !== socketId || before.leftAt !== null;
+      lobby.screenPresence[id] = { socketId, leftAt: null };
+    }
+    return { screenId: id, changed: !listed || !!minted || present, screenToken: minted };
+  }
+
+  // The socket a screen joined with dropped. Only its latest socket counts: a
+  // TV that already joined again (here or on another instance) stays as it
+  // is. Returns whether the record changed.
+  markScreenLeft(slug: string, screenId: string, socketId: string, at = Date.now()): boolean {
+    const lobby = this.lobbies.get(slug.toUpperCase());
+    const presence = lobby?.screenPresence[screenId];
+    if (!lobby || !presence || presence.socketId !== socketId || presence.leftAt !== null) return false;
+    if (!lobby.screens.includes(screenId)) return false;
+    presence.leftAt = at;
+    return true;
+  }
+
+  // Drop every screen whose socket left at least graceMs ago without the TV
+  // joining again since. Their token binding stays, so the same TV can come
+  // back later. Returns whether any screen was dropped.
+  dropGoneScreens(slug: string, now: number, graceMs: number): boolean {
+    const lobby = this.getLobby(slug);
+    const gone = lobby.screens.filter((id) => {
+      const leftAt = lobby.screenPresence[id]?.leftAt;
+      return leftAt != null && now - leftAt >= graceMs;
+    });
+    for (const id of gone) this.removeScreen(slug, id);
+    return gone.length > 0;
+  }
+
+  // Take a screen out of lobby.screens (its binding stays).
+  removeScreen(slug: string, screenId: string): boolean {
+    const lobby = this.getLobby(slug);
+    if (!lobby.screens.includes(screenId)) return false;
+    lobby.screens = lobby.screens.filter((id) => id !== screenId);
+    delete lobby.screenPresence[screenId];
+    return true;
+  }
+
+  // Make room for one more screen binding by forgetting the oldest ones of
+  // ids that are neither listed nor a player's seat. Such a TV left long ago;
+  // if it comes back it is simply bound anew. So ids that joined and left
+  // can't lock new TVs out, and a seat id can't be freed up for someone else.
+  private forgetOldScreenSecrets(lobby: LobbyRecord): void {
+    const ids = Object.keys(lobby.screenSecrets);
+    if (ids.length < MAX_SCREEN_SECRETS) return;
+    const kept = new Set<string>(lobby.screens);
+    for (const player of lobby.players.values()) if (player.screenId) kept.add(player.screenId);
+    const stale = ids
+      .filter((id) => !kept.has(id))
+      .sort((a, b) => lobby.screenSecrets[a].at - lobby.screenSecrets[b].at)
+      .slice(0, ids.length - MAX_SCREEN_SECRETS + 1);
+    if (ids.length - stale.length >= MAX_SCREEN_SECRETS) throw new LobbyError('Diese Lobby hat schon genug Screens', 409);
+    for (const id of stale) {
+      delete lobby.screenSecrets[id];
+      delete lobby.screenPresence[id];
+    }
   }
 
   private nextColor(lobby: LobbyRecord): number {
@@ -656,7 +782,10 @@ export function serializeLobbyRecord(lobby: LobbyRecord): SerializedLobbyRecord 
     mode: lobby.mode,
     inputSeq: lobby.inputSeq,
     inputLog: lobby.inputLog.slice(),
-    controllerState: structuredClone(lobby.controllerState)
+    controllerState: structuredClone(lobby.controllerState),
+    screens: lobby.screens.slice(),
+    screenSecrets: structuredClone(lobby.screenSecrets),
+    screenPresence: structuredClone(lobby.screenPresence)
   };
 }
 
@@ -691,8 +820,51 @@ export function deserializeLobbyRecord(serialized: SerializedLobbyRecord): Lobby
     mode: serialized.mode ?? 'local',
     inputSeq: serialized.inputSeq ?? 0,
     inputLog: serialized.inputLog ? serialized.inputLog.slice() : [],
-    controllerState: serialized.controllerState ? structuredClone(serialized.controllerState) : {}
+    controllerState: serialized.controllerState ? structuredClone(serialized.controllerState) : {},
+    screens: serialized.screens ? serialized.screens.slice() : [],
+    screenSecrets: readScreenSecrets(serialized.screenSecrets),
+    screenPresence: serialized.screenPresence ? structuredClone(serialized.screenPresence) : {}
   };
+}
+
+const MAX_LOBBY_SCREENS = 8;
+// Screen ids bound in one lobby at a time (screens that left keep their
+// binding until room is needed, see forgetOldScreenSecrets).
+const MAX_SCREEN_SECRETS = 32;
+const SCREEN_ID_RE = /^scr_[A-Za-z0-9_-]{1,60}$/;
+
+function cleanScreenId(value: unknown): string | null {
+  return typeof value === 'string' && SCREEN_ID_RE.test(value) ? value : null;
+}
+
+// Bindings persisted as a bare hash count as the oldest.
+function readScreenSecrets(raw: SerializedLobbyRecord['screenSecrets']): Record<string, ScreenSecret> {
+  const out: Record<string, ScreenSecret> = {};
+  for (const [id, value] of Object.entries(raw ?? {})) {
+    out[id] = typeof value === 'string' ? { hash: value, at: 0 } : { hash: value.hash, at: value.at };
+  }
+  return out;
+}
+
+function hashScreenToken(token: string): string {
+  return createHash('sha256').update(token).digest('hex');
+}
+
+// Constant-time compare of two sha256 hex digests.
+function sameHash(a: string, b: string): boolean {
+  const left = Buffer.from(a, 'hex');
+  const right = Buffer.from(b, 'hex');
+  return left.length === right.length && timingSafeEqual(left, right);
+}
+
+// The screen that runs a host-authoritative game: wherever the host player
+// sits, else the first screen that showed up. Local lobbies have one screen,
+// so it's simply that one. `screens` only lists live screens (a TV that left
+// is dropped after a grace period), so a dead seat is never the host.
+export function hostScreenId(lobby: LobbyRecord): string | null {
+  const host = lobby.hostPlayerId ? lobby.players.get(lobby.hostPlayerId) : undefined;
+  if (host?.screenId && lobby.screens.includes(host.screenId)) return host.screenId;
+  return lobby.screens[0] ?? null;
 }
 
 const MAX_LABEL_CHARS = 16;

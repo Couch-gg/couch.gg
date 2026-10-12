@@ -54,6 +54,9 @@ export interface Player {
   isHost: boolean;
   connected: boolean;
   colorIdx: number;
+  // The screen (TV) this player sits at: the one whose QR they scanned. Null
+  // when they joined by invite link without a screen.
+  screenId?: ScreenId | null;
 }
 
 export interface Lobby {
@@ -75,6 +78,11 @@ export interface Lobby {
   inputLog?: GameInputEnvelope[];
   // What the running game told each player's phone (labels, cooldowns, ...).
   controllerState?: Record<PlayerId, ControllerState>;
+  // Screens (TVs) showing this lobby, in the order they first joined.
+  screens?: ScreenId[];
+  // The screen that runs a host-authoritative game: the host player's screen,
+  // else the first screen that joined.
+  hostScreenId?: ScreenId | null;
 }
 
 // A game's instructions for one player's phone, set via couch.setController.

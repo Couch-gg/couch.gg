@@ -12,6 +12,11 @@
   <!-- One JSON line per input: { playerId, control, action, value }.
        Talks back to the phones like a co-op game would: every player gets
        their own FIRE label, and firing starts a cooldown with a buzz. -->
+  <!-- Host-authoritative mode: which screen am I, who sits here, and (on the
+       other screens) the last state the host screen broadcast. -->
+  <div data-testid="screen-role"></div>
+  <div data-testid="local-players"></div>
+  <div data-testid="mirror"></div>
   <div id="log" data-testid="log"></div>
   <script src="./couch-sdk.js"></script>
   <script>
@@ -38,6 +43,34 @@
       });
       window.couch = couch;
       labelPlayers(couch.players);
+
+      const show = (id, text) => (document.querySelector('[data-testid="' + id + '"]').textContent = text);
+      const renderScreen = () => {
+        show('screen-role', couch.screen.isHost ? 'host' : 'mirror');
+        show('local-players', couch.localPlayers.map((p) => p.name).join(','));
+      };
+      renderScreen();
+      couch.on('playersChanged', renderScreen);
+      couch.on('screenChanged', renderScreen);
+      // The host screen counts presses and broadcasts the count (on each press
+      // and as a 10 Hz heartbeat, asking isHost every tick); mirrors show it and
+      // note which broadcast run (epoch) and seq they last took.
+      let inputs = 0;
+      couch.on('input', (input) => {
+        if (input.action !== 'press') return;
+        inputs += 1;
+        if (couch.screen.isHost) couch.broadcast({ inputs });
+      });
+      setInterval(() => {
+        if (couch.screen.isHost) couch.broadcast({ inputs });
+      }, 100);
+      const mirror = document.querySelector('[data-testid="mirror"]');
+      couch.on('state', (envelope) => {
+        show('mirror', 'inputs:' + envelope.state.inputs);
+        if (mirror.dataset.epoch !== envelope.epoch) mirror.dataset.firstSeq = String(envelope.seq);
+        mirror.dataset.epoch = envelope.epoch;
+        mirror.dataset.seq = String(envelope.seq);
+      });
     }
     main();
   </script>

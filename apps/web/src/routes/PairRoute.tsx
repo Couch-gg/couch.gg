@@ -31,6 +31,13 @@ export function PairRoute({ screenId, navigate }: { screenId: string; navigate: 
   }, [mode, phone]);
 
   const goToController = (slug: string, shareRoomNumber = false) => {
+    // Remember which TV this phone scanned: the controller sends it on join so
+    // games know which players sit at which screen.
+    try {
+      window.localStorage.setItem(`couch:seat:${slug}`, screenId);
+    } catch {
+      // Without it the player just has no screen.
+    }
     if (shareRoomNumber) {
       try {
         window.sessionStorage.setItem(`${REMOTE_SHARE_KEY_PREFIX}${slug}`, '1');
