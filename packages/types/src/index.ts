@@ -73,6 +73,27 @@ export interface Lobby {
   // Populated in a later wave; optional so existing apps compile unchanged.
   mode?: 'local' | 'remote';
   inputLog?: GameInputEnvelope[];
+  // What the running game told each player's phone (labels, cooldowns, ...).
+  controllerState?: Record<PlayerId, ControllerState>;
+}
+
+// A game's instructions for one player's phone, set via couch.setController.
+// `labels` and `disabled` persist until the game changes them; `cooldowns` and
+// `vibrate` are one-shot effects the phone runs once per new `seq`.
+export interface ControllerState {
+  seq: number;
+  labels: Record<string, string>;
+  disabled: string[];
+  cooldowns: Record<string, number>; // control -> ms, counted from when the phone receives it
+  vibrate: number[] | null;
+}
+
+// The patch a game sends. Omitted fields leave the current value alone.
+export interface ControllerPatch {
+  labels?: Record<string, string>;
+  disabled?: string[];
+  cooldowns?: Record<string, number>;
+  vibrate?: number | number[];
 }
 
 // One relayed controller input for an external game. Ordered by monotonic `seq`

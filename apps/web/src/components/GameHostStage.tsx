@@ -20,7 +20,7 @@ import { emitAck } from '../socket.js';
  * in place of the live socket/probe side effects).
  */
 export interface GameHostEvent {
-  kind: 'ready' | 'error' | 'gameOver';
+  kind: 'ready' | 'error' | 'gameOver' | 'controller';
   detail?: unknown;
 }
 
@@ -272,7 +272,23 @@ export const GameHostStage = forwardRef<GameHostStageHandle, GameHostStageProps>
           }
           break;
         }
-        case 'couch:error': {
+        case 'couch:setController': {
+          const { playerId, patch } = msg as { playerId?: unknown; patch?: unknown };
+          if (typeof playerId !== 'string' || !patch || typeof patch !== 'object') break;
+          onEventRef.current?.({ kind: 'controller', detail: { playerId, patch } });
+          if (modeRef.current === 'test') break; // /dev shows it; no phones to update
+          const sock = socketRef.current;
+          if (!sock) break;
+          // The server validates the patch against the manifest; log its
+          // reason so a creator sees the mistake in the TV console.
+          void emitAck(sock, 'screen:controller', { slug: lobbyRef.current.slug, playerId, patch }).catch((err: unknown) => {
+            const message = err instanceof Error ? err.message : 'setController failed';
+            // eslint-disable-next-line no-console
+            console.warn('[GameHostStage] setController rejected:', message);
+          });
+          break;
+        }
+                case 'couch:error': {
           const message = String((msg as { message?: unknown }).message ?? 'Game reported an error');
           setToast(message);
           onEventRef.current?.({ kind: 'error', detail: message });

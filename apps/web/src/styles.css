@@ -2928,3 +2928,13 @@ a.game-card.publish-card {
     min-height: min(84px, 22vh);
   }
 }
+
+/* Game-set cooldown (couch.setController): a dark curtain that drains down. */
+.generic-cooldown {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.62);
+  pointer-events: none;
+}

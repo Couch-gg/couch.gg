@@ -191,6 +191,38 @@ describe('CouchSDK input delivery', () => {
   });
 });
 
+describe('CouchSDK setController', () => {
+  it('posts couch:setController to the host with the player id and patch', async () => {
+    const h = embed();
+    const p = CouchSDK.init({ manifest });
+    h.deliver(initMessage());
+    const couch = await p;
+
+    couch.setController('p1', { labels: { tap: 'SHIELD' }, cooldowns: { tap: 2000 }, vibrate: [40, 20, 40] });
+    expect(h.posted.at(-1)).toEqual({
+      v: 1,
+      type: 'couch:setController',
+      playerId: 'p1',
+      patch: { labels: { tap: 'SHIELD' }, cooldowns: { tap: 2000 }, vibrate: [40, 20, 40] }
+    });
+    h.restore();
+  });
+});
+
+describe('dev simulator setController', () => {
+  it('reads labels as own keys, so a control named "constructor" keeps its label', async () => {
+    standalone();
+    const protoManifest: CouchManifest = {
+      ...manifest,
+      controllerLayout: { kind: 'generic-buttons', controls: [{ control: 'constructor', type: 'button', label: 'Build' }] }
+    };
+    const couch = await CouchSDK.init({ manifest: protoManifest });
+    couch.setController('sim-p1', { disabled: [] });
+    const btn = document.querySelector<HTMLButtonElement>('[data-player-id="sim-p1"] .couch-sim-pad-button')!;
+    expect(btn.textContent).toBe('Build');
+  });
+});
+
 describe('CouchSDK roster updates', () => {
   it('4. players message replaces roster + fires handler; joined/left deltas too', async () => {
     const h = embed();

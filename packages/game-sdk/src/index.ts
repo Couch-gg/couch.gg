@@ -16,6 +16,7 @@
 import {
   PROTOCOL_VERSION,
   isHostMessage,
+  type CouchControllerPatch,
   type CouchInputEnvelope,
   type CouchLatencyTier,
   type CouchManifest,
@@ -95,6 +96,13 @@ export interface CouchGame {
   ): () => void;
   /** Report final scores exactly once. Array or Record form. */
   gameOver(scores: CouchScoreInput): void;
+  /**
+   * Tell one player's phone what to show: per-player labels, greyed-out
+   * controls, cooldowns, a vibration. Omitted fields keep their value.
+   *   couch.setController(p.id, { labels: { a: 'SHIELD', b: 'BASH' } });
+   *   couch.setController(p.id, { cooldowns: { b: 3000 }, vibrate: 80 });
+   */
+  setController(playerId: string, patch: CouchControllerPatch): void;
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +200,10 @@ class CouchCore {
     this.emit('abort', { reason });
   }
 
+  setController(playerId: string, patch: CouchControllerPatch): void {
+    this.send({ v: PROTOCOL_VERSION, type: 'couch:setController', playerId: String(playerId), patch });
+  }
+
   gameOver(scores: CouchScoreInput): void {
     if (this.gameOverSent) {
       // eslint-disable-next-line no-console
@@ -247,6 +259,9 @@ function makeHandle(core: CouchCore): CouchGame {
     },
     gameOver(scores) {
       core.gameOver(scores);
+    },
+    setController(playerId, patch) {
+      core.setController(playerId, patch);
     }
   };
 }
@@ -374,6 +389,8 @@ function initDev(opts: CouchInitOptions): Promise<CouchGame> {
   const core = new CouchCore(opts.manifest, (msg) => {
     if (msg.type === 'couch:gameOver') {
       simulator?.showGameOver(msg.scores);
+    } else if (msg.type === 'couch:setController') {
+      simulator?.setController(msg.playerId, msg.patch);
     }
   });
   bindConvenienceCallbacks(core, opts);

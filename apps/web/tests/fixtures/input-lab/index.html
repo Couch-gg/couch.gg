@@ -9,16 +9,25 @@
   </style>
 </head>
 <body>
-  <!-- One JSON line per input: { playerId, control, action, value }. -->
+  <!-- One JSON line per input: { playerId, control, action, value }.
+       Talks back to the phones like a co-op game would: every player gets
+       their own FIRE label, and firing starts a cooldown with a buzz. -->
   <div id="log" data-testid="log"></div>
   <script src="./couch-sdk.js"></script>
   <script>
     async function main() {
       const manifest = await fetch('./couch.game.json').then((r) => r.json());
       const log = document.getElementById('log');
+      const heroLabels = ['SHIELD', 'ROLL', 'HEAL', 'DASH'];
+      const labelPlayers = (players) =>
+        players.forEach((p, i) => couch.setController(p.id, { labels: { fire: heroLabels[i % heroLabels.length] } }));
       const couch = await CouchSDK.init({
         manifest,
+        onPlayersChanged: (players) => labelPlayers(players),
         onInput(input) {
+          if (input.control === 'fire' && input.action === 'press') {
+            couch.setController(input.playerId, { cooldowns: { fire: 1500 }, vibrate: 40 });
+          }
           log.textContent += JSON.stringify({
             playerId: input.playerId,
             control: input.control,
@@ -28,6 +37,7 @@
         }
       });
       window.couch = couch;
+      labelPlayers(couch.players);
     }
     main();
   </script>

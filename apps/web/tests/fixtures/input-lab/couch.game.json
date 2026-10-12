@@ -8,9 +8,26 @@
     "kind": "generic-buttons",
     "orientation": "landscape",
     "controls": [
-      { "control": "move", "type": "stick", "label": "Move" },
-      { "control": "aim", "type": "dpad", "label": "Aim" },
-      { "control": "fire", "type": "button", "label": "FIRE" }
+      {
+        "control": "move",
+        "type": "stick",
+        "label": "Move"
+      },
+      {
+        "control": "aim",
+        "type": "dpad",
+        "label": "Aim"
+      },
+      {
+        "control": "fire",
+        "type": "button",
+        "label": "FIRE"
+      },
+      {
+        "control": "jump",
+        "type": "button",
+        "label": "JUMP"
+      }
     ]
   },
   "aspectRatio": "16:9",

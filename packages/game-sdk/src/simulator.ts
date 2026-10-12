@@ -8,6 +8,7 @@
 
 import type {
   CouchControl,
+  CouchControllerPatch,
   CouchInputEnvelope,
   CouchManifest,
   CouchPlayer,
@@ -38,6 +39,8 @@ export interface SimulatorOptions {
 export interface Simulator {
   /** Show a game-over toast with the reported scores. */
   showGameOver(scores: CouchScore[]): void;
+  /** Apply a game's couch.setController patch to that player's fake phone. */
+  setController(playerId: string, patch: CouchControllerPatch): void;
   /** Tear the overlay down (used by tests / hot reloads). */
   destroy(): void;
 }
@@ -61,7 +64,7 @@ function hasDom(): boolean {
 export function createSimulator(opts: SimulatorOptions): Simulator {
   if (!hasDom()) {
     // No DOM (e.g. SSR / worker) — return an inert handle.
-    return { showGameOver: () => {}, destroy: () => {} };
+    return { showGameOver: () => {}, setController: () => {}, destroy: () => {} };
   }
 
   const { manifest, core } = opts;
@@ -71,12 +74,35 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
   const nextSeq = (): number => (seq += 1);
 
   /** Emit an input through the shared core funnel, stamped with seq + timestamp. */
+  // Per-player setController state, mirrored onto the fake phones. A disabled or
+  // cooling-down control swallows presses/changes like the real phone does.
+  const overrides = new Map<string, { labels: Record<string, string>; disabled: Set<string>; coolUntil: Map<string, number> }>();
+  const overrideFor = (playerId: string) => {
+    let entry = overrides.get(playerId);
+    if (!entry) {
+      entry = { labels: {}, disabled: new Set(), coolUntil: new Map() };
+      overrides.set(playerId, entry);
+    }
+    return entry;
+  };
+  const isBlocked = (playerId: string, control: string): boolean => {
+    const entry = overrides.get(playerId);
+    if (!entry) return false;
+    return entry.disabled.has(control) || (entry.coolUntil.get(control) ?? 0) > Date.now();
+  };
+  const labelFor = (playerId: string, control: CouchControl): string => {
+    const labels = overrides.get(playerId)?.labels;
+    const own = labels && Object.hasOwn(labels, control.control) ? labels[control.control] : undefined;
+    return own ?? (control.label || control.control);
+  };
+
   const emitInput = (
     playerId: string,
     control: string,
     action: CouchInputEnvelope['action'],
     value?: unknown
   ): void => {
+    if (action !== 'release' && isBlocked(playerId, control)) return;
     core.dispatchInput({
       seq: nextSeq(),
       at: Date.now(),
@@ -231,6 +257,7 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
     for (let i = 0; i < core.players.length; i += 1) {
       phones.appendChild(renderPhone(core.players[i], i === 0));
     }
+    paintOverrides();
   }
 
   function renderPhone(player: CouchPlayer, isPrimary: boolean): HTMLElement {
@@ -283,7 +310,7 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
     const btn = document.createElement('button');
     btn.className = 'couch-sim-pad couch-sim-pad-button';
     btn.type = 'button';
-    btn.textContent = control.label || control.control;
+    btn.textContent = labelFor(player.id, control);
     btn.dataset.control = control.control;
     btn.dataset.kind = 'button';
     const press = (e: Event): void => {
@@ -303,7 +330,7 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
     const btn = document.createElement('button');
     btn.className = 'couch-sim-pad couch-sim-pad-hold';
     btn.type = 'button';
-    btn.textContent = control.label || control.control;
+    btn.textContent = labelFor(player.id, control);
     btn.dataset.control = control.control;
     btn.dataset.kind = 'hold';
 
@@ -600,6 +627,44 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
     toastTimer = setTimeout(() => toast.classList.add('is-hidden'), 6000);
   }
 
+  function setController(playerId: string, patch: CouchControllerPatch): void {
+    const entry = overrideFor(playerId);
+    if (patch.labels) entry.labels = { ...patch.labels };
+    if (patch.disabled) entry.disabled = new Set(patch.disabled);
+    for (const [control, ms] of Object.entries(patch.cooldowns ?? {})) {
+      entry.coolUntil.set(control, Date.now() + ms);
+      setTimeout(paintOverrides, ms + 10);
+    }
+    if (patch.vibrate !== undefined) {
+      try {
+        navigator.vibrate?.(patch.vibrate);
+      } catch {
+        /* no haptics in this browser */
+      }
+      const phone = phones.querySelector<HTMLElement>(`[data-player-id="${CSS.escape(playerId)}"]`);
+      phone?.animate?.([{ transform: 'translateX(-3px)' }, { transform: 'translateX(3px)' }, { transform: 'none' }], 160);
+    }
+    paintOverrides();
+  }
+
+  // Re-label and grey out the fake phones' buttons from the override map.
+  function paintOverrides(): void {
+    for (const player of core.players) {
+      const phone = phones.querySelector<HTMLElement>(`[data-player-id="${CSS.escape(player.id)}"]`);
+      if (!phone) continue;
+      for (const control of controls) {
+        for (const el of Array.from(phone.querySelectorAll<HTMLElement>(`[data-control="${CSS.escape(control.control)}"]`))) {
+          if (el instanceof HTMLButtonElement && (el.dataset.kind === 'button' || el.dataset.kind === 'hold')) {
+            el.textContent = labelFor(player.id, control);
+          }
+          if (el instanceof HTMLButtonElement || el instanceof HTMLInputElement) {
+            el.disabled = isBlocked(player.id, control.control);
+          }
+        }
+      }
+    }
+  }
+
   function destroy(): void {
     window.removeEventListener('keydown', onKeyDown);
     window.removeEventListener('keyup', onKeyUp);
@@ -607,7 +672,7 @@ export function createSimulator(opts: SimulatorOptions): Simulator {
     root.remove();
   }
 
-  return { showGameOver, destroy };
+  return { showGameOver, setController, destroy };
 }
 
 /** Retro palette for fake-player accents. */

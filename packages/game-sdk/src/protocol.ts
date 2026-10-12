@@ -167,8 +167,32 @@ export interface CouchErrorMessage {
   message: string;
 }
 
+/**
+ * What a game can tell one player's phone. Omitted fields keep their current
+ * value. Control names must be ones the manifest declares.
+ */
+export interface CouchControllerPatch {
+  /** Replace this player's button labels, e.g. `{ a: 'SHIELD', b: 'BASH' }` (1-16 chars). */
+  labels?: Record<string, string>;
+  /** Replace the set of greyed-out controls. `[]` re-enables all. */
+  disabled?: string[];
+  /** Start a cooldown (ms, max 60000) on these controls now; the phone shows it draining. */
+  cooldowns?: Record<string, number>;
+  /** Vibrate once: a duration or an on/off pattern in ms (max 10 steps of 1000). */
+  vibrate?: number | number[];
+}
+
+/** Update one player's phone controller. */
+export interface CouchSetControllerMessage {
+  v: ProtocolVersion;
+  type: 'couch:setController';
+  playerId: string;
+  patch: CouchControllerPatch;
+}
+
 export type CouchGameToHostMessage =
   | CouchHelloMessage
+  | CouchSetControllerMessage
   | CouchReadyMessage
   | CouchGameOverMessage
   | CouchErrorMessage;
@@ -263,6 +287,7 @@ const COUCH_MESSAGE_TYPES = new Set<string>([
   'couch:ready',
   'couch:gameOver',
   'couch:error',
+  'couch:setController',
   // host -> game
   'couch:init',
   'couch:input',

@@ -2,6 +2,8 @@ import type {
   ActivityMessage,
   ChatMessage,
   ControllerEvent,
+  ControllerPatch,
+  ControllerState,
   ExternalGameManifest,
   ExternalGameSnapshot,
   GameEventEnvelope,
@@ -113,6 +115,7 @@ export interface SerializedLobbyRecord {
   mode?: 'local' | 'remote';
   inputSeq?: number;
   inputLog?: GameInputEnvelope[];
+  controllerState?: Record<PlayerId, ControllerState>;
 }
 
 export interface LobbyRecord {
@@ -133,6 +136,7 @@ export interface LobbyRecord {
   mode: 'local' | 'remote';
   inputSeq: number;
   inputLog: GameInputEnvelope[];
+  controllerState: Record<PlayerId, ControllerState>;
 }
 
 export class LobbyError extends Error {
@@ -180,7 +184,8 @@ export class LobbyStore {
       engine: null,
       mode,
       inputSeq: 0,
-      inputLog: []
+      inputLog: [],
+      controllerState: {}
     };
     this.addActivity(lobby, 'Lobby erstellt');
     this.lobbies.set(slug, lobby);
@@ -214,7 +219,8 @@ export class LobbyStore {
       gameSession: lobby.gameSession,
       lastEvent: lobby.lastEvent,
       mode: lobby.mode,
-      inputLog: lobby.inputLog.slice(-INPUT_LOG_PUBLIC_LIMIT)
+      inputLog: lobby.inputLog.slice(-INPUT_LOG_PUBLIC_LIMIT),
+      controllerState: lobby.controllerState
     };
   }
 
@@ -326,6 +332,7 @@ export class LobbyStore {
       lobby.state = 'playing';
       lobby.inputSeq = 0;
       lobby.inputLog = [];
+      lobby.controllerState = {};
       lobby.gameSession = {
         id: createId('session'),
         lobbyId: lobby.id,
@@ -441,6 +448,30 @@ export class LobbyStore {
       lobby.inputLog = lobby.inputLog.slice(-INPUT_LOG_LIMIT);
     }
     return envelope;
+  }
+
+  // Apply a running external game's instructions for one player's phone. Only
+  // the trusted screen shell calls this (checked by the socket handler). Labels
+  // and disabled controls must name controls the manifest declares; one-shot
+  // cooldowns/vibrate are replaced by each patch and replayed once per seq.
+  setControllerState(slug: string, playerId: PlayerId, patch: ControllerPatch): ControllerState {
+    const lobby = this.getLobby(slug);
+    if (lobby.state !== 'playing') throw new LobbyError('Kein laufendes Spiel', 409);
+    if (!lobby.players.has(playerId)) throw new LobbyError('Spieler nicht gefunden', 404);
+    const manifest = this.manifestOrThrow(lobby.currentGameId);
+    if (!isExternalManifest(manifest)) throw new LobbyError('Kein externes Spiel', 409);
+    const clean = sanitizeControllerPatch(patch, new Set(manifest.controllerLayout.controls.map((c) => c.control)));
+
+    const prev = lobby.controllerState[playerId];
+    const next: ControllerState = {
+      seq: (prev?.seq ?? 0) + 1,
+      labels: clean.labels ?? prev?.labels ?? {},
+      disabled: clean.disabled ?? prev?.disabled ?? [],
+      cooldowns: clean.cooldowns ?? {},
+      vibrate: clean.vibrate ?? null
+    };
+    lobby.controllerState[playerId] = next;
+    return next;
   }
 
   // Finish an external game with reported scores (from the trusted screen shell).
@@ -624,7 +655,8 @@ export function serializeLobbyRecord(lobby: LobbyRecord): SerializedLobbyRecord 
     lastEvent: lobby.lastEvent,
     mode: lobby.mode,
     inputSeq: lobby.inputSeq,
-    inputLog: lobby.inputLog.slice()
+    inputLog: lobby.inputLog.slice(),
+    controllerState: structuredClone(lobby.controllerState)
   };
 }
 
@@ -658,8 +690,75 @@ export function deserializeLobbyRecord(serialized: SerializedLobbyRecord): Lobby
     // Back-compat: records persisted before external-game support lack these.
     mode: serialized.mode ?? 'local',
     inputSeq: serialized.inputSeq ?? 0,
-    inputLog: serialized.inputLog ? serialized.inputLog.slice() : []
+    inputLog: serialized.inputLog ? serialized.inputLog.slice() : [],
+    controllerState: serialized.controllerState ? structuredClone(serialized.controllerState) : {}
   };
+}
+
+const MAX_LABEL_CHARS = 16;
+const MAX_COOLDOWN_MS = 60_000;
+const MAX_VIBRATE_STEPS = 10;
+const MAX_VIBRATE_STEP_MS = 1_000;
+
+// Validate a game's controller patch against the declared control names.
+// Throws LobbyError(400) on anything malformed rather than silently trimming,
+// so a creator sees the mistake in /dev.
+export function sanitizeControllerPatch(
+  patch: unknown,
+  controls: Set<string>
+): { labels?: Record<string, string>; disabled?: string[]; cooldowns?: Record<string, number>; vibrate?: number[] } {
+  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw new LobbyError('Ungültiger Controller-Patch');
+  const raw = patch as Record<string, unknown>;
+  const out: ReturnType<typeof sanitizeControllerPatch> = {};
+  const known = (control: string) => {
+    if (!controls.has(control)) throw new LobbyError(`Unbekannte Steuerung: ${control}`);
+  };
+
+  if (raw.labels !== undefined) {
+    if (!raw.labels || typeof raw.labels !== 'object' || Array.isArray(raw.labels)) throw new LobbyError('labels muss ein Objekt sein');
+    // Null-prototype maps: a control key can never hit Object.prototype.
+    out.labels = Object.create(null) as Record<string, string>;
+    for (const [control, label] of Object.entries(raw.labels)) {
+      known(control);
+      if (typeof label !== 'string' || !label.trim() || label.trim().length > MAX_LABEL_CHARS) {
+        throw new LobbyError(`Label für ${control} muss 1-${MAX_LABEL_CHARS} Zeichen haben`);
+      }
+      out.labels[control] = label.trim();
+    }
+  }
+  if (raw.disabled !== undefined) {
+    if (!Array.isArray(raw.disabled)) throw new LobbyError('disabled muss eine Liste sein');
+    out.disabled = [];
+    for (const control of raw.disabled) {
+      if (typeof control !== 'string') throw new LobbyError('disabled enthält keinen Steuerungsnamen');
+      known(control);
+      if (!out.disabled.includes(control)) out.disabled.push(control);
+    }
+  }
+  if (raw.cooldowns !== undefined) {
+    if (!raw.cooldowns || typeof raw.cooldowns !== 'object' || Array.isArray(raw.cooldowns)) throw new LobbyError('cooldowns muss ein Objekt sein');
+    out.cooldowns = Object.create(null) as Record<string, number>;
+    for (const [control, ms] of Object.entries(raw.cooldowns)) {
+      known(control);
+      if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0 || ms > MAX_COOLDOWN_MS) {
+        throw new LobbyError(`Cooldown für ${control} muss 0-${MAX_COOLDOWN_MS} ms sein`);
+      }
+      out.cooldowns[control] = Math.round(ms);
+    }
+  }
+  if (raw.vibrate !== undefined) {
+    const steps = typeof raw.vibrate === 'number' ? [raw.vibrate] : raw.vibrate;
+    if (
+      !Array.isArray(steps) ||
+      steps.length === 0 ||
+      steps.length > MAX_VIBRATE_STEPS ||
+      steps.some((ms) => typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0 || ms > MAX_VIBRATE_STEP_MS)
+    ) {
+      throw new LobbyError(`vibrate muss 1-${MAX_VIBRATE_STEPS} Werte von 0-${MAX_VIBRATE_STEP_MS} ms haben`);
+    }
+    out.vibrate = (steps as number[]).map((ms) => Math.round(ms));
+  }
+  return out;
 }
 
 // Deep-clone a stored snapshot. External snapshots are shallow (seed + scores)

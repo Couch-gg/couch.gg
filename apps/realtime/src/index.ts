@@ -5,7 +5,7 @@ import express from 'express';
 import { Server, type ServerOptions } from 'socket.io';
 import { GAME_MANIFESTS } from '@couch/game-runtime';
 import type { TrebuchetEvent } from '@couch/trebuchet';
-import type { ControllerEvent, GameId, GameManifest, PlayerId, ScreenId } from '@couch/types';
+import type { ControllerEvent, ControllerPatch, GameId, GameManifest, PlayerId, ScreenId } from '@couch/types';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { LobbyError, LobbyStore, RECONNECT_GRACE_MS, type LobbyRecord, type ManifestResolver } from './lobbies.js';
 import { mergeCatalog, parseExternalGamesJson } from './external-games.js';
@@ -106,6 +106,8 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
   const persistence = createProductionLobbyPersistence();
   const turnTimers = new Map<string, NodeJS.Timeout>();
   const inputLimiter = new RateLimiter();
+  // Separate budget for game -> phone controller updates, keyed per lobby.
+  const controllerLimiter = new RateLimiter();
   // Per-IP report throttle: 5 reports/hour. Same token-bucket shape as the input
   // limiter but with report-specific capacity/refill, keyed `report:<ip>`.
   const reportLimiter = new ReportRateLimiter();
@@ -474,6 +476,30 @@ export function createRealtimeServer(options: RealtimeServerOptions = {}): Realt
           await saveLobby(slug);
           emitLobby(slug);
         }
+      } catch (err) {
+        ack?.(socketError(err));
+      }
+    });
+
+    // The running game tells one player's phone what to show (labels, disabled
+    // controls, cooldowns, a vibration). Like game:finish this comes only from
+    // the trusted screen shell, never from the iframe or a phone.
+    socket.on('screen:controller', async (payload: { slug?: string; playerId?: string; patch?: unknown }, ack?: (value: unknown) => void) => {
+      try {
+        const slug = String(payload?.slug ?? '').toUpperCase();
+        if (!ctx || ctx.role !== 'screen' || ctx.slug !== slug) {
+          throw new LobbyError('Nur der Screen kann Controller steuern', 403);
+        }
+        if (!controllerLimiter.allow(slug, 'screen')) {
+          ack?.({ ok: true, dropped: true });
+          return;
+        }
+        await hydrateLobby(slug);
+        const playerId = String(payload?.playerId ?? '');
+        const state = store.setControllerState(slug, playerId, payload?.patch as ControllerPatch);
+        ack?.({ ok: true, state });
+        await saveLobby(slug);
+        io.to(room(slug)).emit('controller:state', { playerId, state });
       } catch (err) {
         ack?.(socketError(err));
       }
